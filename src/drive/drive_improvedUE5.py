@@ -529,7 +529,8 @@ class World(object):
         if not blueprint_list:
             raise ValueError("Couldn't find any blueprints with the specified filters")
         # blueprint = random.choice(blueprint_list)
-
+        for vehicle_model in blueprint_list:
+            print(vehicle_model)
         # Use a fixed vehicle blueprint -- vehicle.dodge.charger_2020
         blueprint = self.world.get_blueprint_library().find('vehicle.dodge.charger_2020')
 
