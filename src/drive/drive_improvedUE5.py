@@ -533,7 +533,8 @@ class World(object):
         #     print(vehicle_model)
         # Use a fixed vehicle blueprint -- vehicle.dodge.charger
         blueprint = self.world.get_blueprint_library().find('vehicle.dodge.charger')
-
+        if blueprint is None:
+            raise ValueError("Couldn't find blueprint 'vehicle.dodge.charger'")
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('terramechanics'):
             blueprint.set_attribute('terramechanics', 'true')
@@ -1009,7 +1010,7 @@ class HUD(object):
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
-        self._show_info = True
+        self._show_info = False  # hide HUD initially
         self._info_text = []
         self._server_clock = pygame.time.Clock()
 
@@ -1430,6 +1431,7 @@ class CameraManager(object):
 
         if not self._parent.type_id.startswith("walker.pedestrian"):
             self._camera_transforms = [
+                (carla.Transform(carla.Location(x=0.25, y=-0.33, z=1.21), carla.Rotation(pitch=-2.0)), Attachment.Rigid),  # drive-seat view
                 (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
                 (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
