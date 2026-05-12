@@ -370,7 +370,11 @@ class LoASelectionPopup(object):
             (self._title_font, 'LoA Selection Required'),
             (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
             (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
-            (self._small_font, '0=none  1=suggest  2=ask_approval  3=auto_with_veto  4=auto'),
+            (self._small_font, '0: None (No assistive action is taken)'),
+            (self._small_font, '1: Suggest (Give Suggestion)'),
+            (self._small_font, '2: Ask Approval (Ask for user confirmation)'),
+            (self._small_font, '3: Auto with Veto (Execute automatically but user can veto)'),
+            (self._small_font, '4: Auto (Fully automatic)'),
         ]
 
         y = int(self.height * 0.35)
@@ -683,7 +687,7 @@ class KeyboardControl(object):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
-        self._control_mode = control_mode
+        self._control_mode = control_mode  # 'test' or 'full'
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
