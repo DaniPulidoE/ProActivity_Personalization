@@ -565,6 +565,18 @@ class World(object):
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
+
+        # === Persist the vehicle id to a file for other processes to read ===
+        try:
+            id_file = os.path.join(os.getcwd(), "vehicle_id.txt")
+            tmp_file = id_file + ".tmp"
+            with open(tmp_file, "w") as f:
+                f.write(str(self.player.id))
+            os.replace(tmp_file, id_file)
+            print(f"[INFO] Written vehicle id to {id_file}")
+        except Exception as e:
+            print("[WARN] Failed to write vehicle id file:", e)
+
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud, self.control_mode)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud, self.control_mode)
