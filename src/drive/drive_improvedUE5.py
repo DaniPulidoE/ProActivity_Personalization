@@ -1,23 +1,22 @@
-#!/usr/bin/env python
-
-# Copyright (c) 2025 Computer Vision Center (CVC) at the Universitat Autonoma de
-# Barcelona (UAB).
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
-
-"""Allows controlling a vehicle with a keyboard."""
-
 """
-Welcome to CARLA manual control.
+Welcome to CARLA manual control (UE5).
 
-Use ARROWS or WASD keys for control.
+Control Modes:
+    --control test (default) : Only basic driving controls available
+    --control full          : All controls available
 
+Basic Controls (available in both modes):
     W            : throttle
     S            : brake
     A/D          : steer left/right
     Q            : toggle reverse
     Space        : hand-brake
+
+    F1           : toggle HUD
+    H/?          : toggle help
+    ESC          : quit
+
+Additional Controls (only in --control full mode):
     P            : toggle autopilot
     M            : toggle manual transmission
     ,/.          : gear up/down
@@ -47,11 +46,8 @@ Use ARROWS or WASD keys for control.
     CTRL + P     : start replaying last recorded simulation
     CTRL + +     : increments the start time of the replay by 1 second (+SHIFT = 10 seconds)
     CTRL + -     : decrements the start time of the replay by 1 second (+SHIFT = 10 seconds)
-
-    F1           : toggle HUD
-    H/?          : toggle help
-    ESC          : quit
 """
+
 
 # ==============================================================================
 # -- imports -------------------------------------------------------------------
@@ -63,12 +59,16 @@ from carla import ColorConverter as cc
 
 import argparse
 import collections
+import csv
 import datetime
+import json
 import logging
 import math
+import os
 import random
 import re
-import os
+import sys
+import uuid
 import weakref
 
 try:
@@ -131,15 +131,15 @@ OBJECT_TO_COLOR = [
     (153, 153, 153),
     (250, 170, 30),
     (220, 220, 0),
-    (107, 142, 35),
+    (107, 142,  35),
     (152, 251, 152),
     (70, 130, 180),
     (220, 20, 60),
     (255, 0, 0),
     (0, 0, 142),
     (0, 0, 70),
-    (0, 60, 100),
-    (0, 80, 100),
+    (0,  60, 100),
+    (0,  80, 100),
     (0, 0, 230),
     (119, 11, 32),
     (110, 190, 160),
@@ -153,10 +153,279 @@ OBJECT_TO_COLOR = [
     (180, 165, 180),
 ]
 
+DEFAULT_DECISION_COLUMNS = [
+    'action',
+    'level',
+    'LoA',
+    'message',
+    'fcd',
+    'probs',
+    'profile',
+    'fallback',
+    'fallback_reason',
+]
+
+USER_LOA_LABEL_COLUMNS = [
+    'session_id',
+    'window_idx',
+    'window_start_ms',
+    'window_end_ms',
+    'window_start_timestamp',
+    'window_end_timestamp',
+    'selection_timestamp',
+    'selection_frame',
+    'selection_sim_time',
+    'selection_speed_kmh',
+    'participantid',
+    'environment',
+    'secondary_task',
+    'functionname',
+    'emotion',
+    'modeltype',
+    'state_model',
+    'w_fcd',
+    'user_selected_loa',
+    'system_action',
+    'system_level',
+    'system_loa',
+    'system_message',
+    'system_probs',
+    'system_profile',
+    'system_fallback',
+    'system_fallback_reason',
+    'system_fcd',
+]
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
 # ==============================================================================
+
+
+def _read_csv_headers(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+    with open(path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        return next(reader, [])
+
+
+def _read_last_csv_row(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            last = None
+            for row in reader:
+                last = row
+            return last or {}
+    except Exception:
+        return {}
+
+
+def _ensure_csv_columns(path, source_headers, added_headers):
+    existing_headers = _read_csv_headers(path)
+    headers = existing_headers[:] if existing_headers else source_headers[:]
+    for col in added_headers:
+        if col not in headers:
+            headers.append(col)
+
+    if existing_headers == headers:
+        return headers
+
+    rows = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, 'r', newline='') as f:
+            rows = list(csv.DictReader(f))
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, '') for k in headers})
+    return headers
+
+
+def _current_session_id(explicit_session_id=''):
+    return (explicit_session_id or os.getenv('PV_SESSION_ID') or f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}")
+
+
+def _load_latest_system_decision_snapshot(session_id=''):
+    cwd = os.getcwd()
+    path = os.path.join(cwd, 'data', 'decisions.csv')
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            last_match = None
+            last_any = None
+            for row in reader:
+                last_any = row
+                if session_id and row.get('session_id') not in (None, '', session_id):
+                    continue
+                last_match = row
+            chosen = last_match or last_any
+            if chosen:
+                chosen['_source_path'] = path
+                return chosen
+    except Exception:
+        return {}
+    return {}
+
+
+def _normalize_csv_value(value):
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    if value is None:
+        return ''
+    return value
+
+
+def append_user_loa_selection(selection_row):
+    cwd = os.getcwd()
+    labels_path = os.path.join(cwd, 'data', 'user_loa_labels.csv')
+    source_headers = _read_csv_headers(labels_path)
+    if not source_headers:
+        source_headers = USER_LOA_LABEL_COLUMNS[:]
+
+    headers = _ensure_csv_columns(labels_path, source_headers, USER_LOA_LABEL_COLUMNS)
+    row = {k: '' for k in headers}
+    for key, value in (selection_row or {}).items():
+        if key in row:
+            row[key] = _normalize_csv_value(value)
+
+    with open(labels_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writerow(row)
+
+
+class LoASelectionPopup(object):
+    def __init__(self, width, height, interval_seconds=20):
+        self.interval_ms = int(interval_seconds * 1000)
+        self.next_prompt_ms = 0
+        self.active = False
+        self.prompt_started_ms = 0
+        self.session_started_ms = 0
+        self.session_started_walltime = None
+        self.window_idx = 0
+        self.window_start_ms = 0
+        self.window_end_ms = 0
+        self.window_start_timestamp = ''
+        self.window_end_timestamp = ''
+        self.width = width
+        self.height = height
+        self._title_font = pygame.font.Font(pygame.font.get_default_font(), 30)
+        self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
+        self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
+
+    def start(self):
+        self.session_started_ms = pygame.time.get_ticks()
+        self.session_started_walltime = datetime.datetime.now()
+        self.window_idx = 0
+        self.next_prompt_ms = self.session_started_ms + self.interval_ms
+
+    def should_open(self, now_ms):
+        return (not self.active) and self.next_prompt_ms and now_ms >= self.next_prompt_ms
+
+    def open(self, now_ms):
+        self.active = True
+        self.prompt_started_ms = now_ms
+        self.window_idx += 1
+        self.window_start_ms = max(self.session_started_ms, now_ms - self.interval_ms)
+        self.window_end_ms = now_ms
+        if self.session_started_walltime is not None:
+            elapsed = now_ms - self.session_started_ms
+            start_wall = self.session_started_walltime + datetime.timedelta(milliseconds=self.window_start_ms - self.session_started_ms)
+            end_wall = self.session_started_walltime + datetime.timedelta(milliseconds=self.window_end_ms - self.session_started_ms)
+            self.window_start_timestamp = start_wall.isoformat()
+            self.window_end_timestamp = end_wall.isoformat()
+
+    def close(self, now_ms):
+        self.active = False
+        self.next_prompt_ms = now_ms + self.interval_ms
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            return 'quit', None
+        if event.type != pygame.KEYDOWN:
+            return None, None
+        if event.key == K_ESCAPE:
+            return 'quit', None
+        if event.unicode in ('0', '1', '2', '3', '4'):
+            return 'select', int(event.unicode)
+        return None, None
+
+    def render(self, display):
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(200)
+        overlay.fill((0, 0, 0))
+        display.blit(overlay, (0, 0))
+
+        lines = [
+            (self._title_font, 'LoA Selection Required'),
+            (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
+            (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
+            (self._small_font, '0=none  1=suggest  2=ask_approval  3=auto_with_veto  4=auto'),
+        ]
+
+        y = int(self.height * 0.35)
+        for font, text in lines:
+            surface = font.render(text, True, (255, 255, 255))
+            rect = surface.get_rect(center=(self.width // 2, y))
+            display.blit(surface, rect)
+            y += 45
+
+
+class StartScreenOverlay(object):
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self._title_font = pygame.font.Font(pygame.font.get_default_font(), 40)
+        self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
+        self._button_font = pygame.font.Font(pygame.font.get_default_font(), 28)
+
+    def _button_rect(self):
+        button_w = 220
+        button_h = 70
+        x = (self.width - button_w) // 2
+        y = int(self.height * 0.58)
+        return pygame.Rect(x, y, button_w, button_h)
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            return 'quit'
+        if event.type == pygame.KEYDOWN and event.key == K_ESCAPE:
+            return 'quit'
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._button_rect().collidepoint(event.pos):
+                return 'start'
+        return None
+
+    def render(self, display):
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(170)
+        overlay.fill((0, 0, 0))
+        display.blit(overlay, (0, 0))
+
+        title = self._title_font.render('ProActivity Experiment', True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self.width // 2, int(self.height * 0.35)))
+        display.blit(title, title_rect)
+
+        hint = self._text_font.render('Click Start to begin driving.', True, (220, 220, 220))
+        hint_rect = hint.get_rect(center=(self.width // 2, int(self.height * 0.45)))
+        display.blit(hint, hint_rect)
+
+        button_rect = self._button_rect()
+        pygame.draw.rect(display, (30, 144, 255), button_rect, border_radius=8)
+        pygame.draw.rect(display, (255, 255, 255), button_rect, width=2, border_radius=8)
+        label = self._button_font.render('START', True, (255, 255, 255))
+        label_rect = label.get_rect(center=button_rect.center)
+        display.blit(label, label_rect)
 
 
 def find_weather_presets():
@@ -169,7 +438,6 @@ def find_weather_presets():
 def get_actor_display_name(actor, truncate=250):
     name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
-
 
 def get_actor_blueprints(world, filter, generation):
     bps = world.get_blueprint_library().filter(filter)
@@ -207,6 +475,7 @@ class World(object):
         self.sync = args.sync
         self.traffic_manager = traffic_manager
         self.actor_role_name = args.rolename
+        self.control_mode = args.control  # Store control mode
         try:
             self.map = self.world.get_map()
         except RuntimeError as error:
@@ -343,7 +612,7 @@ class World(object):
             self.radar_sensor = None
 
     def modify_vehicle_physics(self, actor):
-        # If actor is not a vehicle, we cannot use the physics control
+        #If actor is not a vehicle, we cannot use the physics control
         try:
             physics_control = actor.get_physics_control()
             physics_control.use_sweep_wheel_collision = True
@@ -387,7 +656,6 @@ class World(object):
 
 class KeyboardControl(object):
     """Class that handles keyboard input."""
-
     def __init__(self, world, start_in_autopilot):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
@@ -407,10 +675,11 @@ class KeyboardControl(object):
         self._steer_cache = 0.0
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
-    def parse_events(self, client, world, clock, sync_mode):
+    def parse_events(self, client, world, clock, sync_mode, events=None):
         if isinstance(self._control, carla.VehicleControl):
             current_lights = self._lights
-        for event in pygame.event.get():
+        event_list = events if events is not None else pygame.event.get()
+        for event in event_list:
             if event.type == pygame.QUIT:
                 return True
             elif event.type == pygame.KEYUP:
@@ -588,13 +857,13 @@ class KeyboardControl(object):
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
                     current_lights |= carla.VehicleLightState.Brake
-                else:  # Remove the Brake flag
+                else: # Remove the Brake flag
                     current_lights &= ~carla.VehicleLightState.Brake
                 if self._control.reverse:
                     current_lights |= carla.VehicleLightState.Reverse
-                else:  # Remove the Reverse flag
+                else: # Remove the Reverse flag
                     current_lights &= ~carla.VehicleLightState.Reverse
-                if current_lights != self._lights:  # Change the light state only if necessary
+                if current_lights != self._lights: # Change the light state only if necessary
                     world.player.set_light_state(carla.VehicleLightState(current_lights))
                 # Apply control
                 if not self._ackermann_enabled:
@@ -626,8 +895,7 @@ class KeyboardControl(object):
             if not self._ackermann_enabled:
                 self._control.brake = min(self._control.brake + 0.2, 1)
             else:
-                self._ackermann_control.speed -= min(abs(self._ackermann_control.speed),
-                                                     round(milliseconds * 0.005, 2)) * self._ackermann_reverse
+                self._ackermann_control.speed -= min(abs(self._ackermann_control.speed), round(milliseconds * 0.005, 2)) * self._ackermann_reverse
                 self._ackermann_control.speed = max(0, abs(self._ackermann_control.speed)) * self._ackermann_reverse
         else:
             if not self._ackermann_enabled:
@@ -732,7 +1000,7 @@ class HUD(object):
             'Map:     % 20s' % world.map.name.split('/')[-1],
             'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
             '',
-            'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)),
+            'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)),
             u'Compass:% 17.0f\N{DEGREE SIGN} % 2s' % (compass, heading),
             'Accelero: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.accelerometer),
             'Gyroscop: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.gyroscope),
@@ -753,7 +1021,7 @@ class HUD(object):
                 self._info_text += [
                     '',
                     'Ackermann Controller:',
-                    '  Target speed: % 8.0f km/h' % (3.6 * self._ackermann_control.speed),
+                    '  Target speed: % 8.0f km/h' % (3.6*self._ackermann_control.speed),
                 ]
         elif isinstance(c, carla.WalkerControl):
             self._info_text += [
@@ -767,8 +1035,7 @@ class HUD(object):
             'Number of vehicles: % 8d' % len(vehicles)]
         if len(vehicles) > 1:
             self._info_text += ['Nearby vehicles:']
-            distance = lambda l: math.sqrt(
-                (l.x - t.location.x) ** 2 + (l.y - t.location.y) ** 2 + (l.z - t.location.z) ** 2)
+            distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
             vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.player.id]
             for d, vehicle in sorted(vehicles, key=lambda vehicles: vehicles[0]):
                 if d > 200.0:
@@ -866,7 +1133,6 @@ class FadingText(object):
 
 class HelpText(object):
     """Helper class to handle text output using pygame"""
-
     def __init__(self, font, width, height):
         lines = __doc__.split('\n')
         self.font = font
@@ -923,7 +1189,7 @@ class CollisionSensor(object):
         actor_type = get_actor_display_name(event.other_actor)
         self.hud.notification('Collision with %r' % actor_type)
         impulse = event.normal_impulse
-        intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
+        intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         self.history.append((event.frame, intensity))
         if len(self.history) > 4000:
             self.history.pop(0)
@@ -1040,7 +1306,7 @@ class RadarSensor(object):
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
 
-        self.velocity_range = 7.5  # m/s
+        self.velocity_range = 7.5 # m/s
         world = self._parent.get_world()
         self.debug = world.debug
         bp = world.get_blueprint_library().find('sensor.other.radar')
@@ -1049,7 +1315,7 @@ class RadarSensor(object):
         self.sensor = world.spawn_actor(
             bp,
             carla.Transform(
-                carla.Location(x=bound_x + 0.05, z=bound_z + 0.05),
+                carla.Location(x=bound_x + 0.05, z=bound_z+0.05),
                 carla.Rotation(pitch=5)),
             attach_to=self._parent)
         # We need a weak reference to self to avoid circular reference.
@@ -1083,7 +1349,7 @@ class RadarSensor(object):
             def clamp(min_v, max_v, value):
                 return max(min_v, min(value, max_v))
 
-            norm_velocity = detect.velocity / self.velocity_range  # range [-1, 1]
+            norm_velocity = detect.velocity / self.velocity_range # range [-1, 1]
             r = int(clamp(0.0, 1.0, 1.0 - norm_velocity) * 255.0)
             g = int(clamp(0.0, 1.0, 1.0 - abs(norm_velocity)) * 255.0)
             b = int(abs(clamp(- 1.0, 0.0, - 1.0 - norm_velocity)) * 255.0)
@@ -1093,7 +1359,6 @@ class RadarSensor(object):
                 life_time=0.06,
                 persistent_lines=False,
                 color=carla.Color(r, g, b))
-
 
 # ==============================================================================
 # -- CameraManager -------------------------------------------------------------
@@ -1114,46 +1379,39 @@ class CameraManager(object):
 
         if not self._parent.type_id.startswith("walker.pedestrian"):
             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.0 * bound_x, y=+0.0 * bound_y, z=2.0 * bound_z),
-                                 carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=+0.8 * bound_x, y=+0.0 * bound_y, z=1.3 * bound_z)),
-                 Attachment.Rigid),
-                (carla.Transform(carla.Location(x=+1.9 * bound_x, y=+1.0 * bound_y, z=1.2 * bound_z)),
-                 Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-2.8 * bound_x, y=+0.0 * bound_y, z=4.6 * bound_z),
-                                 carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-1.0, y=-1.0 * bound_y, z=0.4 * bound_z)), Attachment.Rigid)]
+                (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
+                (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=-1.0, y=-1.0*bound_y, z=0.4*bound_z)), Attachment.Rigid)]
         else:
             self._camera_transforms = [
                 (carla.Transform(carla.Location(x=-2.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=1.6, z=1.7)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)),
-                 Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=0, y=-2.5, z=-0.0), carla.Rotation(yaw=90.0)), Attachment.Rigid)]
-        world = self._parent.get_world()
-        map_name = world.get_map().name
-        post_process_profile = self.get_post_process_profile(map_name)
+
         self.transform_index = 1
         self.sensors = [
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {'post_process_profile': post_process_profile}],
+            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}],
             ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)', {}],
             ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)', {}],
             ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)', {}],
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)', {}],
-            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
-             'Camera Semantic Segmentation (CityScapes Palette)', {}],
+            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)', {}],
             ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}],
             ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)', {'range': '50'}],
             ['sensor.lidar.ray_cast_semantic', None, 'Semantic Lidar (Ray-Cast)', {'range': '50'}],
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB Distorted',
-             {'lens_circle_multiplier': '3.0',
-              'lens_circle_falloff': '3.0',
-              'post_process_profile': post_process_profile}],
+                {'lens_circle_multiplier': '3.0',
+                'lens_circle_falloff': '3.0',
+                'chromatic_aberration_intensity': '0.5',
+                'chromatic_aberration_offset': '0'}],
             ['sensor.camera.optical_flow', cc.Raw, 'Optical Flow', {}],
             ['sensor.camera.normals', cc.Raw, 'Camera Normals', {}],
         ]
-
+        world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
             bp = bp_library.find(item[0])
@@ -1210,11 +1468,6 @@ class CameraManager(object):
     def render(self, display):
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
-
-    def get_post_process_profile(self, map_name: str) -> str:
-        if "Town10HD_Opt" in map_name:
-            return "Town10HD_Opt"
-        return "Default"
 
     @staticmethod
     def _parse_image(weak_self, image):
@@ -1301,12 +1554,29 @@ def game_loop(args):
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
-        display.fill((0, 0, 0))
+        display.fill((0,0,0))
         pygame.display.flip()
 
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot)
+        loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
+        start_overlay = StartScreenOverlay(args.width, args.height)
+        started = False
+        session_id = _current_session_id(getattr(args, 'session_id', ''))
+        label_context = {
+            'session_id': session_id,
+            'participantid': getattr(args, 'participantid', ''),
+            'environment': getattr(args, 'environment', ''),
+            'secondary_task': getattr(args, 'secondary_task', ''),
+            'functionname': getattr(args, 'functionname', 'Adjust seat positioning'),
+            'emotion': getattr(args, 'emotion', ''),
+            'modeltype': getattr(args, 'modeltype', ''),
+            'state_model': getattr(args, 'state_model', ''),
+            'w_fcd': getattr(args, 'w_fcd', ''),
+        }
+        print(f"[INFO] Drive session_id={session_id}")
+        print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
 
         if args.sync:
             sim_world.tick()
@@ -1315,10 +1585,80 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         while True:
+            clock.tick_busy_loop(60)
+            now_ms = pygame.time.get_ticks()
+            events = pygame.event.get()
+
+            if not started:
+                if isinstance(world.player, carla.Vehicle):
+                    pause_control = carla.VehicleControl()
+                    pause_control.throttle = 0.0
+                    pause_control.brake = 1.0
+                    pause_control.hand_brake = True
+                    world.player.apply_control(pause_control)
+                for event in events:
+                    action = start_overlay.handle_event(event)
+                    if action == 'quit':
+                        return
+                    if action == 'start':
+                        started = True
+                        loa_popup.start()
+                        break
+                world.render(display)
+                start_overlay.render(display)
+                pygame.display.flip()
+                continue
+
+            if loa_popup.should_open(now_ms):
+                loa_popup.open(now_ms)
+
+            if loa_popup.active:
+                if isinstance(world.player, carla.Vehicle):
+                    pause_control = carla.VehicleControl()
+                    pause_control.throttle = 0.0
+                    pause_control.brake = 1.0
+                    pause_control.hand_brake = True
+                    world.player.apply_control(pause_control)
+                for event in events:
+                    action, selected_loa = loa_popup.handle_event(event)
+                    if action == 'quit':
+                        return
+                    if action == 'select':
+                        player_velocity = world.player.get_velocity() if world and world.player else carla.Vector3D()
+                        speed_kmh = 3.6 * math.sqrt(
+                            player_velocity.x ** 2 + player_velocity.y ** 2 + player_velocity.z ** 2)
+                        system_snapshot = _load_latest_system_decision_snapshot(label_context['session_id'])
+                        append_user_loa_selection({
+                            **label_context,
+                            'window_idx': loa_popup.window_idx,
+                            'window_start_ms': loa_popup.window_start_ms,
+                            'window_end_ms': loa_popup.window_end_ms,
+                            'window_start_timestamp': loa_popup.window_start_timestamp,
+                            'window_end_timestamp': loa_popup.window_end_timestamp,
+                            'selection_timestamp': datetime.datetime.now().isoformat(timespec='milliseconds'),
+                            'selection_frame': world.hud.frame if world else '',
+                            'selection_sim_time': round(world.hud.simulation_time, 3) if world else '',
+                            'selection_speed_kmh': round(speed_kmh, 2),
+                            'user_selected_loa': selected_loa,
+                            'system_action': system_snapshot.get('action', ''),
+                            'system_level': system_snapshot.get('level', ''),
+                            'system_loa': system_snapshot.get('LoA', system_snapshot.get('loa', '')),
+                            'system_message': system_snapshot.get('message', ''),
+                            'system_probs': system_snapshot.get('probs', ''),
+                            'system_profile': system_snapshot.get('profile', ''),
+                            'system_fallback': system_snapshot.get('fallback', ''),
+                            'system_fallback_reason': system_snapshot.get('fallback_reason', ''),
+                            'system_fcd': system_snapshot.get('fcd', system_snapshot.get('FCD', '')),
+                        })
+                        loa_popup.close(now_ms)
+                world.render(display)
+                loa_popup.render(display)
+                pygame.display.flip()
+                continue
+
             if args.sync:
                 sim_world.tick()
-            clock.tick_busy_loop(60)
-            if controller.parse_events(client, world, clock, args.sync):
+            if controller.parse_events(client, world, clock, args.sync, events):
                 return
             world.tick(clock)
             world.render(display)
@@ -1344,7 +1684,7 @@ def game_loop(args):
 
 
 def main():
-    argparser = argparse.ArgumentParser(description='CARLA Manual Control Client')
+    argparser = argparse.ArgumentParser(description='CARLA Manual Control Client (UE5)')
     argparser.add_argument(
         '-v', '--verbose', action='store_true', dest='debug',
         help='print debug information')
@@ -1373,6 +1713,33 @@ def main():
         '--gamma', default=1.0, type=float,
         help='Gamma correction of the camera (default: 1.0)')
     argparser.add_argument(
+        '--participantid', default='',
+        help='participant id for label logging')
+    argparser.add_argument(
+        '--environment', default='',
+        help='environment for label logging')
+    argparser.add_argument(
+        '--secondary-task', dest='secondary_task', default='',
+        help='secondary task for label logging')
+    argparser.add_argument(
+        '--functionname', default='Adjust seat positioning',
+        help='function/task name for label logging')
+    argparser.add_argument(
+        '--emotion', default='',
+        help='emotion label for label logging')
+    argparser.add_argument(
+        '--modeltype', default='',
+        help='model type for label logging')
+    argparser.add_argument(
+        '--state-model', dest='state_model', default='',
+        help='state model name for label logging')
+    argparser.add_argument(
+        '--w-fcd', dest='w_fcd', default='', type=float,
+        help='FCD weight for label logging')
+    argparser.add_argument(
+        '--session-id', dest='session_id', default='',
+        help='shared session id for aligning logs')
+    argparser.add_argument(
         '--sync', action='store_true',
         help='Activate synchronous mode execution')
     args = argparser.parse_args()
@@ -1395,4 +1762,5 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()
