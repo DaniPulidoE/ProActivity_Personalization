@@ -2,7 +2,7 @@
 """
 Start both drive_improved.py and provoice in separate terminal windows with shared session_id.
 Usage:
-  python start_both.py --participantid 001 --environment city --secondary-task none \
+  python start_experiment.py --participantid 001 --environment city --secondary-task none \
     --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
 """
 
@@ -12,6 +12,19 @@ import uuid
 import subprocess
 import argparse
 
+VEHICLE_CONFIGS = [
+    (0, "vehicle.sprinter.mercedes"),
+    (5, "vehicle.ambulance.ford"),
+    (10, "vehicle.firetruck.actors"),
+    (15, "vehicle.lincoln.mkz"),
+    (20, "vehicle.dodgecop.charger"),
+    (25, "vehicle.mini.cooper"),
+    (30, "vehicle.dodge.charger"),
+    (35, "vehicle.fuso.mitsubishi"),
+    (40, "vehicle.nissan.patrol"),
+    (45, "vehicle.carlacola.actors"),
+    (50, "vehicle.taxi.ford"),
+]
 
 def write_session_id(root: str) -> str:
     """Generate and atomically write session_id to .session_id file."""
@@ -192,7 +205,7 @@ def start_on_unix(root: str, drive_cmd: str, provoice_cmd: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Start drive_improved.py and provoice with shared session_id"
+        description="Start drive_improvedUE5.py and provoice with shared session_id"
     )
     parser.add_argument("--participantid", default="001", help="Participant ID (default: 001)")
     parser.add_argument("--environment", default="city", help="Environment (default: city)")

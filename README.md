@@ -99,7 +99,7 @@ For best alignment across the two processes, use the same `session_id` in both c
 Use `start_both.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
 
 ```bash
-python start_both.py --participantid 001 --environment city --secondary-task none \
+python start_experiment.py --participantid 001 --environment city --secondary-task none \
   --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
 ```
 
