@@ -1,0 +1,13 @@
+VEHICLE_CONFIGS = [
+    (0, "vehicle.sprinter.mercedes"),
+    (5, "vehicle.ambulance.ford"),
+    (10, "vehicle.firetruck.actors"),
+    (15, "vehicle.lincoln.mkz"),
+    (20, "vehicle.dodgecop.charger"),
+    (25, "vehicle.mini.cooper"),
+    (30, "vehicle.dodge.charger"),
+    (35, "vehicle.fuso.mitsubishi"),
+    (40, "vehicle.nissan.patrol"),
+    (45, "vehicle.carlacola.actors"),
+    (50, "vehicle.taxi.ford"),
+]
