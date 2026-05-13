@@ -23,16 +23,17 @@ FIXED_DELTA_SECONDS = 0.05
 # (spawn_point_index, blueprint_id)
 
 VEHICLE_CONFIGS = [
-    (0,  "vehicle.tesla.model3"),
-    (5,  "vehicle.audi.tt"),
-    (10, "vehicle.bmw.grandtourer"),
-    (15, "vehicle.lincoln.mkz_2020"),
-    (20, "vehicle.mercedes.coupe"),
-    (25, "vehicle.nissan.patrol"),
-    (30, "vehicle.toyota.prius"),
-    (35, "vehicle.ford.mustang"),
-    (40, "vehicle.chevrolet.impala"),
-    (45, "vehicle.dodge.charger"),
+    (0, "vehicle.sprinter.mercedes"),
+    (5, "vehicle.ambulance.ford"),
+    (10, "vehicle.firetruck.actors"),
+    (15, "vehicle.lincoln.mkz"),
+    (20, "vehicle.dodgecop.charger"),
+    (25, "vehicle.mini.cooper"),
+    (30, "vehicle.dodge.charger"),
+    (35, "vehicle.fuso.mitsubishi"),
+    (40, "vehicle.nissan.patrol"),
+    (45, "vehicle.carlacola.actors"),
+    (50, "vehicle.taxi.ford"),
 ]
 
 # =========================
@@ -156,8 +157,8 @@ for spawn_index, blueprint_id in VEHICLE_CONFIGS:
 
 print("NPC traffic running...")
 
-for bp in world.get_blueprint_library().filter('vehicle'):
-    print(bp.id)
+# for bp in world.get_blueprint_library().filter('vehicle'):
+#     print(bp.id)
 
 try:
 
