@@ -86,8 +86,6 @@ class ProcessManager:
 
         p = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
             creationflags=subprocess.CREATE_NEW_CONSOLE
         )
