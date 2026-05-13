@@ -86,8 +86,7 @@ class ProcessManager:
 
         p = subprocess.Popen(
             cmd,
-            text=True,
-            creationflags=subprocess.CREATE_NEW_CONSOLE
+            text=True
         )
 
         self.processes.append((name, p))
