@@ -58,7 +58,7 @@ def build_drive_cmd(session, args):
 
 def build_provoice_cmd(session, args):
     return [
-        "uv",
+        "python",
         "run",
         "provoice",
         f"session_id={session}",
@@ -88,7 +88,8 @@ class ProcessManager:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            creationflags=subprocess.CREATE_NEW_CONSOLE
         )
 
         self.processes.append((name, p))
