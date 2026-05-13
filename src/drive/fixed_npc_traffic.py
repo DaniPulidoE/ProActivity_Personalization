@@ -156,6 +156,9 @@ for spawn_index, blueprint_id in VEHICLE_CONFIGS:
 
 print("NPC traffic running...")
 
+for bp in world.get_blueprint_library().filter('vehicle'):
+    print(bp.id)
+
 try:
 
     while True:
@@ -175,7 +178,6 @@ except KeyboardInterrupt:
         except:
             pass
 
-    # 恢复异步模式
     settings = world.get_settings()
 
     settings.synchronous_mode = False
