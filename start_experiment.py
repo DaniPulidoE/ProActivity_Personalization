@@ -41,7 +41,7 @@ def write_session_id(root: Path) -> str:
 
 def build_drive_cmd(session, args):
     return [
-        "python",
+        sys.executable,
         "-m",
         "src.drive.drive_improved",
         "--control", "test",
@@ -58,7 +58,7 @@ def build_drive_cmd(session, args):
 
 def build_provoice_cmd(session, args):
     return [
-        "python",
+        sys.executable,
         "-m",
         "provoice",
         f"session_id={session}",
