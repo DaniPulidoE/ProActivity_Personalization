@@ -1,246 +1,189 @@
 #!/usr/bin/env python3
 """
-Start both drive_improved.py and provoice in separate terminal windows with shared session_id.
-Usage:
-  python start_experiment.py --participantid 001 --environment city --secondary-task none \
-    --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
+Experiment launcher (CARLA + Drive + ProVoice)
+Improved version: process-controlled instead of terminal-based
 """
 
 import os
 import sys
 import uuid
+import time
 import subprocess
 import argparse
+from pathlib import Path
 
-VEHICLE_CONFIGS = [
-    (0, "vehicle.sprinter.mercedes"),
-    (5, "vehicle.ambulance.ford"),
-    (10, "vehicle.firetruck.actors"),
-    (15, "vehicle.lincoln.mkz"),
-    (20, "vehicle.dodgecop.charger"),
-    (25, "vehicle.mini.cooper"),
-    (30, "vehicle.dodge.charger"),
-    (35, "vehicle.fuso.mitsubishi"),
-    (40, "vehicle.nissan.patrol"),
-    (45, "vehicle.carlacola.actors"),
-    (50, "vehicle.taxi.ford"),
-]
 
-def write_session_id(root: str) -> str:
-    """Generate and atomically write session_id to .session_id file."""
+# =========================
+# CONFIG
+# =========================
+
+
+
+# =========================
+# SESSION
+# =========================
+
+def write_session_id(root: Path) -> str:
     session = str(uuid.uuid4())
-    tmp = os.path.join(root, ".session_id.tmp")
-    path = os.path.join(root, ".session_id")
+    path = root / ".session_id"
+    tmp = root / ".session_id.tmp"
 
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(session)
-    os.replace(tmp, path)
+    tmp.write_text(session)
+    tmp.replace(path)
 
-    print(f"[INFO] Generated session_id: {session}")
-    print(f"[INFO] Wrote to: {path}")
+    print(f"[SESSION] {session}")
     return session
 
 
-def build_drive_command(root: str, session: str, args: dict) -> str:
-    """Build drive_improved.py command."""
-    cmd_parts = [
-        "python -m src.drive.drive_improved",
-        "--control test",
-        f"--session-id {session}",
-        f"--participantid {args['participantid']}",
-        f"--environment {args['environment']}",
-        f"--secondary-task {args['secondary_task']}",
-        f"--functionname \"{args['functionname']}\"",
-        f"--modeltype {args['modeltype']}",
-        f"--state-model {args['state_model']}",
-        f"--w-fcd {args['w_fcd']}",
+# =========================
+# COMMAND BUILDERS (FIXED)
+# =========================
+
+def build_drive_cmd(session, args):
+    return [
+        sys.executable,
+        "-m",
+        "src.drive.drive_improved",
+        "--control", "test",
+        "--session-id", session,
+        "--participantid", args.participantid,
+        "--environment", args.environment,
+        "--secondary-task", args.secondary_task,
+        "--functionname", args.functionname,
+        "--modeltype", args.modeltype,
+        "--state-model", args.state_model,
+        "--w-fcd", str(args.w_fcd),
     ]
-    return " ".join(cmd_parts)
 
 
-def build_provoice_command(session: str, args: dict) -> str:
-    """Build provoice command."""
-    cmd_parts = [
-        "uv run provoice",
+def build_provoice_cmd(session, args):
+    return [
+        "uv",
+        "run",
+        "provoice",
         f"session_id={session}",
-        f"participantid={args['participantid']}",
-        f"environment={args['environment']}",
-        f"secondary_task={args['secondary_task']}",
-        f"functionname={args['functionname']}",
-        f"modeltype={args['modeltype']}",
-        f"state_model={args['state_model']}",
-        f"w_fcd={args['w_fcd']}",
+        f"participantid={args.participantid}",
+        f"environment={args.environment}",
+        f"secondary_task={args.secondary_task}",
+        f"functionname={args.functionname}",
+        f"modeltype={args.modeltype}",
+        f"state_model={args.state_model}",
+        f"w_fcd={args.w_fcd}",
     ]
-    return " ".join(cmd_parts)
 
 
-def start_on_windows(root: str, drive_cmd: str, provoice_cmd: str):
-    """Start processes in new PowerShell windows on Windows."""
-    print("[INFO] Starting on Windows (PowerShell)...")
+# =========================
+# PROCESS MANAGER
+# =========================
 
-    # Start drive_improved in new PowerShell window
-    ps_drive = (
-        f"Set-Location -Path '{root}'; "
-        f"{drive_cmd}; "
-        "Write-Host 'Press any key to close...'; "
-        "$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')"
-    )
-    subprocess.Popen([
-        "powershell.exe",
-        "-NoExit",
-        "-Command",
-        ps_drive
-    ])
-    print("[INFO] Started drive_improved in new PowerShell window")
+class ProcessManager:
+    def __init__(self):
+        self.processes = []
 
-    # Start provoice in new PowerShell window
-    ps_provoice = (
-        f"Set-Location -Path '{root}'; "
-        f"{provoice_cmd}; "
-        "Write-Host 'Press any key to close...'; "
-        "$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')"
-    )
-    subprocess.Popen([
-        "powershell.exe",
-        "-NoExit",
-        "-Command",
-        ps_provoice
-    ])
-    print("[INFO] Started provoice in new PowerShell window")
+    def start(self, cmd, name):
+        print(f"[START] {name}")
+        print("        ", " ".join(cmd))
+
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        self.processes.append((name, p))
+        return p
+
+    def stop_all(self):
+        print("[CLEANUP] stopping processes...")
+
+        for name, p in self.processes:
+            print(f"[STOP] {name}")
+            p.terminate()
+
+        time.sleep(2)
+
+        for name, p in self.processes:
+            if p.poll() is None:
+                print(f"[KILL] {name}")
+                p.kill()
 
 
-def start_on_unix(root: str, drive_cmd: str, provoice_cmd: str):
-    """Start processes in new terminal windows on macOS/Linux."""
-    print("[INFO] Starting on Unix (macOS/Linux)...")
+# =========================
+# WAIT HELPERS (IMPORTANT FOR CARLA)
+# =========================
 
-    system = sys.platform
+def wait_for_carla_ready():
+    print("[WAIT] CARLA warmup...")
+    time.sleep(5)
 
-    if system == "darwin":
-        # macOS: use osascript to open Terminal
-        print("[INFO] Attempting to open new Terminal windows on macOS...")
 
-        # Start drive_improved
-        script_drive = f"""
-        tell application "Terminal"
-            do script "cd '{root}' && {drive_cmd}"
-        end tell
-        """
-        try:
-            subprocess.run([
-                "osascript",
-                "-e",
-                script_drive
-            ], check=True)
-            print("[INFO] Started drive_improved in new Terminal window")
-        except Exception as e:
-            print(f"[WARN] Failed to open Terminal for drive_improved: {e}")
-            print(f"[INFO] You can run manually: cd {root} && {drive_cmd}")
-
-        # Start provoice
-        script_provoice = f"""
-        tell application "Terminal"
-            do script "cd '{root}' && {provoice_cmd}"
-        end tell
-        """
-        try:
-            subprocess.run([
-                "osascript",
-                "-e",
-                script_provoice
-            ], check=True)
-            print("[INFO] Started provoice in new Terminal window")
-        except Exception as e:
-            print(f"[WARN] Failed to open Terminal for provoice: {e}")
-            print(f"[INFO] You can run manually: cd {root} && {provoice_cmd}")
-
-    elif system.startswith("linux"):
-        # Linux: try common terminal emulators
-        print("[INFO] Attempting to open new terminal windows on Linux...")
-
-        terminals = ["gnome-terminal", "konsole", "xterm", "xfce4-terminal"]
-        found = False
-
-        for term in terminals:
-            try:
-                # Try to start drive_improved
-                if term == "gnome-terminal":
-                    subprocess.Popen([term, "--", "bash", "-c", f"cd '{root}' && {drive_cmd}; exec bash"])
-                elif term == "konsole":
-                    subprocess.Popen([term, "-e", "bash", "-c", f"cd '{root}' && {drive_cmd}; exec bash"])
-                elif term == "xfce4-terminal":
-                    subprocess.Popen([term, "-e", f"bash -c 'cd {root} && {drive_cmd}; exec bash'"])
-                else:  # xterm
-                    subprocess.Popen([term, "-e", f"bash -c 'cd {root} && {drive_cmd}; exec bash'"])
-
-                print(f"[INFO] Started drive_improved using {term}")
-                found = True
-                break
-            except FileNotFoundError:
-                continue
-
-        if not found:
-            print("[WARN] Could not find a suitable terminal emulator.")
-            print(f"[INFO] You can run manually in two separate terminals:")
-            print(f"  Terminal 1: cd {root} && {drive_cmd}")
-            print(f"  Terminal 2: cd {root} && {provoice_cmd}")
-            return
-
-        # Try the same terminal for provoice
-        for term in terminals:
-            try:
-                if term == "gnome-terminal":
-                    subprocess.Popen([term, "--", "bash", "-c", f"cd '{root}' && {provoice_cmd}; exec bash"])
-                elif term == "konsole":
-                    subprocess.Popen([term, "-e", "bash", "-c", f"cd '{root}' && {provoice_cmd}; exec bash"])
-                elif term == "xfce4-terminal":
-                    subprocess.Popen([term, "-e", f"bash -c 'cd {root} && {provoice_cmd}; exec bash'"])
-                else:  # xterm
-                    subprocess.Popen([term, "-e", f"bash -c 'cd {root} && {provoice_cmd}; exec bash'"])
-
-                print(f"[INFO] Started provoice using {term}")
-                break
-            except FileNotFoundError:
-                continue
-
+# =========================
+# MAIN
+# =========================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Start drive_improvedUE5.py and provoice with shared session_id"
-    )
-    parser.add_argument("--participantid", default="001", help="Participant ID (default: 001)")
-    parser.add_argument("--environment", default="city", help="Environment (default: city)")
-    parser.add_argument("--secondary-task", default="none", help="Secondary task (default: none)")
-    parser.add_argument("--functionname", default="Adjust seat positioning", help="Function name")
-    parser.add_argument("--modeltype", default="combined", help="Model type (default: combined)")
-    parser.add_argument("--state-model", default="xlstm", help="State model (default: xlstm)")
-    parser.add_argument("--w-fcd", default="0.7", help="FCD weight (default: 0.7)")
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--participantid", default="001")
+    parser.add_argument("--environment", default="city")
+    parser.add_argument("--secondary-task", default="none")
+    parser.add_argument("--functionname", default="Adjust seat positioning")
+    parser.add_argument("--modeltype", default="combined")
+    parser.add_argument("--state-model", default="xlstm")
+    parser.add_argument("--w-fcd", type=float, default=0.7)
 
     args = parser.parse_args()
 
-    root = os.getcwd()
+    root = Path.cwd()
 
-    # Generate and write session_id
     session = write_session_id(root)
 
-    # Build commands
-    drive_cmd = build_drive_command(root, session, vars(args))
-    provoice_cmd = build_provoice_command(session, vars(args))
+    pm = ProcessManager()
 
-    print("\n[INFO] Drive command:")
-    print(f"  {drive_cmd}\n")
-    print("[INFO] ProVoice command:")
-    print(f"  {provoice_cmd}\n")
+    try:
+        # =========================
+        # START CARLA FIRST (IMPORTANT)
+        # =========================
+        # if CARLA has been started，removce this line
+        # pm.start(["./CarlaUnreal.sh"], "CARLA")
 
-    # Start processes based on platform
-    if sys.platform.startswith("win"):
-        start_on_windows(root, drive_cmd, provoice_cmd)
-    else:
-        start_on_unix(root, drive_cmd, provoice_cmd)
+        wait_for_carla_ready()
 
-    print("\n[INFO] Both processes started. Check the opened windows.")
-    print("[INFO] Session ID stored in: .session_id")
+        # =========================
+        # START NPC / TRAFFIC
+        # =========================
+        pm.start(
+            [sys.executable, "-m", "src.drive.fixed_npc_traffic"],
+            "NPC_TRAFFIC"
+        )
+
+        time.sleep(2)
+
+        # =========================
+        # START DRIVE
+        # =========================
+        drive_cmd = build_drive_cmd(session, args)
+        pm.start(drive_cmd, "DRIVE")
+
+        # =========================
+        # START PROVOICE
+        # =========================
+        provoice_cmd = build_provoice_cmd(session, args)
+        pm.start(provoice_cmd, "PROVOICE")
+
+        # =========================
+        # MAIN LOOP (keep alive)
+        # =========================
+        print("[RUNNING] experiment started")
+
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n[EXIT] stopping experiment...")
+        pm.stop_all()
 
 
 if __name__ == "__main__":
     main()
-
