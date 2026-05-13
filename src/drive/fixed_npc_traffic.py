@@ -2,188 +2,162 @@ import carla
 import random
 import time
 
-# =========================
-# CONFIG
-# =========================
 
-CARLA_HOST = "localhost"
-CARLA_PORT = 2000
+class FixedTrafficManager:
+    def __init__(
+        self,
+        host="localhost",
+        port=2000,
+        tm_port=9000,
+        seed=42,
+        sync_mode=True,
+        fixed_delta_seconds=0.05,
+        vehicle_configs=None
+    ):
+        self.host = host
+        self.port = port
+        self.tm_port = tm_port
+        self.seed = seed
+        self.sync_mode = sync_mode
+        self.fixed_delta_seconds = fixed_delta_seconds
 
-TM_PORT = 9000
+        self.client = None
+        self.world = None
+        self.tm = None
 
-SEED = 42
+        self.blueprint_library = None
+        self.spawn_points = None
 
-NUM_VEHICLES = 50
+        self.vehicles = []
 
-SYNC_MODE = True
+        # default configs
+        self.vehicle_configs = vehicle_configs or []
 
-FIXED_DELTA_SECONDS = 0.05
+    # =========================
+    # CONNECT
+    # =========================
+    def connect(self):
+        self.client = carla.Client(self.host, self.port)
+        self.client.set_timeout(10.0)
+        self.world = self.client.get_world()
 
-# fixed npc vehicle config
-# (spawn_point_index, blueprint_id)
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.spawn_points = self.world.get_map().get_spawn_points()
 
-VEHICLE_CONFIGS = [
-    (0, "vehicle.sprinter.mercedes"),
-    (5, "vehicle.ambulance.ford"),
-    (10, "vehicle.firetruck.actors"),
-    (15, "vehicle.lincoln.mkz"),
-    (20, "vehicle.dodgecop.charger"),
-    (25, "vehicle.mini.cooper"),
-    (30, "vehicle.dodge.charger"),
-    (35, "vehicle.fuso.mitsubishi"),
-    (40, "vehicle.nissan.patrol"),
-    (45, "vehicle.carlacola.actors"),
-    (50, "vehicle.taxi.ford"),
-]
+        random.seed(self.seed)
 
-# =========================
-# CONNECT
-# =========================
+    # =========================
+    # WORLD SETUP
+    # =========================
+    def setup_world(self):
+        settings = self.world.get_settings()
 
-client = carla.Client(CARLA_HOST, CARLA_PORT)
-client.set_timeout(10.0)
+        settings.synchronous_mode = self.sync_mode
 
-world = client.get_world()
-
-# =========================
-# SYNCHRONOUS MODE
-# =========================
-
-settings = world.get_settings()
-
-if SYNC_MODE:
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
-else:
-    settings.synchronous_mode = False
-
-world.apply_settings(settings)
-
-# =========================
-# TRAFFIC MANAGER
-# =========================
-
-tm = client.get_trafficmanager(TM_PORT)
-
-tm.set_synchronous_mode(SYNC_MODE)
-
-tm.set_random_device_seed(SEED)
-
-tm.set_hybrid_physics_mode(True)
-
-# =========================
-# RANDOM SEED
-# =========================
-
-random.seed(SEED)
-
-# =========================
-# CLEAN OLD VEHICLES
-# =========================
-
-print("Destroying old vehicles...")
-
-actors = world.get_actors()
-
-old_vehicles = actors.filter('vehicle.*')
-
-for vehicle in old_vehicles:
-    try:
-        vehicle.destroy()
-    except:
-        pass
-
-time.sleep(1)
-
-# =========================
-# SPAWN VEHICLES
-# =========================
-
-blueprint_library = world.get_blueprint_library()
-
-spawn_points = world.get_map().get_spawn_points()
-
-vehicles_list = []
-
-print("Spawning fixed NPC vehicles...")
-
-for spawn_index, blueprint_id in VEHICLE_CONFIGS:
-
-    if spawn_index >= len(spawn_points):
-        print(f"Spawn point {spawn_index} not available")
-        continue
-
-    try:
-
-        blueprint = blueprint_library.find(blueprint_id)
-
-        transform = spawn_points[spawn_index]
-
-        vehicle = world.try_spawn_actor(
-            blueprint,
-            transform
-        )
-
-        if vehicle is None:
-            print(f"Failed spawn at {spawn_index}")
-            continue
-
-        # autopilot
-        vehicle.set_autopilot(True, TM_PORT)
-
-        # lane change
-        tm.auto_lane_change(vehicle, True)
-
-        tm.distance_to_leading_vehicle(vehicle, 5.0)
-
-        tm.vehicle_percentage_speed_difference(
-            vehicle,
-            random.uniform(-10, 10)
-        )
-
-        vehicles_list.append(vehicle)
-
-        print(
-            f"Spawned: {vehicle.type_id} "
-            f"at spawn point {spawn_index}"
-        )
-
-    except Exception as e:
-        print(e)
-
-# =========================
-# MAIN LOOP
-# =========================
-
-print("NPC traffic running...")
-
-# for bp in world.get_blueprint_library().filter('vehicle'):
-#     print(bp.id)
-
-try:
-
-    while True:
-
-        if SYNC_MODE:
-            world.tick()
+        if self.sync_mode:
+            settings.fixed_delta_seconds = self.fixed_delta_seconds
         else:
-            world.wait_for_tick()
+            settings.fixed_delta_seconds = None
 
-except KeyboardInterrupt:
+        self.world.apply_settings(settings)
 
-    print("Cleaning up vehicles...")
+        # traffic manager
+        self.tm = self.client.get_trafficmanager(self.tm_port)
+        self.tm.set_synchronous_mode(self.sync_mode)
+        self.tm.set_random_device_seed(self.seed)
+        self.tm.set_hybrid_physics_mode(True)
 
-    for vehicle in vehicles_list:
+    # =========================
+    # SPAWN VEHICLES
+    # =========================
+    def spawn_vehicles(self):
+        print("Destroying old vehicles...")
+
+        actors = self.world.get_actors()
+        for actor in actors.filter("vehicle.*"):
+            try:
+                actor.destroy()
+            except:
+                pass
+
+        time.sleep(1)
+
+        print("Spawning fixed NPC vehicles...")
+
+        for spawn_index, blueprint_id in self.vehicle_configs:
+
+            if spawn_index >= len(self.spawn_points):
+                print(f"Spawn point {spawn_index} not available")
+                continue
+
+            try:
+                bp = self.blueprint_library.find(blueprint_id)
+                transform = self.spawn_points[spawn_index]
+
+                vehicle = self.world.try_spawn_actor(bp, transform)
+
+                if vehicle is None:
+                    print(f"Failed spawn at {spawn_index}")
+                    continue
+
+                # autopilot
+                vehicle.set_autopilot(True, self.tm_port)
+
+                # traffic manager rules
+                self.tm.auto_lane_change(vehicle, True)
+
+                self.tm.distance_to_leading_vehicle(vehicle, 5.0)
+
+                self.tm.vehicle_percentage_speed_difference(
+                    vehicle,
+                    random.uniform(-10, 10)
+                )
+
+                self.vehicles.append(vehicle)
+
+                print(f"Spawned {vehicle.type_id} at {spawn_index}")
+
+            except Exception as e:
+                print("Spawn error:", e)
+
+    # =========================
+    # RUN LOOP
+    # =========================
+    def run(self, tick_callback=None):
+        print("NPC traffic running...")
+
         try:
-            vehicle.destroy()
-        except:
-            pass
+            while True:
 
-    settings = world.get_settings()
+                if self.sync_mode:
+                    self.world.tick()
+                else:
+                    self.world.wait_for_tick()
 
-    settings.synchronous_mode = False
-    settings.fixed_delta_seconds = None
+                if tick_callback:
+                    tick_callback(self.world, self.vehicles)
 
-    world.apply_settings(settings)
+        except KeyboardInterrupt:
+            print("Stopping traffic...")
+            self.cleanup()
 
-    print("Done.")
+    # =========================
+    # CLEANUP
+    # =========================
+    def cleanup(self):
+        print("Cleaning up vehicles...")
+
+        for v in self.vehicles:
+            try:
+                v.destroy()
+            except:
+                pass
+
+        self.vehicles.clear()
+
+        settings = self.world.get_settings()
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        self.world.apply_settings(settings)
+
+        print("Done.")

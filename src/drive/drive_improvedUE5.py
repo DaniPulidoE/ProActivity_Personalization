@@ -57,6 +57,8 @@ import carla
 
 from carla import ColorConverter as cc
 
+from fixed_npc_traffic import FixedTrafficManager
+
 import argparse
 import collections
 import csv
@@ -195,6 +197,22 @@ USER_LOA_LABEL_COLUMNS = [
     'system_fallback_reason',
     'system_fcd',
 ]
+
+
+VEHICLE_CONFIGS = [
+    (0, "vehicle.sprinter.mercedes"),
+    (5, "vehicle.ambulance.ford"),
+    (10, "vehicle.firetruck.actors"),
+    (15, "vehicle.lincoln.mkz"),
+    (20, "vehicle.dodgecop.charger"),
+    (25, "vehicle.mini.cooper"),
+    (30, "vehicle.dodge.charger"),
+    (35, "vehicle.fuso.mitsubishi"),
+    (40, "vehicle.nissan.patrol"),
+    (45, "vehicle.carlacola.actors"),
+    (50, "vehicle.taxi.ford"),
+]
+
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -1588,7 +1606,27 @@ def game_loop(args):
     world = None
     original_settings = None
 
+    tm = FixedTrafficManager(
+        host="localhost",
+        port=2000,
+        tm_port=9000,
+        seed=42,
+        sync_mode=True,
+        fixed_delta_seconds=0.05,
+        vehicle_configs=VEHICLE_CONFIGS
+    )
+
     try:
+        # =========== setup npc traffics ====================
+
+
+        tm.connect()
+        tm.setup_world()
+        tm.spawn_vehicles()
+
+        tm.run()
+
+        # =========== setup player vehicle ==================
         client = carla.Client(args.host, args.port)
         client.set_timeout(2000.0)
 
@@ -1732,6 +1770,7 @@ def game_loop(args):
         if world is not None:
             world.destroy()
 
+        tm.cleanup()
         pygame.quit()
 
 
