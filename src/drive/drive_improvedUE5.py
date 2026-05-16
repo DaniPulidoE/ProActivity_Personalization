@@ -367,8 +367,8 @@ class LoASelectionPopup(object):
         display.blit(overlay, (0, 0))
 
         lines = [
-            (self._title_font, 'LoA Selection Required'),
-            (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
+            (self._title_font, 'Level of Proactivity Selection Required'),
+            (self._text_font, 'Please choose the proper Level of Proactivity for the last 20 seconds.'),
             (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
             (self._small_font, '0: None (No assistive action is taken)'),
             (self._small_font, '1: Suggest (Give Suggestion)'),
