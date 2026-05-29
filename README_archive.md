@@ -6,19 +6,18 @@ Before you begin, ensure you have:
 
 ### Required Software
 - **Python >= 3.10, < 3.11**
-- **CARLA Simulator 0.10.0** - [Installation Guide](https://carla-ue5.readthedocs.io/en/latest/start_quickstart/)
-  - ⚠️ **Important**: CARLA 0.10.0 is required; other versions may not be compatible
+- **CARLA Simulator 0.9.16** - [Installation Guide](https://carla.readthedocs.io/en/latest/start_quickstart/)
+  - ⚠️ **Important**: CARLA 0.9.16 is required; other versions may not be compatible
 - **uv Package Manager** - [Installation Guide](https://docs.astral.sh/uv/getting-started/installation/)
 
 ### System Requirements
-- **OS**: Windows 11, macOS (Apple Silicon required), or Linux
-  - Strongly recommended: Windows 11
+- **OS**: macOS (Apple Silicon recommended), Windows 11, or Linux
 - **GPU**: Dedicated GPU recommended for better performance
 
 ### Platform-Specific Setup
+- **macOS (Apple Silicon)**: See [Mac Setup Guide](docs/README_macOS_carla_setup.md)
 - **Windows**: Standard installation should work
 - **Linux**: Standard installation should work
-- **macOS (Apple Silicon)**: See [Mac Setup Guide](docs/README_macOS_carla_setup.md)
 
 ## Installation
 
@@ -28,21 +27,18 @@ cd proactivity-main
 uv sync  # Install dependencies (required on first run)
 ```
 
-### Step 2: Manualloy install CARLA python package 0.10.0
-Install the pacakge through `wheels/carla-0.10.0-cp310-cp310-win_amd64.whl`
-
-### Step 3: Start CARLA Simulator
+### Step 2: Start CARLA Simulator
 ```bash
 # Windows
-CarlaUE5.exe -quality-level=Low
+CarlaUE4.exe -quality-level=Low
 
-# Linux
-./CarlaUE5.sh -quality-level=Low
+# macOS/Linux
+./CarlaUE4.sh -quality-level=Low
 ```
 
-> **Note**:
-> Use `-quality-level=Low` for better performance if you have limited resources. 
-> Use `-RenderOffScreen` for better performance if you have limited resources
+> **Note**: Use `-quality-level=Low` for better performance if you have limited resources
+> 
+> **Note**: Use `-RenderOffScreen` for better performance if you have limited resources
 
 
 
@@ -52,12 +48,12 @@ CarlaUE5.exe -quality-level=Low
 
 Start the driving simulator in test mode (clean interface, basic controls only):
 ```bash
-python -m src.drive.drive_improvedUE5 --control test
+python -m src.drive.drive_improved --control test
 ```
 
 For full controls including weather, cameras, and telemetry:
 ```bash
-python -m src.drive.drive_improvedUE5 --control full
+python -m src.drive.drive_improved --control full
 ```
 
 > For detailed options, please refer to the [Control Modes](docs/README_DRIVE_CONTROL_MODES.md) section.
@@ -66,7 +62,7 @@ python -m src.drive.drive_improvedUE5 --control full
 
 In a **separate terminal**, run:
 
-#### Option 1: Using UV
+#### Option 1: Using UV (Recommended)
 ```bash
 uv run provoice \
   participantid=001 \
@@ -100,7 +96,7 @@ For best alignment across the two processes, use the same `session_id` in both c
 
 #### Quick Start (Recommended)
 
-Use `start_experiment.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
+Use `start_both.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
 
 ```bash
 python start_experiment.py --participantid 001 --environment city --secondary-task none \
@@ -110,12 +106,10 @@ python start_experiment.py --participantid 001 --environment city --secondary-ta
 This script will:
 1. Generate a unique `session_id` and save it to `.session_id`
 2. Open two new terminal windows (PowerShell on Windows, Terminal/gnome-terminal on macOS/Linux)
-3. Launch `drive_improvedUE5.py` in the first window
+3. Launch `drive_improved.py` in the first window
 4. Launch `provoice` in the second window
 
 Both processes will automatically use the same session ID for data alignment.
-
-> **Note**: Please do activate the correct Python environment before running this script.
 
 #### Manual Launch (Alternative)
 
@@ -159,8 +153,9 @@ proactivity-main/
 ├── start_both.py              # Launcher script (recommended for starting both processes)
 ├── src/
 │   ├── drive/                  # Driving simulation module
-│   │   ├── drive_improvedUE5.py   # Enhanced CARLA manual control
+│   │   ├── drive_improved.py   # Enhanced CARLA manual control
 │   │   ├── drive.py            # Basic driving interface
+│   │   └── wheel.py            # Wheel controller support
 │   │
 │   └── ProVoice/               # AI assistant module
 │       ├── main.py             # Entry point
@@ -187,7 +182,7 @@ proactivity-main/
 ### Drive Script Options
 
 ```bash
-python -m src.drive.drive_improvedUE5 --help
+python -m src.drive.drive_improved --help
 ```
 
 Common options:
@@ -230,8 +225,8 @@ ffmpeg -f avfoundation -framerate 30 -i "0" -vcodec mpeg4 -f mpegts udp://127.0.
 - **[Original Documentation](docs/README_original.md)** - Archived original guide
 
 ### Additional Resources
-- [CARLA Documentation](https://carla-ue5.readthedocs.io)
-- [CARLA Python API Reference](https://carla-ue5.readthedocs.io/en/latest/python_api/)
+- [CARLA Documentation](https://carla.readthedocs.io/)
+- [CARLA Python API Reference](https://carla.readthedocs.io/en/latest/python_api/)
 
 
 ## License

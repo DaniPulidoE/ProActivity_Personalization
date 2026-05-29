@@ -34,14 +34,14 @@
 
 ### Default (test mode):
 ```bash
-python -m drive.drive_improved
+python -m drive.drive_improvedUE5
 ```
 or explicitly:
 ```bash
-python -m drive.drive_improved --control test
+python -m drive.drive_improvedUE5 --control test
 ```
 
 ### Full control mode:
 ```bash
-python -m drive.drive_improved --control full
+python -m drive.drive_improvedUE5 --control full
 ```
