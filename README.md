@@ -1,5 +1,10 @@
 # ProActivity / ProVoice
 
+## Description
+
+Forked from https://github.com/LouisSY/ProActivity, will be adding a layer of personalization on top of the predictions.
+No changes made so far.
+
 ## Prerequisites
 
 Before you begin, ensure you have:
