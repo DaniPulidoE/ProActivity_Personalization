@@ -67,6 +67,7 @@ class DataCollector:
         cam_index: int | str = 0,
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
+        window_size: int = 256,
     ) -> None:
         self.visual_enabled = bool(visual and HAS_CV2)
         self.phys_enabled = bool(physiological)
@@ -132,6 +133,8 @@ class DataCollector:
         self.latest_data: Dict[str, Any] = {}
         self.bpm_history: list = []
         self.rr_history: list = []
+        self.data_history: list = []
+        self.window_size = window_size
         self.blink_count = 0
         self.yawn_count = 0
         self.perclos = 0.0
@@ -366,12 +369,22 @@ class DataCollector:
         while self._running:
             try:
                 data = self.collect_data()
+                
+                # Add sequence for LSTM models
+                with self._lock:
+                    self.data_history.append(dict(data))
+                    if len(self.data_history) > self.window_size:
+                        self.data_history.pop(0)
 
                 action = None
                 if self.decision_engine:
     
                     data['functionname'] = data.get('functionname', self.functionname)
-                    action = self.decision_engine.decide(dict(data))
+                    # separate dict to avoid adding the whole history to each sequence entry
+                    data_for_decision = dict(data)
+                    data_for_decision['sequence'] = list(self.data_history)
+
+                    action = self.decision_engine.decide(dict(data_for_decision))
                     if self.logger and isinstance(action, dict):
                         action_for_log = dict(action)
                         for key in ('session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):

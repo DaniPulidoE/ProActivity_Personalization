@@ -16,7 +16,7 @@ def main():
 
     NUM_VEHICLES = 50
 
-    SYNC_MODE = True
+    SYNC_MODE = False
 
     FIXED_DELTA_SECONDS = 0.05
 

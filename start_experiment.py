@@ -59,8 +59,7 @@ def build_drive_cmd(session, args):
 def build_provoice_cmd(session, args):
     return [
         sys.executable,
-        "-m",
-        "provoice",
+        "src/ProVoice/main.py",
         f"session_id={session}",
         f"participantid={args.participantid}",
         f"environment={args.environment}",
@@ -156,7 +155,7 @@ def main():
             "NPC_TRAFFIC"
         )
 
-        time.sleep(2)
+        time.sleep(6)
 
         # =========================
         # START DRIVE
