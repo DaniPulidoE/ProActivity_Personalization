@@ -5,20 +5,19 @@
 Before you begin, ensure you have:
 
 ### Required Software
-- **Python >= 3.10, < 3.11**
-- **CARLA Simulator 0.10.0** - [Installation Guide](https://carla-ue5.readthedocs.io/en/latest/start_quickstart/)
-  - ⚠️ **Important**: CARLA 0.10.0 is required; other versions may not be compatible
+- **Python 3.12** (`>=3.12,<3.13`)
+- **CARLA Simulator 0.10.0** - [Installation Guide](https://carla.readthedocs.io/en/latest/start_quickstart/)
+  - The 0.10 Python wheel bundled in `wheels/` is for CPython 3.12 on Windows. For Linux, install the matching wheel from `<CARLA_ROOT>/PythonAPI/carla/dist/`.
 - **uv Package Manager** - [Installation Guide](https://docs.astral.sh/uv/getting-started/installation/)
 
 ### System Requirements
-- **OS**: Windows 11, macOS (Apple Silicon required), or Linux
-  - Strongly recommended: Windows 11
+- **OS**: Windows 11 (the bundled CARLA 0.10 Python wheel is Windows-only; `tool.uv.environments` in `pyproject.toml` is scoped to `win32`). To use Linux/macOS, drop in the matching `carla-0.10.0-*-linux_x86_64.whl` from `<CARLA_ROOT>/PythonAPI/carla/dist/` and widen `tool.uv.environments`.
 - **GPU**: Dedicated GPU recommended for better performance
 
 ### Platform-Specific Setup
-- **Windows**: Standard installation should work
-- **Linux**: Standard installation should work
-- **macOS (Apple Silicon)**: See [Mac Setup Guide](docs/README_macOS_carla_setup.md)
+- **Windows**: Standard installation works out of the box
+- **macOS (Apple Silicon)**: See [Mac Setup Guide](docs/README_macOS_carla_setup.md) (untested with CARLA 0.10)
+- **Linux**: Standard installation works once the Linux carla wheel is wired up (see above)
 
 ## Installation
 
@@ -28,16 +27,16 @@ cd proactivity-main
 uv sync  # Install dependencies (required on first run)
 ```
 
-### Step 2: Manualloy install CARLA python package 0.10.0
-Install the pacakge through `wheels/carla-0.10.0-cp310-cp310-win_amd64.whl`
+### Step 2: Manually install CARLA python package 0.10.0
+Install the package through `wheels/carla-0.10.0-cp312-cp312-win_amd64.whl`
 
 ### Step 3: Start CARLA Simulator
 ```bash
 # Windows
-CarlaUE5.exe -quality-level=Low
+CarlaUnreal.exe -quality-level=Low
 
-# Linux
-./CarlaUE5.sh -quality-level=Low
+# macOS/Linux
+./CarlaUnreal.sh -quality-level=Low
 ```
 
 > **Note**:
@@ -52,12 +51,12 @@ CarlaUE5.exe -quality-level=Low
 
 Start the driving simulator in test mode (clean interface, basic controls only):
 ```bash
-python -m src.drive.drive_improvedUE5 --control test
+python -m src.drive.drive_improved --control test
 ```
 
 For full controls including weather, cameras, and telemetry:
 ```bash
-python -m src.drive.drive_improvedUE5 --control full
+python -m src.drive.drive_improved --control full
 ```
 
 > For detailed options, please refer to the [Control Modes](docs/README_DRIVE_CONTROL_MODES.md) section.
@@ -110,7 +109,7 @@ python start_experiment.py --participantid 001 --environment city --secondary-ta
 This script will:
 1. Generate a unique `session_id` and save it to `.session_id`
 2. Open two new terminal windows (PowerShell on Windows, Terminal/gnome-terminal on macOS/Linux)
-3. Launch `drive_improvedUE5.py` in the first window
+3. Launch `drive_improved.py` in the first window
 4. Launch `provoice` in the second window
 
 Both processes will automatically use the same session ID for data alignment.
@@ -159,13 +158,15 @@ proactivity-main/
 ├── start_both.py              # Launcher script (recommended for starting both processes)
 ├── src/
 │   ├── drive/                  # Driving simulation module
-│   │   ├── drive_improvedUE5.py   # Enhanced CARLA manual control
+│   │   ├── drive_improved.py   # Enhanced CARLA manual control
 │   │   ├── drive.py            # Basic driving interface
 │   │
 │   └── ProVoice/               # AI assistant module
 │       ├── main.py             # Entry point
 │       ├── decision_engine.py   # AI decision making
 │       ├── data_collector.py    # Data collection
+│       ├── perception.py        # EAR/MAR (MediaPipe) + YOLO26 distraction detection
+│       ├── train_distraction.py # Fine-tune YOLO26 on a custom distraction dataset
 │       ├── train_fcd_loa.py     # Model training (FCD)
 │       ├── train_XLSTM.py       # Model training (XLSTM)
 │       └── webui/               # Dashboard interface
@@ -182,12 +183,71 @@ proactivity-main/
 └── README.md                  # This file
 ```
 
+## Driver Perception (EAR / MAR / Distraction)
+
+`src/ProVoice/data_collector.py` no longer depends on the upstream
+`yolov5-deepsort-driverdistracted-driving-behavior-detection` package
+(which pinned the project to Python 3.10 via its bundled `dlib` wheels
+and a custom YOLOv5 codebase). It now uses the in-tree module
+`src/ProVoice/perception.py`, which stacks two modern libraries:
+
+| Signal | Implementation |
+|---|---|
+| Eye / mouth aspect ratio (`eye_ar`, `mar`) | MediaPipe FaceMesh |
+| Distraction labels (`safe`, `phone`, `drink`, `distracted`) | Ultralytics YOLO26 (classification) |
+
+**The distraction model is not stored in this repo.** It is downloaded on
+first use from the Hugging Face Hub
+([`maco018/in-car-distraction-yolo26`](https://huggingface.co/maco018/in-car-distraction-yolo26))
+and cached locally by `huggingface_hub` (so it only downloads once). The
+repo hosts the full **YOLO26 classification series** (`n`/`s`/`m`/`l`/`x`)
+fine-tuned on the
+[State Farm Distracted Driver Detection](https://www.kaggle.com/competitions/state-farm-distracted-driver-detection)
+dataset — real in-cabin, driver-facing frames. The default variant is
+`l` (best accuracy, 94.6% top-1 on held-out drivers).
+
+Weights resolution precedence (first match wins):
+1. `weights=` arg passed to `DistractionDetector(...)`
+2. `PROVOICE_YOLO_WEIGHTS` env var — absolute path to a local `.pt` (offline use)
+3. Hugging Face download of `PROVOICE_YOLO_VARIANT` (`n`/`s`/`m`/`l`/`x`, default `l`)
+   from `PROVOICE_YOLO_REPO` (default `maco018/in-car-distraction-yolo26`)
+
+`face` is set whenever MediaPipe detects a face (independent of YOLO).
+The classifier runs at **imgsz 224** (its training resolution) — this is
+auto-detected from the checkpoint.
+
+### Retraining (e.g. when a newer YOLO release lands)
+
+The training pipeline is kept in-repo so the models can be regenerated:
+
+```bash
+# 1. Download the State Farm dataset from Kaggle into
+#    datasets/state-farm-distracted-driver-detection/, then build the
+#    subject-aware YOLO classification split:
+uv run python scripts/build_statefarm_dataset.py
+
+# 2a. Fine-tune a single variant:
+uv run --no-sync python -m ProVoice.train_distraction \
+    --task classify --data datasets/distraction_sf \
+    --weights yolo26l-cls.pt --epochs 50 --imgsz 224 --cos-lr --device 0
+
+# 2b. ...or train the whole n/s/m/l/x series and package each for upload:
+uv run --no-sync python scripts/train_yolo26_series.py --variants n,s,m,l,x
+
+# 3. Upload the packaged exports/ folder to Hugging Face:
+huggingface-cli upload maco018/in-car-distraction-yolo26 \
+    exports/provoice-distraction-yolo26 . --repo-type model
+```
+
+> On an NVIDIA GPU, run `python scripts/setup_cuda_torch.py` once first to
+> overlay the CUDA build of PyTorch (see the script header for why).
+
 ## Advanced Options
 
 ### Drive Script Options
 
 ```bash
-python -m src.drive.drive_improvedUE5 --help
+python -m src.drive.drive_improved --help
 ```
 
 Common options:

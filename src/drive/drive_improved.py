@@ -48,12 +48,10 @@ Additional Controls (only in --control full mode):
     CTRL + -     : decrements the start time of the replay by 1 second (+SHIFT = 10 seconds)
 """
 
-from __future__ import print_function
 
 # ==============================================================================
 # -- imports -------------------------------------------------------------------
 # ==============================================================================
-
 
 import carla
 
@@ -123,6 +121,37 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+OBJECT_TO_COLOR = [
+    (255, 255, 255),
+    (128, 64, 128),
+    (244, 35, 232),
+    (70, 70, 70),
+    (102, 102, 156),
+    (190, 153, 153),
+    (153, 153, 153),
+    (250, 170, 30),
+    (220, 220, 0),
+    (107, 142,  35),
+    (152, 251, 152),
+    (70, 130, 180),
+    (220, 20, 60),
+    (255, 0, 0),
+    (0, 0, 142),
+    (0, 0, 70),
+    (0,  60, 100),
+    (0,  80, 100),
+    (0, 0, 230),
+    (119, 11, 32),
+    (110, 190, 160),
+    (170, 120, 50),
+    (55, 90, 80),
+    (45, 60, 150),
+    (157, 234, 50),
+    (81, 0, 81),
+    (150, 100, 100),
+    (230, 150, 140),
+    (180, 165, 180),
+]
 
 DEFAULT_DECISION_COLUMNS = [
     'action',
@@ -167,46 +196,9 @@ USER_LOA_LABEL_COLUMNS = [
     'system_fcd',
 ]
 
-
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
 # ==============================================================================
-
-
-def find_weather_presets():
-    rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
-    name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
-    presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
-    return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]
-
-
-def get_actor_display_name(actor, truncate=250):
-    name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
-    return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
-
-def get_actor_blueprints(world, filter, generation):
-    bps = world.get_blueprint_library().filter(filter)
-
-    if generation.lower() == "all":
-        return bps
-
-    # If the filter returns only one bp, we assume that this one needed
-    # and therefore, we ignore the generation
-    if len(bps) == 1:
-        return bps
-
-    try:
-        int_generation = int(generation)
-        # Check if generation is in available generations
-        if int_generation in [1, 2, 3]:
-            bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
-            return bps
-        else:
-            print("   Warning! Actor Generation is not valid. No actor will be spawned.")
-            return []
-    except:
-        print("   Warning! Actor Generation is not valid. No actor will be spawned.")
-        return []
 
 
 def _read_csv_headers(path):
@@ -347,8 +339,11 @@ class LoASelectionPopup(object):
         self.window_start_ms = max(self.session_started_ms, now_ms - self.interval_ms)
         self.window_end_ms = now_ms
         if self.session_started_walltime is not None:
-            self.window_start_timestamp = (self.session_started_walltime + datetime.timedelta(milliseconds=self.window_start_ms - self.session_started_ms)).isoformat(timespec='milliseconds')
-            self.window_end_timestamp = (self.session_started_walltime + datetime.timedelta(milliseconds=self.window_end_ms - self.session_started_ms)).isoformat(timespec='milliseconds')
+            elapsed = now_ms - self.session_started_ms
+            start_wall = self.session_started_walltime + datetime.timedelta(milliseconds=self.window_start_ms - self.session_started_ms)
+            end_wall = self.session_started_walltime + datetime.timedelta(milliseconds=self.window_end_ms - self.session_started_ms)
+            self.window_start_timestamp = start_wall.isoformat()
+            self.window_end_timestamp = end_wall.isoformat()
 
     def close(self, now_ms):
         self.active = False
@@ -372,10 +367,14 @@ class LoASelectionPopup(object):
         display.blit(overlay, (0, 0))
 
         lines = [
-            (self._title_font, 'LoA Selection Required'),
-            (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
+            (self._title_font, 'Level of Proactivity Selection Required'),
+            (self._text_font, 'Please choose the proper Level of Proactivity for the last 20 seconds.'),
             (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
-            (self._small_font, '0=none  1=suggest  2=ask_approval  3=auto_with_veto  4=auto'),
+            (self._small_font, '0: None (No assistive action is taken)'),
+            (self._small_font, '1: Suggest (Give Suggestion)'),
+            (self._small_font, '2: Ask Approval (Ask for user confirmation)'),
+            (self._small_font, '3: Auto with Veto (Execute automatically but user can veto)'),
+            (self._small_font, '4: Auto (Fully automatic)'),
         ]
 
         y = int(self.height * 0.35)
@@ -433,15 +432,52 @@ class StartScreenOverlay(object):
         display.blit(label, label_rect)
 
 
+def find_weather_presets():
+    rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
+    name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
+    presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
+    return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]
+
+
+def get_actor_display_name(actor, truncate=250):
+    name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
+    return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
+
+def get_actor_blueprints(world, filter, generation):
+    bps = world.get_blueprint_library().filter(filter)
+
+    if generation.lower() == "all":
+        return bps
+
+    # If the filter returns only one bp, we assume that this one needed
+    # and therefore, we ignore the generation
+    if len(bps) == 1:
+        return bps
+
+    try:
+        int_generation = int(generation)
+        # Check if generation is in available generations
+        if int_generation in [1, 2, 3, 4]:
+            bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
+            return bps
+        else:
+            print("   Warning! Actor Generation is not valid. No actor will be spawned.")
+            return []
+    except:
+        print("   Warning! Actor Generation is not valid. No actor will be spawned.")
+        return []
+
+
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
 
 
 class World(object):
-    def __init__(self, carla_world, hud, args):
+    def __init__(self, carla_world, hud, traffic_manager, args):
         self.world = carla_world
         self.sync = args.sync
+        self.traffic_manager = traffic_manager
         self.actor_role_name = args.rolename
         self.control_mode = args.control  # Store control mode
         try:
@@ -492,10 +528,17 @@ class World(object):
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        # Use a fixed vehicle blueprint -- vehicle.dodge.charger_2020
-        blueprint = self.world.get_blueprint_library().find('vehicle.dodge.charger_2020')
+        # Get a random blueprint.
+        blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
+        if not blueprint_list:
+            raise ValueError("Couldn't find any blueprints with the specified filters")
+        # blueprint = random.choice(blueprint_list)
+        # for vehicle_model in blueprint_list:
+        #     print(vehicle_model)
+        # Use a fixed vehicle blueprint -- vehicle.dodge.charger
+        blueprint = self.world.get_blueprint_library().find('vehicle.dodge.charger')
         if blueprint is None:
-            raise ValueError("Couldn't find blueprint 'vehicle.dodge.charger_2020'")
+            raise ValueError("Couldn't find blueprint 'vehicle.dodge.charger'")
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('terramechanics'):
             blueprint.set_attribute('terramechanics', 'true')
@@ -525,7 +568,7 @@ class World(object):
         while self.player is None:
             if not self.map.get_spawn_points():
                 print('There are no spawn points available in your map/town.')
-                print('Please add some Vehicle Spawn Point to your UE4 scene.')
+                print('Please add some Vehicle Spawn Point to your UE5 scene.')
                 sys.exit(1)
             spawn_points = self.map.get_spawn_points()
             spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
@@ -543,7 +586,7 @@ class World(object):
             print(f"[INFO] Written vehicle id to {id_file}")
         except Exception as e:
             print("[WARN] Failed to write vehicle id file:", e)
-            
+
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud, self.control_mode)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud, self.control_mode)
@@ -555,6 +598,7 @@ class World(object):
         actor_type = get_actor_display_name(self.player)
         if self.control_mode == 'full':
             self.hud.notification(actor_type)
+        self.traffic_manager.update_vehicle_lights(self.player, True)
 
         if self.sync:
             self.world.tick()
@@ -657,7 +701,7 @@ class KeyboardControl(object):
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
-        if (control_mode == 'full'):
+        if self._control_mode == 'full':
             world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
     def parse_events(self, client, world, clock, sync_mode, events=None):
@@ -756,7 +800,7 @@ class KeyboardControl(object):
                             if self._control_mode == 'full':
                                 world.hud.notification("Recorder is OFF")
                         else:
-                            client.start_recorder("manual_recording.log")
+                            client.start_recorder("manual_recording.rec")
                             world.recording_enabled = True
                             if self._control_mode == 'full':
                                 world.hud.notification("Recorder is ON")
@@ -771,9 +815,9 @@ class KeyboardControl(object):
                         self._autopilot_enabled = False
                         world.player.set_autopilot(self._autopilot_enabled)
                         if self._control_mode == 'full':
-                            world.hud.notification("Replaying file 'manual_recording.log'")
+                            world.hud.notification("Replaying file 'manual_recording.rec'")
                         # replayer
-                        client.replay_file("manual_recording.log", world.recording_start, 0, 0)
+                        client.replay_file("manual_recording.rec", world.recording_start, 0, 0)
                         world.camera_manager.set_sensor(current_index)
                     elif event.key == K_MINUS and (pygame.key.get_mods() & KMOD_CTRL):
                         if pygame.key.get_mods() & KMOD_SHIFT:
@@ -872,8 +916,7 @@ class KeyboardControl(object):
                 else: # Remove the Reverse flag
                     current_lights &= ~carla.VehicleLightState.Reverse
                 if current_lights != self._lights: # Change the light state only if necessary
-                    self._lights = current_lights
-                    world.player.set_light_state(carla.VehicleLightState(self._lights))
+                    world.player.set_light_state(carla.VehicleLightState(current_lights))
                 # Apply control
                 if not self._ackermann_enabled:
                     world.player.apply_control(self._control)
@@ -887,6 +930,8 @@ class KeyboardControl(object):
             elif isinstance(self._control, carla.WalkerControl):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time(), world)
                 world.player.apply_control(self._control)
+
+        self._lights = current_lights
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         if keys[K_UP] or keys[K_w]:
@@ -1404,7 +1449,7 @@ class CameraManager(object):
                 (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=0, y=-2.5, z=-0.0), carla.Rotation(yaw=90.0)), Attachment.Rigid)]
 
-        self.transform_index = 0
+        self.transform_index = 1
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}],
             ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)', {}],
@@ -1412,11 +1457,9 @@ class CameraManager(object):
             ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)', {}],
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)', {}],
             ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)', {}],
-            ['sensor.camera.instance_segmentation', cc.CityScapesPalette, 'Camera Instance Segmentation (CityScapes Palette)', {}],
             ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}],
-            ['sensor.camera.cosmos_visualization', cc.Raw, 'Cosmos Control Visualization', {}],
             ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)', {'range': '50'}],
-            ['sensor.camera.dvs', cc.Raw, 'Dynamic Vision Sensor', {}],
+            ['sensor.lidar.ray_cast_semantic', None, 'Semantic Lidar (Ray-Cast)', {'range': '50'}],
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB Distorted',
                 {'lens_circle_multiplier': '3.0',
                 'lens_circle_falloff': '3.0',
@@ -1488,7 +1531,7 @@ class CameraManager(object):
         self = weak_self()
         if not self:
             return
-        if self.sensors[self.index][0].startswith('sensor.lidar'):
+        if self.sensors[self.index][0] == 'sensor.lidar.ray_cast':
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
             points = np.reshape(points, (int(points.shape[0] / 4), 4))
             lidar_data = np.array(points[:, :2])
@@ -1501,15 +1544,21 @@ class CameraManager(object):
             lidar_img = np.zeros((lidar_img_size), dtype=np.uint8)
             lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
             self.surface = pygame.surfarray.make_surface(lidar_img)
-        elif self.sensors[self.index][0].startswith('sensor.camera.dvs'):
-            # Example of converting the raw_data from a carla.DVSEventArray
-            # sensor into a NumPy array and using it as an image
-            dvs_events = np.frombuffer(image.raw_data, dtype=np.dtype([
-                ('x', np.uint16), ('y', np.uint16), ('t', np.int64), ('pol', bool)]))
-            dvs_img = np.zeros((image.height, image.width, 3), dtype=np.uint8)
-            # Blue is positive, red is negative
-            dvs_img[dvs_events[:]['y'], dvs_events[:]['x'], dvs_events[:]['pol'] * 2] = 255
-            self.surface = pygame.surfarray.make_surface(dvs_img.swapaxes(0, 1))
+        elif self.sensors[self.index][0] == 'sensor.lidar.ray_cast_semantic':
+            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
+            points = np.reshape(points, (int(points.shape[0] / 6), 6))
+            lidar_data = np.array(points[:, :2])
+            lidar_data *= min(self.hud.dim) / (2.0 * self.lidar_range)
+            lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
+            lidar_data = lidar_data.astype(np.int32)
+            lidar_data = np.reshape(lidar_data, (-1, 2))
+            lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3)
+            lidar_img = np.zeros((lidar_img_size), dtype=np.uint8)
+            for i in range(len(image)):
+                point = lidar_data[i]
+                lidar_tag = image[i].object_tag
+                lidar_img[tuple(point.T)] = OBJECT_TO_COLOR[int(lidar_tag)]
+            self.surface = pygame.surfarray.make_surface(lidar_img)
         elif self.sensors[self.index][0].startswith('sensor.camera.optical_flow'):
             image = image.get_color_coded_flow()
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
@@ -1544,6 +1593,7 @@ def game_loop(args):
         client.set_timeout(2000.0)
 
         sim_world = client.get_world()
+        traffic_manager = client.get_trafficmanager()
         if args.sync:
             original_settings = sim_world.get_settings()
             settings = sim_world.get_settings()
@@ -1552,7 +1602,6 @@ def game_loop(args):
                 settings.fixed_delta_seconds = 0.05
             sim_world.apply_settings(settings)
 
-            traffic_manager = client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
 
         if args.autopilot and not sim_world.get_settings().synchronous_mode:
@@ -1566,7 +1615,7 @@ def game_loop(args):
         pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, args)
+        world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control)
         loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
         start_overlay = StartScreenOverlay(args.width, args.height)
@@ -1692,103 +1741,69 @@ def game_loop(args):
 
 
 def main():
-    argparser = argparse.ArgumentParser(
-        description='CARLA Manual Control Client')
+    argparser = argparse.ArgumentParser(description='CARLA Manual Control Client')
     argparser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        dest='debug',
+        '-v', '--verbose', action='store_true', dest='debug',
         help='print debug information')
     argparser.add_argument(
-        '--host',
-        metavar='H',
-        default='127.0.0.1',
+        '--host', metavar='H', default='127.0.0.1',
         help='IP of the host server (default: 127.0.0.1)')
     argparser.add_argument(
-        '-p', '--port',
-        metavar='P',
-        default=2000,
-        type=int,
+        '-p', '--port', metavar='P', default=2000, type=int,
         help='TCP port to listen to (default: 2000)')
     argparser.add_argument(
-        '-a', '--autopilot',
-        action='store_true',
+        '-a', '--autopilot', action='store_true',
         help='enable autopilot')
     argparser.add_argument(
-        '--res',
-        metavar='WIDTHxHEIGHT',
-        default='1280x720',
+        '--res', metavar='WIDTHxHEIGHT', default='1280x720',
         help='window resolution (default: 1280x720)')
     argparser.add_argument(
-        '--filter',
-        metavar='PATTERN',
-        default='vehicle.*',
+        '--filter', metavar='PATTERN', default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
     argparser.add_argument(
-        '--generation',
-        metavar='G',
-        default='2',
-        help='restrict to certain actor generation (values: "1","2","All" - default: "2")')
+        '--generation', metavar='G', default='All',
+        help='restrict to certain actor generation (values: "2","3","All" - default: "All")')
     argparser.add_argument(
-        '--rolename',
-        metavar='NAME',
-        default='hero',
+        '--rolename', metavar='NAME', default='hero',
         help='actor role name (default: "hero")')
     argparser.add_argument(
-        '--gamma',
-        default=2.2,
-        type=float,
-        help='Gamma correction of the camera (default: 2.2)')
+        '--gamma', default=1.0, type=float,
+        help='Gamma correction of the camera (default: 1.0)')
     argparser.add_argument(
-        '--participantid',
-        default='',
+        '--participantid', default='',
         help='participant id for label logging')
     argparser.add_argument(
-        '--environment',
-        default='',
+        '--environment', default='',
         help='environment for label logging')
     argparser.add_argument(
-        '--secondary-task',
-        dest='secondary_task',
-        default='',
+        '--secondary-task', dest='secondary_task', default='',
         help='secondary task for label logging')
     argparser.add_argument(
-        '--functionname',
-        default='Adjust seat positioning',
+        '--functionname', default='Adjust seat positioning',
         help='function/task name for label logging')
     argparser.add_argument(
-        '--emotion',
-        default='',
+        '--emotion', default='',
         help='emotion label for label logging')
     argparser.add_argument(
-        '--modeltype',
-        default='',
+        '--modeltype', default='',
         help='model type for label logging')
     argparser.add_argument(
-        '--state-model',
-        dest='state_model',
-        default='',
+        '--state-model', dest='state_model', default='',
         help='state model name for label logging')
     argparser.add_argument(
-        '--w-fcd',
-        dest='w_fcd',
-        default='',
-        type=float,
+        '--w-fcd', dest='w_fcd', default=None, type=float,
         help='FCD weight for label logging')
     argparser.add_argument(
-        '--session-id',
-        dest='session_id',
-        default='',
+        '--session-id', dest='session_id', default='',
         help='shared session id for aligning logs')
     argparser.add_argument(
-        '--sync',
-        action='store_true',
+        '--sync', action='store_true',
         help='Activate synchronous mode execution')
     argparser.add_argument(
         '--control',
         choices=['test', 'full'],
         default='test',
-        help='Control mode: "test" for basic controls (W,A,S,D,Q,Space) only, "full" for all controls (default: test)')
+        help='Control mode: "test" for basic controls, "full" for all controls (default: test)')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]

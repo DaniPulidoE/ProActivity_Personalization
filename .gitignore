@@ -1,3 +1,17 @@
+# ---------------------------------------------------------------------------
+# ProVoice: models, datasets and training artifacts are NOT committed.
+# The distraction models live on the Hugging Face Hub
+# (maco018/in-car-distraction-yolo26) and are downloaded at runtime.
+# ---------------------------------------------------------------------------
+# Model weights (pulled from Hugging Face / auto-downloaded by Ultralytics)
+*.pt
+# Training datasets (downloaded from Kaggle, rebuilt by scripts/build_statefarm_dataset.py)
+/datasets/
+# Ultralytics training run outputs (curves, checkpoints, logs)
+/runs/
+# Packaged model exports (uploaded to Hugging Face, not tracked here)
+/exports/
+
 # Created by https://www.toptal.com/developers/gitignore/api/python,windows,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,windows,linux
 
@@ -239,3 +253,5 @@ src/ProVoice/image/dashboard.png
 src/ProVoice.egg-info/
 Materialien/
 
+/datasets
+/runs

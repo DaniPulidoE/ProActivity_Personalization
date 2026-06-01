@@ -1,6 +1,6 @@
 absl-py==2.4.0
 attrs==25.4.0
-carla==0.9.16
+carla==0.10.0
 certifi==2026.2.25
 cffi==2.0.0
 charset-normalizer==3.4.4
@@ -9,7 +9,6 @@ colorama==0.4.6
 coloredlogs==15.0.1
 contourpy==1.3.2
 cycler==0.12.1
-dlib @ https://github.com/z-mahmud22/Dlib_Windows_Python3.x/raw/2cc3bb593701cc7fc4007a299c3f19b34a76c002/dlib-19.22.99-cp310-cp310-win_amd64.whl#sha256=f2181b6724669fb0147c9ebc326d72b94de41bced1812eff5df4b133b5d0b575
 filelock==3.20.0
 flatbuffers==25.12.19
 fonttools==4.61.1
@@ -74,4 +73,4 @@ uv==0.10.7
 uv-build==0.10.7
 uvicorn==0.38.0
 Werkzeug==3.1.6
-yolov5-deepsort-driverdistracted-driving-behavior-detection @ git+https://github.com/LukasWestholt/Yolov5-deepsort-driverDistracted-driving-behavior-detection@47b7f5e3963ecc06536b86e58001462de9b749f5
+ultralytics>=8.4.57

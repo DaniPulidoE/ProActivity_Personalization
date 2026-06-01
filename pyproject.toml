@@ -3,16 +3,16 @@ name = "ProVoice"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = "==3.10.*"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "carla>=0.9.15",
+    "carla>=0.10.0",
     "dash>=3.3.0",
     "dash-bootstrap-components>=2.0.4",
     "flask>=3.1.2",
     "matplotlib>=3.10.7",
     "mediapipe>=0.10.14",
     "numpy>=1.26.4",
-    "opencv-python>=4.11.0.86",
+    "huggingface-hub>=0.25.0",
     "pandas>=2.3.3",
     "pyyaml>=6.0.3",
     "scipy>=1.15.3",
@@ -21,7 +21,7 @@ dependencies = [
     "torchvision>=0.24.1",
     "tqdm>=4.67.1",
     "pygame>=2.6.1",
-    "yolov5-deepsort-driverdistracted-driving-behavior-detection>=0.1.0",
+    "ultralytics>=8.4.57",
     "keras>=3.12.0",
     "pandas-stubs==2.3.3.251201",
     "joblib>=1.5.2",
@@ -36,20 +36,31 @@ dependencies = [
 
 [tool.uv]
 package = true
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
 required-environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
-    "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]
+# NOTE: torch/torchvision are pinned to the CPU index here ONLY so the
+# lockfile resolves (the `mmrphys` git dependency pins the same CPU
+# index, and uv refuses a mixed-index resolution). For GPU training the
+# CUDA 12.8 build (RTX 5080 / Blackwell sm_120) is installed imperatively
+# on top via `uv pip install ... --index-url .../whl/cu128` and training
+# is launched through the venv Python directly (never `uv run`, which
+# would re-sync and revert it). See scripts/setup_cuda_torch.py.
 torch = [
   { index = "pytorch-cpu" },
 ]
 torchvision = [
   { index = "pytorch-cpu" },
 ]
+carla = [
+  { path = "wheels/carla-0.10.0-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32' and python_version == '3.12'" },
+]
 mmrphys = { git = "https://github.com/LukasWestholt/MMRPhys" }
-yolov5-deepsort-driverdistracted-driving-behavior-detection = { git = "https://github.com/LukasWestholt/Yolov5-deepsort-driverDistracted-driving-behavior-detection" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

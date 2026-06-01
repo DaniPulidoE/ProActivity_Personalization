@@ -14,10 +14,10 @@ import mediapipe as mp
 mp_face_mesh = mp.solutions.face_mesh if mp else None
 
 from rPPG.rppg_infer_simple import OnlineRPPG
-from yolov5_deepsort_driverdistracted_driving_behavior_detection import myframe  # type: ignore
+from ProVoice import perception as _perception  # in-tree replacement for yolov5-deepsort
 
 HAS_CV2 = True
-HAS_MYFRAME = True
+HAS_MYFRAME = True  # kept for backward-compat; gates the perception.frametest call
 HAS_RPPG = True
 HAS_NP = True
 HAS_MP = True
@@ -112,8 +112,8 @@ class DataCollector:
                     print(e, "Error initializing face mesh")
                     self.face_mesh = None
 
-            if HAS_MYFRAME and myframe is not None:
-                print("[DataCollector] YOLOv5 behavior detection module detected.")
+            if HAS_MYFRAME:
+                print("[DataCollector] Distraction/fatigue perception module detected (MediaPipe + Ultralytics YOLO26).")
 
             if HAS_RPPG and OnlineRPPG is not None:
                 try:
@@ -270,12 +270,12 @@ class DataCollector:
         if emo:
             data.update(emo)  # emotion, emotion_prob
 
-        if HAS_MYFRAME and myframe is not None:
+        if HAS_MYFRAME:
             try:
-                ret, frame_annot = myframe.frametest(frame)  # type: ignore
+                ret, frame_annot = _perception.frametest(frame)
                 lab, eye, mouth = ret
-            except NotImplementedError as e:
-                print(e, "Error computing myframe")
+            except Exception as e:  # noqa: BLE001 (perception code crosses C extensions)
+                print(e, "Error computing perception.frametest")
                 frame_annot = frame
                 lab, eye, mouth = ([], 0.3, 0.5)
         else:
