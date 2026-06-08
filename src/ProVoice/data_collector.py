@@ -144,11 +144,21 @@ class DataCollector:
         self.Rollmouth = 0
         self.COUNTER = 0
         self.mCOUNTER = 0
+        # yawn and blink rates (instead of raw counts) should act as better predictors
+        self.blink_times = []
+        self.blink_rate = 0.0
+        self.yawn_times = []
+        self.yawn_rate = 0.0
 
 
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        
+        # calibration state
+        self.calibrated = False
+        self._calibration_data = dict({'gaze_score': [], 'ear': [], 'mar': [], 'bpm': [], 'rr': []})
+        self._calibration_frames = 100 # subject to changes...
 
     def __del__(self):
         self.stop()
@@ -222,6 +232,66 @@ class DataCollector:
             print(e, "Error computing gaze score")
             return 0.0
 
+    def calibrate_step(self) -> None:
+        # check for errors (same as in collect_data)
+        if not self.visual_enabled or self.cap is None:
+            return
+        ok, frame = self.cap.read()
+        if not ok:
+            print("not okay")
+            self.latest_frame = None
+            return
+        
+        # gaze score
+        gaze_score = self.get_gaze_score(frame)
+        if gaze_score > 0.0: # filter out frames where gaze score couldn't be computed to avoid skewing calibration
+            self._calibration_data['gaze_score'].append(gaze_score)
+        
+        # load face detector
+        if _face_detector is not None and (
+                self.rppg_estimator is not None or (_emotion_model is not None and _emotion_input_size is not None)):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # type: ignore
+            faces = _face_detector.detectMultiScale(gray, 1.3, 5)  # type: ignore
+        else:
+            gray = None
+            faces = []
+        
+        # face data for EAR/MAR and Perclos
+        if HAS_MYFRAME:
+            try:
+                ret, frame_annot = _perception.frametest(frame)
+                lab, eye, mouth = ret
+                if eye > 0.15: # filter out frames where eye is too closed to avoid skewing calibration
+                    self._calibration_data['ear'].append(eye)
+                self._calibration_data['mar'].append(mouth)
+            except Exception as e:  # noqa: BLE001 (perception code crosses C extensions)
+                print(e, "Error computing perception.frametest")
+                frame_annot = frame
+                lab, eye, mouth = ([], 0.3, 0.5)
+        else:
+            frame_annot = frame
+            lab, eye, mouth = ([], 0.3, 0.5)
+
+        self.latest_frame = frame_annot # so frame appears on webpage
+
+    def compute_calibration(self):
+        # compute mean and std for each metric, set calibrated flag
+        self.calibrate = dict()
+        for key, values in self._calibration_data.items():
+            if values:
+                mean = sum(values) / len(values)
+                std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
+                # 0.65 threshold for MAR based on literature (doesn't make sense to calibrate based on a closed mouth)
+                self.calibrate[key] = {'mean': mean, 'std': std, 'threshold': mean + std * 2.5 if key in ['gaze_score'] else mean - std * 2.5 if key in ['ear'] else 0.65}
+            else:
+                # default values originally in the script
+                thres = 0.2 if key in ['gaze_score', 'ear'] else 0.65
+                self.calibrate[key] = {'mean': 0.0, 'std': 0.0, 'threshold': thres}
+        self.calibrated = True
+        
+        print("Calibration completed:", self.calibrate)    
+        
+
     def _visual_process(self, data: Dict[str, Any]) -> None:
         if not self.visual_enabled or self.cap is None:
             return
@@ -234,7 +304,7 @@ class DataCollector:
         # Gaze
         gaze_score = self.get_gaze_score(frame)
         data['gaze_score'] = round(float(gaze_score), 3)
-        data['gaze_distracted'] = bool(gaze_score > 0.20)
+        data['gaze_distracted'] = bool(gaze_score > self.calibrate['gaze_score']['threshold'])
 
         if _face_detector is not None and (
                 self.rppg_estimator is not None or (_emotion_model is not None and _emotion_input_size is not None)):
@@ -268,7 +338,21 @@ class DataCollector:
                     if len(self.rr_history) > 80:
                         self.rr_history.pop(0)
                     data['rr_history'] = self.rr_history
-
+                    
+                # set flag if there is an anomalous increase or decrease in hr
+                # also add deviation from mean as a feature
+                if len(self.bpm_history) >= 10:
+                    hr_mean = sum(self.bpm_history) / len(self.bpm_history)
+                    hr_std = (sum((x - hr_mean)**2 for x in self.bpm_history) / len(self.bpm_history)) ** 0.5
+                    #data['hr_anomaly'] = bool(abs(data.get('bpm', hr_mean) - hr_mean) > 2.5 * hr_std)
+                    data['hr_delta'] = round(data.get('bpm', hr_mean) - hr_mean, 1)
+                # same for rr
+                if len(self.rr_history) >= 10:
+                    rr_mean = sum(self.rr_history) / len(self.rr_history)
+                    rr_std = (sum((x - rr_mean)**2 for x in self.rr_history) / len(self.rr_history)) ** 0.5
+                    #data['rr_anomaly'] = bool(abs(data.get('breaths-per-minute', rr_mean) - rr_mean) > 2.5 * rr_std)
+                    data['rr_delta'] = round(data.get('breaths-per-minute', rr_mean) - rr_mean, 1)
+                    
         emo = self.detect_emotion(faces, gray)
         if emo:
             data.update(emo)  # emotion, emotion_prob
@@ -285,25 +369,28 @@ class DataCollector:
             frame_annot = frame
             lab, eye, mouth = ([], 0.3, 0.5)
 
-        EYE_AR_THRESH = 0.2
+        #EYE_AR_THRESH = 0.2
         EYE_AR_CONSEC_FRAMES = 2
-        MAR_THRESH = 0.65
+        #MAR_THRESH = 0.65
         MOUTH_AR_CONSEC_FRAMES = 3
 
-        if eye < EYE_AR_THRESH:
+        if eye < self.calibrate['ear']['threshold']:
             self.COUNTER += 1
             self.Rolleye += 1
         else:
             if self.COUNTER >= EYE_AR_CONSEC_FRAMES:
                 self.blink_count += 1
+                self.blink_times.append(time.monotonic())
+
             self.COUNTER = 0
 
-        if mouth > MAR_THRESH:
+        if mouth > self.calibrate['mar']['threshold']:
             self.mCOUNTER += 1
             self.Rollmouth += 1
         else:
             if self.mCOUNTER >= MOUTH_AR_CONSEC_FRAMES:
                 self.yawn_count += 1
+                self.yawn_times.append(time.monotonic())
             self.mCOUNTER = 0
 
         self.Roll += 1
@@ -314,7 +401,15 @@ class DataCollector:
             self.Rolleye = 0
             self.Rollmouth = 0
 
-
+        # yawn and blink rates )
+        blink_window = 30.0 # 30 second window for blinks
+        now = time.monotonic()
+        self.blink_times = [t for t in self.blink_times if now - t <= blink_window]
+        data['blink_rate'] = len(self.blink_times) / (blink_window / 60)  # blinks per minute
+        yawn_window = 180 # 3 minute window for yawms
+        self.yawn_times = [t for t in self.yawn_times if now - t <= yawn_window]
+        data['yawn_rate'] = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
+        
         self.latest_frame = frame_annot
         data['blink_count'] = int(self.blink_count)
         data['yawn_count'] = int(self.yawn_count)
@@ -363,50 +458,58 @@ class DataCollector:
         return data
 
 
-
     def _run_loop(self) -> None:
+        calibration_counter = 0
+
         next_t = time.monotonic()
         while self._running:
             try:
-                data = self.collect_data()
-                
-                # Add sequence for LSTM models
-                with self._lock:
-                    self.data_history.append(dict(data))
-                    if len(self.data_history) > self.window_size:
-                        self.data_history.pop(0)
+                if self.calibrated is False:
+                    # run calibration for _calibration_frames frames 
+                    self.calibrate_step()
+                    calibration_counter += 1
+                    if calibration_counter >= self._calibration_frames:
+                        self.compute_calibration()
+                else:
+                    data = self.collect_data()
+                    
+                    # Add sequence for LSTM models
+                    with self._lock:
+                        self.data_history.append(dict(data))
+                        if len(self.data_history) > self.window_size:
+                            self.data_history.pop(0)
 
-                action = None
-                if self.decision_engine:
-    
-                    data['functionname'] = data.get('functionname', self.functionname)
-                    # separate dict to avoid adding the whole history to each sequence entry
-                    data_for_decision = dict(data)
-                    data_for_decision['sequence'] = list(self.data_history)
+                    action = None
+                    if self.decision_engine:
+        
+                        data['functionname'] = data.get('functionname', self.functionname)
+                        # separate dict to avoid adding the whole history to each sequence entry
+                        data_for_decision = dict(data)
+                        data_for_decision['sequence'] = list(self.data_history)
 
-                    action = self.decision_engine.decide(dict(data_for_decision))
-                    if self.logger and isinstance(action, dict):
-                        action_for_log = dict(action)
-                        for key in ('session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
-                            value = data.get(key)
-                            if value not in (None, ''):
-                                action_for_log.setdefault(key, value)
-                        self.logger.log_processed(action_for_log)
-                    data['last_action'] = action
-
-
-                if self.logger:
-                    raw_with_decision = dict(data)
-                    if isinstance(action, dict):
-                        raw_with_decision['LoA'] = action.get('LoA')
-                        fcd = action.get('fcd') or action.get('fcd_scores')
-                        if isinstance(fcd, dict):
-                            raw_with_decision['FCD'] = fcd
-                    self.logger.log_raw(raw_with_decision)
+                        action = self.decision_engine.decide(dict(data_for_decision))
+                        if self.logger and isinstance(action, dict):
+                            action_for_log = dict(action)
+                            for key in ('session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
+                                value = data.get(key)
+                                if value not in (None, ''):
+                                    action_for_log.setdefault(key, value)
+                            self.logger.log_processed(action_for_log)
+                        data['last_action'] = action
 
 
-                if self.actuator and action is not None:
-                    self.actuator.execute(action)
+                    if self.logger:
+                        raw_with_decision = dict(data)
+                        if isinstance(action, dict):
+                            raw_with_decision['LoA'] = action.get('LoA')
+                            fcd = action.get('fcd') or action.get('fcd_scores')
+                            if isinstance(fcd, dict):
+                                raw_with_decision['FCD'] = fcd
+                        self.logger.log_raw(raw_with_decision)
+
+
+                    if self.actuator and action is not None:
+                        self.actuator.execute(action)
 
             except NotImplementedError as e:
                 print('[DataCollector] loop error:', e)
@@ -423,7 +526,8 @@ class DataCollector:
         self._thread.start()
 
     def stop(self) -> None:
-        self.rppg_estimator.stop()
+        if self.rppg_estimator:
+            self.rppg_estimator.stop()
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)

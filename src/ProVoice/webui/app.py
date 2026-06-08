@@ -45,6 +45,13 @@ data_collector: DataCollector | None = None
 
 dash_app.layout = dbc.Container([
     html.H2("ProVoice Driver State Dashboard with WebSocket", className="mt-4 mb-4 text-center"),
+    dbc.Alert(
+        "Calibrating sensors... please look at the camera.",
+        id="calibration-banner",
+        color="warning",
+        className="text-center",
+        style={"display": "none"},   # hidden by default
+    ),
     dbc.Row([
         # 左侧：实时图像
         dbc.Col(
@@ -134,7 +141,8 @@ async def emit_data_periodically():
         if data_collector is None:
             await asyncio.sleep(0.02)
             continue
-
+        
+        
         # 图像流
         frame_b64 = data_collector.get_latest_frame()
         # 数值
@@ -146,6 +154,7 @@ async def emit_data_periodically():
 
         payload = latest_data.copy()
         payload["frame"] = frame_b64
+        payload["calibrating"] = not data_collector.calibrated
 
         await sio.emit("new_data", payload)
         await asyncio.sleep(0.02)
