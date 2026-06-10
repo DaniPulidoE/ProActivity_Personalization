@@ -280,28 +280,32 @@ def main():
     # Add: Read vehicle_id and attempt to connect to CARLA to get the vehicle actor (optional)
     # ---------------------------------------------------------------------
     vehicle_actor = None
-    if vehicle_id_arg is not None:
-        try:
-            vehicle_id = int(vehicle_id_arg)
-            print(f"[INFO] Using vehicle_id={vehicle_id} from command-line argument.")
-        except ValueError:
-            print(f"[WARN] Invalid vehicle_id argument {vehicle_id_arg!r}; ignoring.")
-            vehicle_id = None
+    if vehicle_state_url:
+        # Bridge URL provided — no direct CARLA connection needed; the bridge
+        # reads from CARLA locally on the remote and serves speed/location over HTTP.
+        print(f"[INFO] vehicle_state_url set — skipping direct CARLA connection.")
     else:
-        # Read vehicle_id; wait up to 10 seconds to allow the wheel script to write the file.
-        vehicle_id = read_vehicle_id(wait_seconds=10.0)
-
-    if vehicle_id is not None and HAS_CARLA:
-        vehicle_actor = get_carla_vehicle_by_id(vehicle_id, host=host, port=port, timeout=carla_timeout)
-        if vehicle_actor is None:
-            print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
+        if vehicle_id_arg is not None:
+            try:
+                vehicle_id = int(vehicle_id_arg)
+                print(f"[INFO] Using vehicle_id={vehicle_id} from command-line argument.")
+            except ValueError:
+                print(f"[WARN] Invalid vehicle_id argument {vehicle_id_arg!r}; ignoring.")
+                vehicle_id = None
         else:
-            print(f"[INFO] Connected to CARLA vehicle actor id={vehicle_id} type={vehicle_actor.type_id}")
-    else:
-        if vehicle_id is None:
-            print("[WARN] No vehicle_id available; DataCollector will run without carla_vehicle.")
-        elif not HAS_CARLA:
-            print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
+            vehicle_id = read_vehicle_id(wait_seconds=10.0)
+
+        if vehicle_id is not None and HAS_CARLA:
+            vehicle_actor = get_carla_vehicle_by_id(vehicle_id, host=host, port=port, timeout=carla_timeout)
+            if vehicle_actor is None:
+                print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
+            else:
+                print(f"[INFO] Connected to CARLA vehicle actor id={vehicle_id} type={vehicle_actor.type_id}")
+        else:
+            if vehicle_id is None:
+                print("[WARN] No vehicle_id available; DataCollector will run without carla_vehicle.")
+            elif not HAS_CARLA:
+                print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
 
     # Determine cam_index for DataCollector
     if camera_source == "udp":

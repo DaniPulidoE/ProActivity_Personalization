@@ -7,7 +7,6 @@ import random
 import threading
 import time
 import urllib.request
-import urllib.error
 import json
 from typing import Any, Dict, Optional, Tuple
 
@@ -92,6 +91,7 @@ class DataCollector:
         self.carla_vehicle = carla_vehicle
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
         self._cached_speed: int = 0
+        self._state_poll_thread: Optional[threading.Thread] = None
         # 如果有 CARLA actor，尝试获取 vehicle_id
         self.vehicle_id = None
         if self.carla_vehicle is not None:
@@ -445,13 +445,9 @@ class DataCollector:
                     print("[DataCollector] Error reading vehicle speed:", e)
                     speed = self._cached_speed
             elif self.vehicle_state_url is not None:
-                try:
-                    with urllib.request.urlopen(self.vehicle_state_url, timeout=0.15) as resp:
-                        state = json.loads(resp.read())
-                    speed = int(state.get("speed_kmh", self._cached_speed))
-                    self._cached_speed = speed
-                except (urllib.error.URLError, OSError, KeyError, ValueError):
-                    speed = self._cached_speed
+                # Updated by _poll_vehicle_state background thread — just read cache
+                speed = self._cached_speed
+                print(f"[DataCollector] Using cached vehicle speed: {speed} km/h")
             else:
                 speed = int(os.getenv('PV_SPEED', random.randint(0, 120)))
             data['speed'] = speed
@@ -533,12 +529,28 @@ class DataCollector:
             time.sleep(max(0.0, min(self.sampling_interval, next_t - time.monotonic())))
         print("data collector stopped!")
 
+    def _poll_vehicle_state(self, interval: float = 0.5) -> None:
+        """Background thread: fetch vehicle state from the bridge every `interval` seconds."""
+        while self._running:
+            try:
+                with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
+                    state = json.loads(resp.read())
+                print(f"[DataCollector] Polled vehicle state: {state}")
+                self._cached_speed = int(state.get("speed_kmh", self._cached_speed))
+            except Exception:
+                pass  # keep using last cached value on any error
+            time.sleep(interval)
+
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        if self.vehicle_state_url:
+            self._state_poll_thread = threading.Thread(target=self._poll_vehicle_state, daemon=True)
+            self._state_poll_thread.start()
+            print(f"[DataCollector] Vehicle state polling started → {self.vehicle_state_url}")
 
     def stop(self) -> None:
         if self.rppg_estimator:
@@ -546,6 +558,8 @@ class DataCollector:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._state_poll_thread and self._state_poll_thread.is_alive():
+            self._state_poll_thread.join(timeout=2.0)
         self.release()
 
     def release(self) -> None:
