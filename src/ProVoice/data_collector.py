@@ -6,6 +6,9 @@ import os
 import random
 import threading
 import time
+import urllib.request
+import urllib.error
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -68,6 +71,7 @@ class DataCollector:
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
         window_size: int = 256,
+        vehicle_state_url: Optional[str] = None,
     ) -> None:
         self.visual_enabled = bool(visual and HAS_CV2)
         self.phys_enabled = bool(physiological)
@@ -86,6 +90,8 @@ class DataCollector:
         self.cap = None
         self.face_mesh = None
         self.carla_vehicle = carla_vehicle
+        self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
+        self._cached_speed: int = 0
         # 如果有 CARLA actor，尝试获取 vehicle_id
         self.vehicle_id = None
         if self.carla_vehicle is not None:
@@ -432,11 +438,20 @@ class DataCollector:
             if self.carla_vehicle is not None:
                 try:
                     vel = self.carla_vehicle.get_velocity()
-                    speed = (vel.x**2 + vel.y**2 + vel.z**2)**0.5  
-                    speed = int(speed * 3.6)  
+                    speed = (vel.x**2 + vel.y**2 + vel.z**2)**0.5
+                    speed = int(speed * 3.6)
+                    self._cached_speed = speed
                 except NotImplementedError as e:
                     print("[DataCollector] Error reading vehicle speed:", e)
-                    speed = 0
+                    speed = self._cached_speed
+            elif self.vehicle_state_url is not None:
+                try:
+                    with urllib.request.urlopen(self.vehicle_state_url, timeout=0.15) as resp:
+                        state = json.loads(resp.read())
+                    speed = int(state.get("speed_kmh", self._cached_speed))
+                    self._cached_speed = speed
+                except (urllib.error.URLError, OSError, KeyError, ValueError):
+                    speed = self._cached_speed
             else:
                 speed = int(os.getenv('PV_SPEED', random.randint(0, 120)))
             data['speed'] = speed
