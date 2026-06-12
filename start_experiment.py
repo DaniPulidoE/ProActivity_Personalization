@@ -53,14 +53,15 @@ def build_drive_cmd(session, args):
         "--modeltype", args.modeltype,
         "--state-model", args.state_model,
         "--w-fcd", str(args.w_fcd),
+        "--host", args.host,
+        "--port", str(args.port)
     ]
 
 
 def build_provoice_cmd(session, args):
     return [
         sys.executable,
-        "-m",
-        "provoice",
+        "src/ProVoice/main.py",
         f"session_id={session}",
         f"participantid={args.participantid}",
         f"environment={args.environment}",
@@ -69,6 +70,8 @@ def build_provoice_cmd(session, args):
         f"modeltype={args.modeltype}",
         f"state_model={args.state_model}",
         f"w_fcd={args.w_fcd}",
+        f"host={args.host}",
+        f"port={args.port}"
     ]
 
 
@@ -130,6 +133,8 @@ def main():
     parser.add_argument("--modeltype", default="combined")
     parser.add_argument("--state-model", default="xlstm")
     parser.add_argument("--w-fcd", type=float, default=0.7)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=2000)
 
     args = parser.parse_args()
 
@@ -152,11 +157,11 @@ def main():
         # START NPC / TRAFFIC
         # =========================
         pm.start(
-            [sys.executable, "-m", "src.drive.fixed_npc_traffic"],
+            [sys.executable, "-m", "src.drive.fixed_npc_traffic", "--host", args.host, "--port", str(args.port)],
             "NPC_TRAFFIC"
         )
 
-        time.sleep(2)
+        time.sleep(6)
 
         # =========================
         # START DRIVE

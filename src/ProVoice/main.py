@@ -102,31 +102,36 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
     return None
 
 
-def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 2000, timeout: float = 2.0):
+def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 2000, timeout: float = 2.0, retries: int = 5):
     """
     Connect to CARLA and return the actor (or None).
     Note: read-only; do not call apply_control on this actor.
+    Retries handle intermittent UnicodeDecodeError / RuntimeError that occur
+    when the CARLA binary RPC protocol is used over a network tunnel (e.g. ngrok).
     """
     if not HAS_CARLA:
         print("[WARN] CARLA python API not available in this process.")
         return None
-    try:
-        client = carla.Client(host, port)
-        client.set_timeout(timeout)
-        world = client.get_world()
-        actor = world.get_actor(actor_id)
-        if actor is None:
-            print(f"[WARN] No actor with id {actor_id} in CARLA world.")
-            return None
-        # Check if the actor is a vehicle
-        if not actor.type_id.startswith("vehicle"):
-            print(f"[WARN] Actor {actor_id} is not a vehicle (type: {actor.type_id})")
-        else:
-            print(f"[INFO] Connected to CARLA vehicle actor id={actor_id} type={actor.type_id}")
-        return actor
-    except NotImplementedError as e:
-        print("[WARN] Error connecting to CARLA or fetching actor:", e)
-        return None
+    for attempt in range(1, retries + 1):
+        try:
+            client = carla.Client(host, port)
+            client.set_timeout(timeout)
+            world = client.get_world()
+            actor = world.get_actor(actor_id)
+            if actor is None:
+                print(f"[WARN] No actor with id {actor_id} in CARLA world.")
+                return None
+            if not actor.type_id.startswith("vehicle"):
+                print(f"[WARN] Actor {actor_id} is not a vehicle (type: {actor.type_id})")
+            else:
+                print(f"[INFO] Connected to CARLA vehicle actor id={actor_id} type={actor.type_id}")
+            return actor
+        except (NotImplementedError, RuntimeError, UnicodeDecodeError) as e:
+            print(f"[WARN] CARLA connect attempt {attempt}/{retries} failed ({type(e).__name__}): {e}")
+            if attempt < retries:
+                time.sleep(1.0)
+    print(f"[WARN] Could not connect to CARLA after {retries} attempts. Running without vehicle actor.")
+    return None
 
 
 
@@ -144,6 +149,11 @@ def main():
     window_sz = int(args.get("window", "256"))
     camera_source = args.get("camera_source", "front")
     camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
+    vehicle_id_arg = args.get("vehicle_id")  # optional: skip file-based discovery when set
+    host = args.get("host", "localhost")
+    port = int(args.get("port", "2000"))
+    carla_timeout = float(args.get("carla_timeout", "10.0"))
+    vehicle_state_url = args.get("vehicle_state_url")  # e.g. http://0.tcp.ngrok.io:PORT
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
     strategy = None
@@ -270,20 +280,32 @@ def main():
     # Add: Read vehicle_id and attempt to connect to CARLA to get the vehicle actor (optional)
     # ---------------------------------------------------------------------
     vehicle_actor = None
-    # Read vehicle_id; wait up to 10 seconds to allow the wheel script to write the file (path can be changed via VEHICLE_ID_PATH).
-    vehicle_id = read_vehicle_id(wait_seconds=10.0)
-
-    if vehicle_id is not None and HAS_CARLA:
-        vehicle_actor = get_carla_vehicle_by_id(vehicle_id)
-        if vehicle_actor is None:
-            print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
-        else:
-            print(f"[INFO] Connected to CARLA vehicle actor id={vehicle_id} type={vehicle_actor.type_id}")
+    if vehicle_state_url:
+        # Bridge URL provided — no direct CARLA connection needed; the bridge
+        # reads from CARLA locally on the remote and serves speed/location over HTTP.
+        print(f"[INFO] vehicle_state_url set — skipping direct CARLA connection.")
     else:
-        if vehicle_id is None:
-            print("[WARN] No vehicle_id available; DataCollector will run without carla_vehicle.")
-        elif not HAS_CARLA:
-            print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
+        if vehicle_id_arg is not None:
+            try:
+                vehicle_id = int(vehicle_id_arg)
+                print(f"[INFO] Using vehicle_id={vehicle_id} from command-line argument.")
+            except ValueError:
+                print(f"[WARN] Invalid vehicle_id argument {vehicle_id_arg!r}; ignoring.")
+                vehicle_id = None
+        else:
+            vehicle_id = read_vehicle_id(wait_seconds=10.0)
+
+        if vehicle_id is not None and HAS_CARLA:
+            vehicle_actor = get_carla_vehicle_by_id(vehicle_id, host=host, port=port, timeout=carla_timeout)
+            if vehicle_actor is None:
+                print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
+            else:
+                print(f"[INFO] Connected to CARLA vehicle actor id={vehicle_id} type={vehicle_actor.type_id}")
+        else:
+            if vehicle_id is None:
+                print("[WARN] No vehicle_id available; DataCollector will run without carla_vehicle.")
+            elif not HAS_CARLA:
+                print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
 
     # Determine cam_index for DataCollector
     if camera_source == "udp":
@@ -309,6 +331,7 @@ def main():
         cam_index=cam_index,
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
+        vehicle_state_url=vehicle_state_url,
     )
 
     dashboard.data_collector = data_collector

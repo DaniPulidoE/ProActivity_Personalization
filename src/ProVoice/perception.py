@@ -7,6 +7,7 @@ Python-version-agnostic dependencies:
 
 * **MediaPipe FaceMesh** -- eye aspect ratio (EAR) and mouth aspect ratio
   (MAR), replacing dlib's 68-point landmark predictor.
+
 * **Ultralytics YOLO26** -- in-cabin driver-distraction classification.
 
 Public API (drop-in replacement for ``myframe.frametest``)::
@@ -339,6 +340,7 @@ class DistractionDetector:
         labels: List[str] = []
         detections: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
         for res in results:
+            #print(f"[DistractionDetector] labels mapping: {self._labels}")
             if self._is_classify:
                 # Classification mode: top-1 prediction from r.probs
                 probs = getattr(res, "probs", None)
@@ -346,6 +348,7 @@ class DistractionDetector:
                     continue
                 cid = int(probs.top1)
                 conf = float(probs.top1conf)
+                #print(f"[DistractionDetector] classification result: cid={cid}, conf={conf}")
                 if conf < self.conf:
                     continue
                 raw_name = self._labels.get(cid)
@@ -365,6 +368,8 @@ class DistractionDetector:
                 confs   = boxes.conf.cpu().numpy().astype(float)
                 xyxy    = boxes.xyxy.cpu().numpy().astype(int)
                 for cid, conf, box in zip(cls_ids, confs, xyxy):
+                    print(self._labels)
+                    print(confs)
                     if conf < self.conf:
                         continue
                     raw_name = self._labels.get(int(cid))
@@ -409,7 +414,8 @@ def frametest(frame_bgr: np.ndarray) -> Tuple[Tuple[List[str], float, float], np
     """
     earmar, distraction = _get_default_detectors()
     annotated, eye_ar, mouth_ar, face_present = earmar(frame_bgr)
-    labels, detections = distraction(frame_bgr if annotated is None else annotated)
+    #labels, detections = distraction(frame_bgr if annotated is None else annotated)
+    labels, detections = distraction(frame_bgr)
 
     if face_present and "face" not in labels:
         labels.insert(0, "face")

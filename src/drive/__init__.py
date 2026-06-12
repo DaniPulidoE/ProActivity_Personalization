@@ -1,4 +1,4 @@
-from drive.drive import main
+from .drive import main
 
 if __name__ == "__main__":
     main()

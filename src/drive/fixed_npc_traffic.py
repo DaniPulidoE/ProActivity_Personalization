@@ -1,14 +1,22 @@
 import carla
 import random
 import time
+import argparse
+
 
 def main():
     # =========================
     # CONFIG
     # =========================
 
-    CARLA_HOST = "localhost"
-    CARLA_PORT = 2000
+    #CARLA_HOST = "localhost"
+    #CARLA_PORT = 2000
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=2000)
+    args = parser.parse_args()
+    CARLA_HOST = args.host
+    CARLA_PORT = args.port
 
     TM_PORT = 9000
 
@@ -16,7 +24,7 @@ def main():
 
     NUM_VEHICLES = 50
 
-    SYNC_MODE = True
+    SYNC_MODE = False
 
     FIXED_DELTA_SECONDS = 0.05
 

@@ -25,6 +25,8 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log("has rr_history?", "rr_history" in data, data.rr_history);
 
         if(data.frame) document.getElementById('live-image').src = 'data:image/jpeg;base64,' + data.frame;
+        const banner = document.getElementById('calibration-banner');
+        if (banner) banner.style.display = data.calibrating ? 'block' : 'none';
         document.getElementById('blink-count').innerText = data.blink_count;
         document.getElementById('yawn-count').innerText = data.yawn_count;
         document.getElementById('perclos-score').innerText = data.perclos;
