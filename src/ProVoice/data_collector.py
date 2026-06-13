@@ -288,7 +288,11 @@ class DataCollector:
                 mean = sum(values) / len(values)
                 std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
                 # 0.65 threshold for MAR based on literature (doesn't make sense to calibrate based on a closed mouth)
-                self.calibrate[key] = {'mean': mean, 'std': std, 'threshold': mean + std * 2.5 if key in ['gaze_score'] else mean - std * 2.5 if key in ['ear'] else 0.65}
+                # EAR "eyes-closed" threshold: a fraction of the open-eye baseline
+                # (with an absolute floor), which is robust to a tiny calibration
+                # std. mean - 2.5*std sat right inside the normal operating range
+                # and made PERCLOS/drowsiness fire almost constantly.
+                self.calibrate[key] = {'mean': mean, 'std': std, 'threshold': mean + std * 2.5 if key in ['gaze_score'] else max(0.15, mean * 0.6) if key in ['ear'] else 0.65}
             else:
                 # default values originally in the script
                 thres = 0.2 if key in ['gaze_score', 'ear'] else 0.65
@@ -326,8 +330,6 @@ class DataCollector:
                 x, y, w, h = faces[0]
                 face_roi = frame[y:y + h, x:x + w]
                 hr, rr = self.rppg_estimator.add_frame(face_roi)
-                print(f"!!!!!!!!!!!!!!!!!!!!!hr: {hr}")
-                print(f"!!!!!!!!!!!!!!!!!!!!!rr: {rr}")
                 if hr is not None:
                     # Heart rate
                     data['bpm'] = round(float(hr), 1)
@@ -432,7 +434,9 @@ class DataCollector:
             self._visual_process(data)
 
         if self.phys_enabled and 'heart_rate' not in data:
-            data['heart_rate'] = random.randint(60, 100)
+            # No live rPPG reading this cycle — report unknown rather than
+            # fabricating a value that pollutes the model input and dashboard.
+            data['heart_rate'] = None
 
         if self.context_enabled:
             if self.carla_vehicle is not None:
@@ -447,9 +451,11 @@ class DataCollector:
             elif self.vehicle_state_url is not None:
                 # Updated by _poll_vehicle_state background thread — just read cache
                 speed = self._cached_speed
-                print(f"[DataCollector] Using cached vehicle speed: {speed} km/h")
             else:
-                speed = int(os.getenv('PV_SPEED', random.randint(0, 120)))
+                # No CARLA actor / bridge — report unknown unless PV_SPEED is set,
+                # rather than fabricating a random speed.
+                pv = os.getenv('PV_SPEED')
+                speed = int(pv) if pv not in (None, '') else None
             data['speed'] = speed
 
         data['timestamp'] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -507,6 +513,11 @@ class DataCollector:
                                     action_for_log.setdefault(key, value)
                             self.logger.log_processed(action_for_log)
                         data['last_action'] = action
+                        # collect_data() snapshotted latest_data BEFORE the
+                        # decision existed; re-publish so the dashboard/get_latest
+                        # actually shows the LoA/action.
+                        with self._lock:
+                            self.latest_data = dict(data)
 
 
                     if self.logger:
