@@ -101,6 +101,30 @@ python src/ProVoice/main.py \
 
 For best alignment across the two processes, use the same `session_id` in both commands.
 
+#### Building the training dataset from logged sessions
+
+`scripts/build_loa_dataset.py` turns logged sessions into trainable files by
+joining each frame in `raw_data.jsonl` to the driver's chosen LoA in
+`user_loa_labels.csv` (matched on `session_id` + the frame timestamp falling
+inside a 20 s label window). The driver's `user_selected_loa` becomes the
+ground-truth label — **not** the system's own predicted `LoA`.
+
+```bash
+# raw_data.jsonl + user_loa_labels.csv  ->  data/labeled_data.jsonl
+#                                           data/processed_data/fcd_out.csv
+python scripts/build_loa_dataset.py
+
+# train on the driver's real labels
+python -m ProVoice.train_XLSTM --in data/labeled_data.jsonl --out trained_models/state_xlstm.pt --context-length 256
+python -m ProVoice.train_fcd_loa     # reads data/processed_data/fcd_out.csv -> trained_models/fcd_levels.pkl
+```
+
+For the join to work, drive and ProVoice must share a `session_id` (use
+`start_experiment.py` or `PV_SESSION_ID`), and the camera must see the driver's
+face so the per-frame state features are populated. To dry-run the whole chain on
+synthetic data, run `scripts/make_test_dataset.py` (writes clearly-labelled fake
+data under `data/testdata/`) and point `build_loa_dataset.py` at it.
+
 #### Quick Start (Recommended)
 
 Use `start_experiment.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
@@ -159,7 +183,7 @@ The web UI dashboard displays real-time metrics and analysis.
 
 ```
 proactivity-main/
-├── start_both.py              # Launcher script (recommended for starting both processes)
+├── start_experiment.py        # Launcher script (recommended for starting both processes)
 ├── src/
 │   ├── drive/                  # Driving simulation module
 │   │   ├── drive_improved.py   # Enhanced CARLA manual control
@@ -169,7 +193,7 @@ proactivity-main/
 │       ├── main.py             # Entry point
 │       ├── decision_engine.py   # AI decision making
 │       ├── data_collector.py    # Data collection
-│       ├── perception.py        # EAR/MAR (MediaPipe) + YOLO26 distraction detection
+│       ├── perception.py        # EAR/MAR (MediaPipe) + YOLO object-detection distraction
 │       ├── train_distraction.py # Fine-tune YOLO26 on a custom distraction dataset
 │       ├── train_fcd_loa.py     # Model training (FCD)
 │       ├── train_XLSTM.py       # State→LoA training (official nx-ai/xlstm, xlstm==2.0.5)
@@ -212,31 +236,43 @@ and a custom YOLOv5 codebase). It now uses the in-tree module
 | Signal | Implementation |
 |---|---|
 | Eye / mouth aspect ratio (`eye_ar`, `mar`) | MediaPipe FaceMesh |
-| Distraction labels (`safe`, `phone`, `drink`, `distracted`) | Ultralytics YOLO26 (classification) |
+| Distraction objects (`phone`, `drink`) | Ultralytics YOLO **object detection** (default) |
+| Looking away (`gaze_distracted`) | MediaPipe gaze score |
 
-**The distraction model is not stored in this repo.** It is downloaded on
-first use from the Hugging Face Hub
-([`maco018/in-car-distraction-yolo26`](https://huggingface.co/maco018/in-car-distraction-yolo26))
-and cached locally by `huggingface_hub` (so it only downloads once). The
-repo hosts the full **YOLO26 classification series** (`n`/`s`/`m`/`l`/`x`)
-fine-tuned on the
-[State Farm Distracted Driver Detection](https://www.kaggle.com/competitions/state-farm-distracted-driver-detection)
-dataset — real in-cabin, driver-facing frames. The default variant is
-`l` (best accuracy, 94.6% top-1 on held-out drivers).
+Distraction runs in one of two modes, selected by the `PROVOICE_DISTRACTION_MODE`
+environment variable:
+
+- **`detect` (default)** — a COCO object detector (auto-downloaded by Ultralytics:
+  `yolo26n.pt`, falling back to `yolo11n.pt`) localises `cell phone` → `phone`
+  and `bottle`/`cup` → `drink` **as objects**. This works at any distance and can
+  report several objects in the same frame. "Looking away" comes separately from
+  the MediaPipe gaze score (`gaze_distracted`) — so the old single-label failure
+  mode (everything collapsing to `distracted`, phone only seen near the face) is
+  gone.
+- **`classify`** — the legacy single-label model fine-tuned on the
+  [State Farm Distracted Driver Detection](https://www.kaggle.com/competitions/state-farm-distracted-driver-detection)
+  dataset, downloaded from the Hugging Face Hub
+  ([`maco018/in-car-distraction-yolo26`](https://huggingface.co/maco018/in-car-distraction-yolo26))
+  and cached locally. One label per frame (`safe`/`phone`/`drink`/`distracted`);
+  it is biased toward `distracted` on out-of-domain cameras, so it is opt-in.
 
 Weights resolution precedence (first match wins):
 1. `weights=` arg passed to `DistractionDetector(...)`
 2. `PROVOICE_YOLO_WEIGHTS` env var — absolute path to a local `.pt` (offline use)
-3. Hugging Face download of `PROVOICE_YOLO_VARIANT` (`n`/`s`/`m`/`l`/`x`, default `l`)
-   from `PROVOICE_YOLO_REPO` (default `maco018/in-car-distraction-yolo26`)
+3. mode default — in `detect`: `PROVOICE_DETECT_WEIGHTS` (default `yolo26n.pt`);
+   in `classify`: the Hugging Face download of `PROVOICE_YOLO_VARIANT`
+   (`n`/`s`/`m`/`l`/`x`, default `l`) from `PROVOICE_YOLO_REPO`
+   (default `maco018/in-car-distraction-yolo26`)
 
-`face` is set whenever MediaPipe detects a face (independent of YOLO).
-The classifier runs at **imgsz 224** (its training resolution) — this is
-auto-detected from the checkpoint.
+`face` is set whenever MediaPipe detects a face (independent of the detector).
+Detection runs at imgsz 640; the classifier at imgsz 224 (auto-detected from the
+checkpoint).
 
-### Retraining (e.g. when a newer YOLO release lands)
+### Retraining the classify-mode model
 
-The training pipeline is kept in-repo so the models can be regenerated:
+This pipeline is only needed for `PROVOICE_DISTRACTION_MODE=classify` (the
+default `detect` mode uses a stock COCO detector and needs no training). It is
+kept in-repo so the classifier can be regenerated:
 
 ```bash
 # 1. Download the State Farm dataset from Kaggle into
