@@ -172,7 +172,7 @@ proactivity-main/
 │       ├── perception.py        # EAR/MAR (MediaPipe) + YOLO26 distraction detection
 │       ├── train_distraction.py # Fine-tune YOLO26 on a custom distraction dataset
 │       ├── train_fcd_loa.py     # Model training (FCD)
-│       ├── train_XLSTM.py       # Model training (XLSTM)
+│       ├── train_XLSTM.py       # State→LoA training (official nx-ai/xlstm, xlstm==2.0.5)
 │       └── webui/               # Dashboard interface
 │
 ├── data/                       # Data storage
@@ -186,6 +186,20 @@ proactivity-main/
 │
 └── README.md                  # This file
 ```
+
+## State Model (xLSTM)
+
+The State→LoA model is a **real xLSTM sequence classifier** built on the
+official [`nx-ai/xlstm`](https://github.com/NX-AI/xlstm) package
+(`xlstm==2.0.5`), trained via `src/ProVoice/train_XLSTM.py`. It consumes the
+per-frame state-feature sequence of a segment and predicts the preferred
+Level of Automation as a **single-label 5-class** output (LoA 0–4).
+
+It uses the CPU-compatible mLSTM `xLSTMBlockStack` path (pure PyTorch); the
+triton-based `xlstm.xlstm_large` / `mlstm_kernels` path is **not** used
+(triton is unavailable on Windows). xLSTM inference therefore runs on CPU.
+If `trained_models/state_xlstm.pt` is absent, the decision engine falls back
+to FCD / LoA 0.
 
 ## Driver Perception (EAR / MAR / Distraction)
 

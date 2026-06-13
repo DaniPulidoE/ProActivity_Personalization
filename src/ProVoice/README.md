@@ -105,12 +105,24 @@ This process ensures that each data segment is accurately labeled and ready for 
 
 ## 6. Model Training
 - Train State→LoA (xLSTM)
-  - The xLSTM repo is updated frequently. Check for the latest instructions if something goes wrong.
+  - This uses the official [`nx-ai/xlstm`](https://github.com/NX-AI/xlstm)
+    package (`xlstm==2.0.5`), which is now a normal `uv` dependency — **no
+    manual repo checkout or separate conda env is needed**. It runs on the
+    CPU-compatible mLSTM `xLSTMBlockStack` path.
+  - The classifier is **single-label, 5-class** (LoA 0–4).
+  - **A real labeled dataset is required to retrain.** No trained checkpoint
+    is committed to this repo. Run the data pipeline first
+    (`data/generate_id.py` → `data/label_data.py` → `data/merge_label.py`,
+    see section 5); `label_data.py` produces a **blank label template** that
+    the researcher must fill in by hand before merging.
   ```
-  python train_XLSTM.py --in data/labeled_data.jsonl --out trained_models/state_xlstm.pt --epochs 30 # hyperparameter tuning is needed based on your dataset
+  python -m ProVoice.train_XLSTM --in data/labeled_data.jsonl --out trained_models/state_xlstm.pt --epochs 30 # hyperparameter tuning is needed based on your dataset
   ```
 
 ## 7. Run Decision Engines
+> **Note:** xLSTM inference runs on CPU. If `trained_models/state_xlstm.pt`
+> is absent, the engine falls back to FCD / LoA 0.
+
 - **FCD→LoA (XGBoost):**
   ```
   python main.py ... modeltype=fcd

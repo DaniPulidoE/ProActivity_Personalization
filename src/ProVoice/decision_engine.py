@@ -3,6 +3,12 @@ from typing import Dict, Any, Optional, Tuple, List
 import math, os
 import numpy as np
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function, resolve_function_key, adjust_fcd_by_state
+from ProVoice.models.xlstm_model import (
+    encode_frame,
+    D_IN,
+    DEFAULT_CONTEXT_LENGTH,
+    load_checkpoint,
+)
 
 def _policy_from_loa(loa: int, conservative: bool = True) -> Tuple[str, str]:
     loa = max(0, min(int(loa), 4))
@@ -181,45 +187,24 @@ class StateLevelsLoAStrategy(BaseStrategy):
 class StateXLSTMLoAStrategy(BaseStrategy):
     def __init__(self, model_path: Optional[str], default_function: str, window: int = 256, conservative: bool = True,
                  fcd_fallback: Optional[BaseStrategy] = None):
-        self.ckpt = None
+        self.model = None
+        # `window` is only a fallback; the authoritative sequence length is
+        # `context_length` taken from the loaded checkpoint's arch.
+        self.context_length = int(window) if window else DEFAULT_CONTEXT_LENGTH
+        self.ok = False
         try:
-            import torch
             if model_path and os.path.exists(model_path):
-                self.ckpt = torch.load(model_path, map_location="cpu")
-        except NotImplementedError as e:
+                self.model, arch = load_checkpoint(model_path)
+                self.context_length = int(arch.get("context_length", self.context_length))
+                self.ok = True
+        except Exception as e:
             print(f"Error loading state model: {e}")
-            self.ckpt = None
-        self.ok = self.ckpt is not None
+            self.model = None
+            self.ok = False
         self.window = int(window)
         self.default_key = resolve_function_key(default_function)
         self.conservative = conservative
         self.fcd_fallback = fcd_fallback
-        if self.ok:
-            import torch.nn as nn
-            d_in = int(self.ckpt.get("d_in", 12 + len(_STATE_NUM) + 2*len(_STATE_CAT)))
-            self.lstm = nn.LSTM(d_in, 128, num_layers=2, bidirectional=True, batch_first=True, dropout=0.1)
-            self.proj = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1))
-            self.head = nn.Linear(128, 5)
-            try:
-                sd = self.ckpt["model"]
-                self.lstm.load_state_dict({k.replace("lstm.", ""): v for k, v in sd.items() if k.startswith("lstm.")}, strict=False)
-                self.proj.load_state_dict({k.replace("proj.", ""): v for k, v in sd.items() if k.startswith("proj.")}, strict=False)
-                self.head.load_state_dict({k.replace("head.", ""): v for k, v in sd.items() if k.startswith("head.")}, strict=False)
-            except NotImplementedError as e:
-                print(f"Error loading state model: {e}")
-                pass
-
-    @staticmethod
-    def _as01(x: Any) -> float:
-        return StateLevelsLoAStrategy._as01(x)
-
-    def _encode_row(self, fn: str, state: Dict[str, Any]) -> np.ndarray:
-        fcd = get_fcd_for_function(fn)
-        num = [self._as01(state.get(k)) for k in _STATE_NUM]
-        catv = []
-        for k in _STATE_CAT:
-            c = str(state.get(k, "")); catv.extend([0.0 if c else 1.0, min(len(c)/16.0, 1.0)])
-        return np.asarray([*(fcd[k] for k in FCD_NAMES), *num, *catv], dtype=np.float32)
 
     def _try_fcd_fallback(self, state: Dict[str, Any], fn: str) -> Dict[str, Any]:
         fcd = get_fcd_for_function(fn)
@@ -236,22 +221,21 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             seq: List[Dict[str, Any]] = state.get("sequence") or []
             if not seq:
                 return self._try_fcd_fallback(state, fn)
-            Xs = [self._encode_row(fn, s) for s in seq[-self.window:]]
-            T, D = len(Xs), Xs[0].shape[0]
-            if T < self.window: Xs = [np.zeros(D, np.float32)]*(self.window-T) + Xs
             import torch
+            Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
+            T = len(Xs)
+            if T < self.context_length:
+                # LEFT-pad with zero vectors so the last timestep is valid.
+                Xs = [np.zeros(D_IN, np.float32)] * (self.context_length - T) + Xs
             with torch.no_grad():
                 xb = torch.from_numpy(np.stack(Xs, 0))[None, ...]
-                out, _ = self.lstm(xb)
-                h = out[:, -1, :]
-                h = self.proj(h)
-                logits = self.head(h)
+                logits = self.model(xb)
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
             loa = _decide_from_probs(probs, "argmax")
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             fcd = get_fcd_for_function(fn)
             return {"action": action, "level": level, "LoA": loa, "message": "State XLSTM", "fcd": fcd, "probs": probs, "profile": resolve_function_key(fn), "fallback": False}
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error in state model: {e}")
             fn = state.get("functionname") or self.default_key
             return self._try_fcd_fallback(state, fn)
