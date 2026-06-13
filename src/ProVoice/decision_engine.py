@@ -133,10 +133,9 @@ class StateLevelsLoAStrategy(BaseStrategy):
         if isinstance(x, bool): return 1.0 if x else 0.0
         s = str(x).strip().lower()
         if s in ("true","1","t","yes","y"): return 1.0
-        if s in ("false","0","f","no","n",""): return 0.0
+        if s in ("false","0","f","no","n","","none","nan","null"): return 0.0
         try: return float(s)
-        except NotImplementedError as e:
-            print(f"Error parsing state value {x}: {e}")
+        except Exception:
             return 0.0
 
     def _extract_features(self, state: Dict[str, Any]) -> Optional[np.ndarray]:
@@ -253,19 +252,25 @@ class CombinedFusionStrategy(BaseStrategy):
         self.quantile_tau = quantile_tau
 
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        fn = state.get("functionname", "")
         try:
             of = self.fcd_strategy.decide(state)
-        except NotImplementedError as e:
-            fn = state.get("functionname", "")
-            return _loa0_result(f"Fusion FCD error: {e}", fn)
+        except Exception as e:
+            of = _loa0_result(f"Fusion FCD error: {e}", fn)
         try:
             os_ = self.state_strategy.decide(state)
-        except NotImplementedError as e:
-            fn = state.get("functionname", "")
-            return _loa0_result(f"Fusion State error: {e}", fn)
-        if of.get("fallback") or os_.get("fallback"):
-            fn = state.get("functionname", "")
-            return _loa0_result("Fusion fallback from child", fn)
+        except Exception as e:
+            os_ = _loa0_result(f"Fusion State error: {e}", fn)
+        of_fb = bool(of.get("fallback")); os_fb = bool(os_.get("fallback"))
+        # Degrade gracefully: if only one model is unavailable, use the other
+        # instead of collapsing the whole decision to LoA0. (Common case: no
+        # trained xLSTM checkpoint -> fall back to the FCD model alone.)
+        if of_fb and os_fb:
+            return _loa0_result("Fusion: both FCD and state unavailable", fn)
+        if os_fb:
+            return {**of, "message": (str(of.get("message", "")) + " (state unavailable; FCD-only)").strip(), "sub": {"fcd": of, "state": os_}}
+        if of_fb:
+            return {**os_, "message": (str(os_.get("message", "")) + " (FCD unavailable; state-only)").strip(), "sub": {"fcd": of, "state": os_}}
         pf = of.get("probs", [0.2]*5); ps = os_.get("probs", [0.2]*5)
         probs = [self.w_fcd*pf[i] + self.w_state*ps[i] for i in range(5)]
         S = sum(probs); probs = [p / S if S>0 else 0.2 for p in probs]

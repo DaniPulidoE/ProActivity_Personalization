@@ -225,7 +225,7 @@ class DistractionDetector:
     def __init__(
         self,
         weights: Optional[str] = None,
-        conf: float = 0.6,
+        conf: Optional[float] = None,
         iou: float = 0.45,
         imgsz: Optional[int] = None,
         class_map: Optional[Dict[str, str]] = None,
@@ -248,16 +248,23 @@ class DistractionDetector:
             print("[perception] ultralytics not installed; distraction detection disabled.")
             return
 
-        # Resolution order: explicit arg > PROVOICE_YOLO_WEIGHTS env >
-        # download from the Hugging Face Hub (cached after first run).
+        # Mode: "detect" (default) localises phone / bottle / cup as objects —
+        # works at any distance and can report several at once. "classify" uses
+        # the single-label Hugging Face model (legacy; biased toward "distracted").
+        mode = os.getenv("PROVOICE_DISTRACTION_MODE", "detect").lower()
+
+        # Resolution order: explicit arg > PROVOICE_YOLO_WEIGHTS env > mode default.
         if weights is None:
             weights = os.getenv("PROVOICE_YOLO_WEIGHTS")
-        if weights is None:
+        if weights is not None:
+            load_candidates = [weights]
+        elif mode == "classify":
             repo = os.getenv("PROVOICE_YOLO_REPO", DEFAULT_HF_REPO)
             variant = os.getenv("PROVOICE_YOLO_VARIANT", DEFAULT_HF_VARIANT)
             try:
-                weights = _download_from_hf(repo, variant)
-                print(f"[perception] using {repo} variant '{variant}' -> {weights}")
+                hf_path = _download_from_hf(repo, variant)
+                print(f"[perception] using {repo} variant '{variant}' -> {hf_path}")
+                load_candidates = [hf_path]
             except Exception as exc:  # noqa: BLE001
                 print(f"[perception] could not fetch distraction model from "
                       f"Hugging Face ({repo}:{variant}): {exc}. "
@@ -265,11 +272,22 @@ class DistractionDetector:
                       f"to use a local model offline).")
                 self._model = None
                 return
-        try:
-            self._model = YOLO(weights)  # type: ignore[misc]
-        except Exception as exc:  # noqa: BLE001
-            print(f"[perception] Failed to load YOLO weights '{weights}': {exc}")
-            self._model = None
+        else:
+            # Detection default: a COCO detector (auto-downloaded by ultralytics).
+            # Try the configured / yolo26 model first, then fall back to yolo11n.
+            load_candidates = [os.getenv("PROVOICE_DETECT_WEIGHTS", "yolo26n.pt"), "yolo11n.pt"]
+
+        self._model = None
+        last_exc = None
+        for cand in load_candidates:
+            try:
+                self._model = YOLO(cand)  # type: ignore[misc]
+                weights = cand
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+        if self._model is None:
+            print(f"[perception] Failed to load YOLO weights {load_candidates}: {last_exc}")
             return
 
         names = getattr(self._model, "names", {}) or {}
@@ -282,6 +300,11 @@ class DistractionDetector:
         task = getattr(self._model, "task", None) or ""
         self._is_classify = ("classif" in str(task).lower()
                               or "-cls" in str(weights).lower())
+
+        # Resolve confidence now that the mode is known: detecting small objects
+        # (phone/bottle) needs a lower threshold than a top-1 classifier.
+        if self.conf is None:
+            self.conf = 0.6 if self._is_classify else 0.35
 
         # Resolve inference resolution. Classification models MUST run at
         # their training size (typically 224); running a 224-trained
@@ -368,8 +391,6 @@ class DistractionDetector:
                 confs   = boxes.conf.cpu().numpy().astype(float)
                 xyxy    = boxes.xyxy.cpu().numpy().astype(int)
                 for cid, conf, box in zip(cls_ids, confs, xyxy):
-                    print(self._labels)
-                    print(confs)
                     if conf < self.conf:
                         continue
                     raw_name = self._labels.get(int(cid))
