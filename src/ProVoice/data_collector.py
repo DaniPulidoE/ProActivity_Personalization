@@ -29,7 +29,7 @@ try:
     os.environ["KERAS_BACKEND"] = "torch"
     from keras.models import load_model  # type: ignore
     HAS_KERAS = True
-except NotImplementedError as e:
+except Exception as e:
     print(e, "Error loading keras")
     load_model = None  # type: ignore
     HAS_KERAS = False
@@ -69,7 +69,7 @@ class DataCollector:
         cam_index: int | str = 0,
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
-        window_size: int = 256,
+        window_size: int = 400, # 20 seconds at 20Hz (as user inputs tabel each 20 seconds)
         vehicle_state_url: Optional[str] = None,
     ) -> None:
         self.visual_enabled = bool(visual and HAS_CV2)
@@ -92,12 +92,12 @@ class DataCollector:
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
         self._cached_speed: int = 0
         self._state_poll_thread: Optional[threading.Thread] = None
-        # 如果有 CARLA actor，尝试获取 vehicle_id
+        # If a CARLA actor is present, attempt to retrieve the vehicle_id
         self.vehicle_id = None
         if self.carla_vehicle is not None:
             try:
                 self.vehicle_id = getattr(self.carla_vehicle, "id", None)
-            except NotImplementedError as e:
+            except Exception as e:
                 print("[DataCollector] Error getting vehicle_id from CARLA actor:", e)
                 
         if self.visual_enabled:
@@ -106,7 +106,7 @@ class DataCollector:
                 print(f"Connecting: {self.cam_index} ...")
                 print(f"Camera opened: {self.cap.isOpened()}")
 
-            except NotImplementedError as e:
+            except Exception as e:
                 print(e, "Error opening camera")
                 self.cap = None
                 self.visual_enabled = False
@@ -115,7 +115,7 @@ class DataCollector:
                     print("[DataCollector] Initializing MediaPipe Face Mesh...")
                     self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)  # type: ignore
                     print("[DataCollector] MediaPipe Face Mesh loaded successfully.")
-                except NotImplementedError as e:
+                except Exception as e:
                     print(e, "Error initializing face mesh")
                     self.face_mesh = None
 
@@ -125,7 +125,7 @@ class DataCollector:
             if HAS_RPPG and OnlineRPPG is not None:
                 try:
                     self.rppg_estimator = OnlineRPPG(frame_rate=10, crop_size=72)  # type: ignore
-                except NotImplementedError as e:
+                except Exception as e:
                     print(e, "Error initializing rPPG estimator")
                     self.rppg_estimator = None
                     raise e
@@ -185,7 +185,7 @@ class DataCollector:
             conf = float(preds[arg])
             label = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'sad', 5: 'surprise', 6: 'neutral'}.get(arg, 'neutral')
             return {'emotion': label, 'emotion_prob': round(conf, 3)}
-        except NotImplementedError as e:
+        except Exception as e:
             print(e, "Error detecting emotion")
             return None
 
@@ -219,7 +219,7 @@ class DataCollector:
             left_score = np.linalg.norm(left_center - left_eye_center) / max(left_eye_width, 1e-6)
             right_score = np.linalg.norm(right_center - right_eye_center) / max(right_eye_width, 1e-6)
             return float((left_score + right_score) / 2.0)
-        except NotImplementedError as e:
+        except Exception as e:
             print(e, "Error computing gaze score")
             return 0.0
 
@@ -234,7 +234,7 @@ class DataCollector:
             lm = results.multi_face_landmarks[0].landmark
             h, w, _ = frame.shape
             return self.compute_gaze_score(lm, w, h)
-        except NotImplementedError as e:
+        except Exception as e:
             print(e, "Error computing gaze score")
             return 0.0
 
@@ -445,7 +445,7 @@ class DataCollector:
                     speed = (vel.x**2 + vel.y**2 + vel.z**2)**0.5
                     speed = int(speed * 3.6)
                     self._cached_speed = speed
-                except NotImplementedError as e:
+                except Exception as e:
                     print("[DataCollector] Error reading vehicle speed:", e)
                     speed = self._cached_speed
             elif self.vehicle_state_url is not None:
@@ -533,7 +533,7 @@ class DataCollector:
                     if self.actuator and action is not None:
                         self.actuator.execute(action)
 
-            except NotImplementedError as e:
+            except Exception as e:
                 print('[DataCollector] loop error:', e)
 
             next_t += self.sampling_interval
@@ -577,7 +577,7 @@ class DataCollector:
         try:
             if self.cap is not None:
                 self.cap.release()
-        except NotImplementedError as e:
+        except Exception as e:
             print(e, "Error releasing camera")
             pass
         self.cap = None
@@ -595,7 +595,7 @@ class DataCollector:
         try:
             _, buffer = cv2.imencode('.jpg', frame)  # type: ignore
             return base64.b64encode(buffer).decode('utf-8')
-        except NotImplementedError as e:
+        except Exception as e:
             print(e, "Error encoding latest frame")
             return None
 
@@ -608,7 +608,7 @@ class DataCollector:
             try:
                 _, buffer = cv2.imencode('.jpg', frame)  # type: ignore
                 img_b64 = base64.b64encode(buffer).decode('utf-8')
-            except NotImplementedError as e:
+            except Exception as e:
                 print(e, "Error encoding latest frame")
                 img_b64 = None
         return {"data": data, "frame_b64": img_b64}

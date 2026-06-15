@@ -6,7 +6,7 @@ import argparse
 mp_face_mesh = mp.solutions.face_mesh
 
 def compute_gaze_score(landmarks, image_width, image_height) -> float:
-    # iris landmarks: 左眼 468, 469, 470, 471；右眼 473, 474, 475, 476
+    # iris landmarks: left eye 468, 469, 470, 471; right eye 473, 474, 475, 476
     left_pts = [landmarks[i] for i in [468, 469, 470, 471]]
     right_pts = [landmarks[i] for i in [473, 474, 475, 476]]
     

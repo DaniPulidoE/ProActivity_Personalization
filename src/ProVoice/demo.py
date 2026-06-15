@@ -7,11 +7,11 @@ def get_env_info(world, ego_vehicle, collision_sensor=None):
     vehicles = world.get_actors().filter('vehicle.*')
     walkers = world.get_actors().filter('walker.*')
 
-    # 计算车辆速度 (km/h)
+    # Compute vehicle speed (km/h)
     velocity = ego_vehicle.get_velocity()
     speed = 3.6 * (velocity.x**2 + velocity.y**2 + velocity.z**2) ** 0.5
 
-    # 计算车辆加速度 (m/s²)
+    # Compute vehicle acceleration (m/s²)
     acceleration = ego_vehicle.get_acceleration()
     acc = (acceleration.x**2 + acceleration.y**2 + acceleration.z**2) ** 0.5
 
@@ -156,13 +156,13 @@ def main():
             info = get_env_info(world, ego_vehicle, collision_sensor)
             draw_info_panel(world, ego_vehicle, info, context=context)
 
-            # 高负载区自动减速
+            # Auto decelerate in high-load zone
             if manual_control:
                 control = carla.VehicleControl(throttle=0.18, steer=0.0, brake=0.0)
                 ego_vehicle.apply_control(control)
             time.sleep(0.08)
 
-            # 约20秒后切换高负载场景，生成更多交通流并减速
+            # Switch to high-load scenario ~20 seconds in, spawn more traffic and slow down
             if phase == 0 and time.time()-t0 > 20:
                 print("Switching to high-traffic scenario and slowing down...")
                 for v in traffic:
@@ -170,7 +170,7 @@ def main():
                 traffic = spawn_traffic(world, blueprint_library, spawn_points, count=5)
                 context = "high"
                 phase = 1
-                ego_vehicle.set_autopilot(False)   # 切为手动慢速
+                ego_vehicle.set_autopilot(False)   # Switch to manual slow mode
                 manual_control = True
 
     finally:

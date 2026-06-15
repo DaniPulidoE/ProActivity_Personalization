@@ -9,6 +9,8 @@ from ProVoice.models.xlstm_model import (
     DEFAULT_CONTEXT_LENGTH,
     load_checkpoint,
 )
+import torch
+
 
 def _policy_from_loa(loa: int, conservative: bool = True) -> Tuple[str, str]:
     loa = max(0, min(int(loa), 4))
@@ -58,7 +60,7 @@ def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]]
 
 class BaseStrategy:
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        raise NotImplementedError
+        raise Exception("BaseStrategy is abstract and cannot decide; use a subclass with a concrete implementation.")
 
 
 class XGBoostLoAStrategy(BaseStrategy):
@@ -70,7 +72,7 @@ class XGBoostLoAStrategy(BaseStrategy):
             import joblib
             if model_path and os.path.exists(model_path):
                 self.model = joblib.load(model_path)
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error loading FCD model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
@@ -98,7 +100,7 @@ class XGBoostLoAStrategy(BaseStrategy):
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             return {"action": action, "level": level, "LoA": loa, "message": "FCD xgboost", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
-        except NotImplementedError as e:
+        except Exception as e:
             fn = state.get("functionname") or self.default_key
             return _loa0_result(f"FCD decide error: {e}", fn)
 
@@ -115,7 +117,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
             import joblib
             if model_path and os.path.exists(model_path):
                 self.model = joblib.load(model_path)
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error loading state model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
@@ -176,7 +178,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             return {"action": action, "level": level, "LoA": loa, "message": "State model", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error in state model: {e}")
             fn = state.get("functionname") or self.default_key
             fcd = get_fcd_for_function(fn)
@@ -220,7 +222,6 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             seq: List[Dict[str, Any]] = state.get("sequence") or []
             if not seq:
                 return self._try_fcd_fallback(state, fn)
-            import torch
             Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
             T = len(Xs)
             if T < self.context_length:

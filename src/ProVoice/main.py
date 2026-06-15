@@ -93,7 +93,7 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
                         print(f"[WARN] Invalid vehicle id content: {raw!r}")
                 else:
                     print(f"[WARN] vehicle_id file {path} empty, waiting...")
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"[WARN] Error reading vehicle id file {path}: {e}")
 
         time.sleep(0.1)
@@ -146,7 +146,7 @@ def main():
     state_model = args.get("state_model", args.get("statemodel", "classic")).lower()
     w_fcd = float(args.get("w_fcd", "0.5"))
     session_id = args.get("session_id") or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    window_sz = int(args.get("window", "256"))
+    window_sz = int(args.get("window", "400"))  # default 400 samples (20 seconds at 20Hz)
     camera_source = args.get("camera_source", "front")
     camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
     vehicle_id_arg = args.get("vehicle_id")  # optional: skip file-based discovery when set
@@ -170,7 +170,7 @@ def main():
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully from trained_models/fcd_levels.pkl")
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
 
@@ -183,7 +183,7 @@ def main():
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully for collection")
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
     # STATE only
@@ -207,7 +207,7 @@ def main():
                 )
                 print("[main] STATE (classic) model loaded successfully from trained_models/state_levels.pkl")
             strategy = state_engine
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] STATE load error:", e)
             strategy = LoAZeroFallback("STATE model load error → LoA0")
 
@@ -221,7 +221,7 @@ def main():
                 conservative=True,
             )
             print("[main] Combined-FCD part loaded successfully.")
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] FCD load error:", e)
             fcd_engine = LoAZeroFallback("FCD model load error → LoA0")
         # STATE
@@ -244,7 +244,7 @@ def main():
                     fcd_fallback=None,
                 )
                 print("[main] Combined-STATE (classic) part loaded successfully.")
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] STATE load error:", e)
             state_engine = LoAZeroFallback("STATE model load error → LoA0")
 
@@ -256,7 +256,7 @@ def main():
                 conservative=True,
             )
             print("[main] CombinedFusionStrategy initialized successfully.")
-        except NotImplementedError as e:
+        except Exception as e:
             print("[main] Combined init error:", e)
             strategy = fcd_engine if fcd_engine is not None else LoAZeroFallback("Combined init error → LoA0")
 
@@ -332,6 +332,7 @@ def main():
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
         vehicle_state_url=vehicle_state_url,
+        window_size=window_sz,
     )
 
     dashboard.data_collector = data_collector

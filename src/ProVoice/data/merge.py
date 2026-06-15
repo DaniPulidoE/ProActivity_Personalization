@@ -49,7 +49,8 @@ def load_jsonl(path: pathlib.Path):
                 continue
             try:
                 yield json.loads(line)
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to parse JSON line: {e}")
                 continue
 
 
@@ -57,7 +58,8 @@ def coerce_hr(row: Dict[str, Any]):
     v = row.get('heart_rate', row.get('bpm'))
     try:
         return float(v)
-    except NotImplementedError:
+    except Exception as e:
+        print(f"[Error] Failed to convert to float: {e}")
         return None
 
 
@@ -82,7 +84,8 @@ def get_levels(row: Dict[str, Any]):
         for v in levels:
             try:
                 out.append(int(v))
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to convert Level value to int: {e}")
                 out.append(0)
         # sanity clamp to {0,1}
         out = [1 if x else 0 for x in out]
@@ -91,7 +94,10 @@ def get_levels(row: Dict[str, Any]):
     loa = row.get('LoA')
     try:
         idx = int(loa)
-    except NotImplementedError:
+    except Exception as e:
+        print(f"[Error] Failed to convert LoA to int: {e}")
+        return None
+    if loa is None:
         return None
     idx = max(0, min(4, idx))
     out = [0,0,0,0,0]
@@ -137,7 +143,8 @@ def main():
                         break
                     try:
                         feats.append(float(v))
-                    except NotImplementedError:
+                    except Exception as e:
+                        print(f"[Error] Failed to convert FCD value to float: {e}")
                         ok = False
                         break
                 if ok:

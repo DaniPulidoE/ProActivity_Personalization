@@ -11,6 +11,7 @@ Uses the OFFICIAL nx-ai/xlstm library (``xlstm==2.0.5``), classic
 """
 from __future__ import annotations
 
+import ast
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -42,12 +43,24 @@ except ImportError:  # pragma: no cover - exercised only when xlstm is absent
 # Canonical feature schema (ONE fixed order, used everywhere).
 # --------------------------------------------------------------------------- #
 STATE_NUM = ['drowsiness_alert', 'gaze_distracted', 'heart_rate']
-STATE_CAT = ['environment', 'secondary_task', 'lab', 'emotion']
+STATE_CAT_LEN = ['environment', 'secondary_task']
+STATE_CAT_ONE_HOT = ['emotion', 'lab']
+STATE_CAT = STATE_CAT_LEN + STATE_CAT_ONE_HOT
+
+
+# one-hot encoding for emotion and lab categories
+EMOTION_VOCAB = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+LAB_VOCAB = ['face', 'phone', 'drink', 'smoke', 'distracted', 'safe'] # leave only phone and drink if we use the detection model !
 
 # FCD values, then each NUM (1 value), then each CAT (2 values).
-D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
+#D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
+# with one-hot encoding for emotion and lab categories
+D_IN = len(FCD_NAMES) + len(STATE_NUM) +  len(STATE_CAT_LEN) + len(EMOTION_VOCAB) + len(LAB_VOCAB)
 
-DEFAULT_CONTEXT_LENGTH = 256
+DEFAULT_CONTEXT_LENGTH = 400
+
+
+
 
 
 def _as01(x: Any) -> float:
@@ -72,9 +85,14 @@ def _as01(x: Any) -> float:
 def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     """Encode a single timestep into a ``float32`` vector of length ``D_IN``.
 
-    Layout: FCD values (via ``get_fcd_for_function``), then each NUM via
-    ``_as01``, then for each CAT two values ``[1.0 if non-empty else 0.0,
-    min(len(str(v))/16.0, 1.0)]``.
+    Layout: 12 FCD values, 3 NUM values (_as01), 2 string-length CAT values
+    (environment, secondary_task), 7 emotion one-hot values, 6 lab multi-hot
+    values. Total: D_IN = 30.
+
+    ``lab`` can be a Python list (from live DataCollector or JSONL), a
+    string-encoded list (``"['face', 'phone']"`` — produced when pandas
+    stringifies the column), or a plain string (``"phone"``). All forms are
+    normalised to a list before building the multi-hot vector.
     """
     fcd = get_fcd_for_function(functionname or "")
     fcd_vec = [float(fcd[k]) for k in FCD_NAMES]
@@ -82,8 +100,23 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     catv = []
     for k in STATE_CAT:
         v = row.get(k, "")
-        c = "" if v is None else str(v)
-        catv.extend([1.0 if c != "" else 0.0, min(len(c) / 16.0, 1.0)])
+        if k == 'emotion':
+            vec = [1.0 if v == e else 0.0 for e in EMOTION_VOCAB]
+        elif k == 'lab':
+            if isinstance(v, list):
+                lab_list = v
+            else:
+                s = str(v).strip()
+                try:
+                    parsed = ast.literal_eval(s)
+                    lab_list = parsed if isinstance(parsed, list) else ([s] if s else [])
+                except Exception:
+                    lab_list = [s] if s else []
+            vec = [1.0 if label in lab_list else 0.0 for label in LAB_VOCAB]
+        else:
+            c = "" if v is None else str(v)
+            vec = [min(len(c) / 16.0, 1.0)]
+        catv.extend(vec)
     return np.asarray([*fcd_vec, *num, *catv], dtype=np.float32)
 
 
@@ -171,9 +204,9 @@ def save_checkpoint(model: XLSTMSequenceClassifier, path: str, arch: Dict[str, A
 def load_checkpoint(path: str, map_location: str = 'cpu') -> Tuple[XLSTMSequenceClassifier, Dict[str, Any]]:
     """Load a checkpoint, rebuild the model, and strict-load its weights."""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
-    assert ckpt.get("format_version") == 1, (
-        f"Unsupported checkpoint format_version: {ckpt.get('format_version')!r}"
-    )
+    if ckpt.get("format_version") != 1:
+        raise ValueError(f"Unsupported checkpoint format_version: {ckpt.get('format_version')!r}")
+
     arch = ckpt["arch"]
     model = XLSTMSequenceClassifier(**arch)
     model.load_state_dict(ckpt["state_dict"], strict=True)

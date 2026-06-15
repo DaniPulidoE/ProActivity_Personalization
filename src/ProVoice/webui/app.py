@@ -53,20 +53,18 @@ dash_app.layout = dbc.Container([
         style={"display": "none"},   # hidden by default
     ),
     dbc.Row([
-        # 左侧：实时图像
+        # Left side: live image
         dbc.Col(
             [
                 html.Img(id="live-image",
-                         style={"width": "720px", "height": "auto", "border": "1px solid #333", "minHeight": "480px",
-                                "display": "block", "margin": "0 auto"}),
-                html.Div(id="action-report", className="mt-3",
-                         style={"fontSize": "1.15rem", "color": "#246", "minHeight": "50px"}),
+                         style={"width": "100%", "height": "auto", "border": "1px solid #333",
+                                "minHeight": "480px", "display": "block"}),
+                html.Div(id="action-report", className="mt-2",
+                         style={"fontSize": "1.1rem", "color": "#246"}),
             ],
             width=6,
-            className="d-flex align-items-center",
-            style={"minHeight": "760px"}
         ),
-        # 右侧：数据面板
+        # Right side: data panel
         dbc.Col([
             html.Div([
                 html.Div([
@@ -143,9 +141,9 @@ async def emit_data_periodically():
             continue
         
         
-        # 图像流
+        # Image stream
         frame_b64 = data_collector.get_latest_frame()
-        # 数值
+        # Numeric values
         latest_data = data_collector.get_latest_data()
 
         if latest_data is None:

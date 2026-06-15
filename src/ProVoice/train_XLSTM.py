@@ -18,21 +18,16 @@ from ProVoice.models.xlstm_model import (
     save_checkpoint,
     DEFAULT_CONTEXT_LENGTH,
 )
+from ProVoice.models.xlstm_model import _as01
+
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
+SPLIT_VARIABLE = "participantid"
 
 
 def set_seed(s: int):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
-
-
-def _as01(x: Any) -> float:
-    s = str(x).strip().lower()
-    if s in ('true', '1', 't', 'yes', 'y'): return 1.0
-    if s in ('false', '0', 'f', 'no', 'n', '', 'nan', 'none', 'null'): return 0.0
-    try: return float(s)
-    except Exception: return 0.0
 
 
 def read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
@@ -56,6 +51,7 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return default
     out = {}
     out['segment_id']      = pick('segment_id', 'segment', 'trial_id', 'trial', 'block_id')
+    out['participantid']   = pick('participantid', 'participant_id', 'participant', 'pid')
     out['functionname']    = pick('functionname', 'function', 'func_name', 'FunctionName')
     out['environment']     = pick('environment', 'env', 'environment_type')
     out['secondary_task']  = pick('secondary_task', 'sec_task', 'secondaryTask')
@@ -191,12 +187,23 @@ def main():
     for k in STATE_NUM:
         if k not in df.columns: df[k] = 0.0
         df[k] = df[k].apply(_as01)
-
+    
+    """ Original case: train-val split done randomly, not by participant
     gids = df['segment_id'].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
     ntr = max(1, int(0.8 * len(gids)))
     tr_ids, te_ids = set(gids[:ntr]), set(gids[ntr:])
     tr_df = df[df['segment_id'].isin(tr_ids)].reset_index(drop=True)
     te_df = df[df['segment_id'].isin(te_ids)].reset_index(drop=True)
+    """
+    # Train-validation split performed by participantid: 80% of participants for training, 20% for validation)
+    if df[SPLIT_VARIABLE].eq("").all():
+        raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
+    pids = df[SPLIT_VARIABLE].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
+    ntr = max(1, int(0.8 * len(pids)))
+    tr_pids, te_pids = set(pids[:ntr]), set(pids[ntr:])
+    print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
+    tr_df = df[df[SPLIT_VARIABLE].isin(tr_pids)].reset_index(drop=True)
+    te_df = df[df[SPLIT_VARIABLE].isin(te_pids)].reset_index(drop=True)
 
     train_ds = SeqDataset(tr_df, context_length=args.context_length)
     test_ds  = SeqDataset(te_df, context_length=args.context_length)
