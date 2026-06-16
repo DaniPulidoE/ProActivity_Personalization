@@ -132,27 +132,31 @@ dash_app.layout = dbc.Container([
 app.mount("/", WSGIMiddleware(dash_app.server))
 
 # =====================================================
-# Async data emitter (20 ms)
+# Async data emitter (20 Hz)
 # =====================================================
 async def emit_data_periodically():
     while True:
-        if data_collector is None:
-            await asyncio.sleep(0.02)
-            continue
-        
-        
-        # Image stream
-        frame_b64 = data_collector.get_latest_frame()
-        # Numeric values
-        latest_data = data_collector.get_latest_data()
+        try: 
+            if data_collector is None:
+                await asyncio.sleep(0.05) 
+                continue
+            
+            # Image stream
+            frame_b64 = data_collector.get_latest_frame()
+            # Numeric values
+            latest_data = data_collector.get_latest_data()
 
-        if latest_data is None:
-            await asyncio.sleep(0.02)
-            continue
+            if latest_data is None:
+                await asyncio.sleep(0.05)
+                continue
 
-        payload = latest_data.copy()
-        payload["frame"] = frame_b64
-        payload["calibrating"] = not data_collector.calibrated
+            payload = latest_data.copy()
+            payload["frame"] = frame_b64
+            payload["calibrating"] = not data_collector.calibrated
 
-        await sio.emit("new_data", payload)
-        await asyncio.sleep(0.02)
+            await sio.emit("new_data", payload)
+            
+        except Exception as e:
+            print(f"[emitter] error: {e}")
+
+        await asyncio.sleep(0.05) # 0.05 to match 20Hz of data collection

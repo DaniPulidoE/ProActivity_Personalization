@@ -69,7 +69,7 @@ class DataCollector:
         cam_index: int | str = 0,
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
-        window_size: int = 400, # 20 seconds at 20Hz (as user inputs tabel each 20 seconds)
+        window_size: int = 400, # 20 seconds at 20Hz (as user inputs label each 20 seconds)
         vehicle_state_url: Optional[str] = None,
     ) -> None:
         self.visual_enabled = bool(visual and HAS_CV2)
@@ -124,7 +124,7 @@ class DataCollector:
 
             if HAS_RPPG and OnlineRPPG is not None:
                 try:
-                    self.rppg_estimator = OnlineRPPG(frame_rate=10, crop_size=72)  # type: ignore
+                    self.rppg_estimator = OnlineRPPG(frame_rate=20, crop_size=72)  # type: ignore
                 except Exception as e:
                     print(e, "Error initializing rPPG estimator")
                     self.rppg_estimator = None
@@ -222,7 +222,7 @@ class DataCollector:
         except Exception as e:
             print(e, "Error computing gaze score")
             return 0.0
-
+    """
     def get_gaze_score(self, frame) -> float:
         if not self.face_mesh or not HAS_MP:
             return 0.0
@@ -237,6 +237,31 @@ class DataCollector:
         except Exception as e:
             print(e, "Error computing gaze score")
             return 0.0
+    """
+    
+    def get_gaze_score(self, frame, face_mesh_results) -> float:
+        if not face_mesh_results:
+            return 0.0
+        try:
+            if not face_mesh_results.multi_face_landmarks:
+                return 0.0
+            lm = face_mesh_results.multi_face_landmarks[0].landmark
+            h, w, _ = frame.shape
+            return self.compute_gaze_score(lm, w, h)
+        except Exception as e:
+            print(e, "Error computing gaze score")
+            return 0.0
+    
+    def compute_face_mesh(self, frame):
+        if not self.face_mesh or not HAS_MP:
+            return None
+        try:
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore
+            results = self.face_mesh.process(img_rgb)
+            return results
+        except Exception as e:
+            print(e, "Error computing face mesh")
+            return None
 
     def calibrate_step(self) -> None:
         # check for errors (same as in collect_data)
@@ -248,12 +273,15 @@ class DataCollector:
             self.latest_frame = None
             return
         
+        # reuse face mesh in gaze score and emotion detection to avoid double processing
+        face_mesh_results = self.compute_face_mesh(frame) 
         # gaze score
-        gaze_score = self.get_gaze_score(frame)
+        gaze_score = self.get_gaze_score(frame, face_mesh_results)
         if gaze_score > 0.0: # filter out frames where gaze score couldn't be computed to avoid skewing calibration
             self._calibration_data['gaze_score'].append(gaze_score)
         
-        # load face detector
+        # load face detector - only needed for rPPG and emotion detection, not gaze score
+        """
         if _face_detector is not None and (
                 self.rppg_estimator is not None or (_emotion_model is not None and _emotion_input_size is not None)):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # type: ignore
@@ -261,11 +289,12 @@ class DataCollector:
         else:
             gray = None
             faces = []
+        """
         
         # face data for EAR/MAR and Perclos
         if HAS_MYFRAME:
             try:
-                ret, frame_annot = _perception.frametest(frame)
+                ret, frame_annot = _perception.frametest(frame, face_mesh_results)
                 lab, eye, mouth = ret
                 if eye > 0.15: # filter out frames where eye is too closed to avoid skewing calibration
                     self._calibration_data['ear'].append(eye)
@@ -311,8 +340,10 @@ class DataCollector:
             self.latest_frame = None
             return
 
-        # Gaze
-        gaze_score = self.get_gaze_score(frame)
+        # reuse face mesh in gaze score and emotion detection to avoid double processing
+        face_mesh_results = self.compute_face_mesh(frame) 
+        # gaze score
+        gaze_score = self.get_gaze_score(frame, face_mesh_results)
         data['gaze_score'] = round(float(gaze_score), 3)
         data['gaze_distracted'] = bool(gaze_score > self.calibrate['gaze_score']['threshold'])
 
@@ -367,7 +398,7 @@ class DataCollector:
 
         if HAS_MYFRAME:
             try:
-                ret, frame_annot = _perception.frametest(frame)
+                ret, frame_annot = _perception.frametest(frame, face_mesh_results)
                 lab, eye, mouth = ret
             except Exception as e:  # noqa: BLE001 (perception code crosses C extensions)
                 print(e, "Error computing perception.frametest")

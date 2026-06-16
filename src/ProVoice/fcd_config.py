@@ -60,7 +60,7 @@ def resolve_function_key(name: str) -> str:
     return _ALIASES.get(ck, FUNCTIONS[0][0])  
 
 def get_fcd_for_function(name: str) -> Dict[str, int]:
-    return BASE_FCD_CONFIG.get(resolve_function_key(name), {k: 3 for k in FCD_NAMES})
+    return BASE_FCD_CONFIG.get(resolve_function_key(name), {k: 3 for k in FCD_NAMES}).copy()
 
 def adjust_fcd_by_state(base_fcd: Dict[str, int], _state=None) -> Dict[str, int]:
     def _clamp(v: int) -> int: return max(1, min(5, int(v)))

@@ -352,8 +352,12 @@ def main():
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    server.run()
-    print("App exiting cleanly")
+    try:
+        server.run()
+    finally:
+        data_collector.stop()
+        logger.close()
+        print("App exiting cleanly")
 
 if __name__ == "__main__":
     main()

@@ -182,10 +182,18 @@ def main():
 
         while True:
             time.sleep(1)
+            for name, p in pm.processes:
+                if p.poll() is not None:
+                    print(f"[CRASH] {name} exited with code {p.poll()}")
+                    raise SystemExit(1)  # or break, or restart it
 
     except KeyboardInterrupt:
         print("\n[EXIT] stopping experiment...")
+        
+    
+    finally:
         pm.stop_all()
+        print("[EXIT] experiment stopped")
 
 
 if __name__ == "__main__":

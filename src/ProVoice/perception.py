@@ -126,6 +126,7 @@ class EARMARDetector:
 
     def __init__(self, max_num_faces: int = 1, refine_landmarks: bool = True) -> None:
         self._lock = threading.Lock()
+        
         self._mesh = None
         if _HAS_MEDIAPIPE and _mp_face_mesh is not None:
             self._mesh = _mp_face_mesh.FaceMesh(
@@ -136,24 +137,26 @@ class EARMARDetector:
                 min_tracking_confidence=0.5,
             )
 
+
     @property
     def available(self) -> bool:
         return self._mesh is not None
 
-    def __call__(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, float, float, bool]:
+    def __call__(self, frame_bgr: np.ndarray, face_mesh_results) -> Tuple[np.ndarray, float, float, bool]:
         """Return ``(annotated_frame, eye_ar, mouth_ar, face_present)``."""
         if not self.available or frame_bgr is None:
             return frame_bgr, self.DEFAULT_EAR, self.DEFAULT_MAR, False
 
         h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        with self._lock:
-            results = self._mesh.process(rgb)
+        if not face_mesh_results:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            with self._lock:
+                face_mesh_results = self._mesh.process(rgb)
 
-        if not results.multi_face_landmarks:
+        if not face_mesh_results.multi_face_landmarks:
             return frame_bgr, self.DEFAULT_EAR, self.DEFAULT_MAR, False
 
-        lm = _landmarks_to_pixels(results.multi_face_landmarks[0].landmark, w, h)
+        lm = _landmarks_to_pixels(face_mesh_results.multi_face_landmarks[0].landmark, w, h)
         ear_left = _ear_from_landmarks(lm, _LEFT_EYE_IDX)
         ear_right = _ear_from_landmarks(lm, _RIGHT_EYE_IDX)
         ear = (ear_left + ear_right) / 2.0
@@ -425,7 +428,7 @@ def _get_default_detectors() -> Tuple[EARMARDetector, DistractionDetector]:
     return _default_earmar, _default_distraction
 
 
-def frametest(frame_bgr: np.ndarray) -> Tuple[Tuple[List[str], float, float], np.ndarray]:
+def frametest(frame_bgr: np.ndarray, face_mesh_results: Optional[Any] = None) -> Tuple[Tuple[List[str], float, float], np.ndarray]:
     """Drop-in replacement for ``myframe.frametest``.
 
     Returns ``((labels, eye_ar, mouth_ar), annotated_frame)``.
@@ -434,7 +437,7 @@ def frametest(frame_bgr: np.ndarray) -> Tuple[Tuple[List[str], float, float], np
     MediaPipe sees a face; the other three depend on the YOLO model.
     """
     earmar, distraction = _get_default_detectors()
-    annotated, eye_ar, mouth_ar, face_present = earmar(frame_bgr)
+    annotated, eye_ar, mouth_ar, face_present = earmar(frame_bgr, face_mesh_results)
     #labels, detections = distraction(frame_bgr if annotated is None else annotated)
     labels, detections = distraction(frame_bgr)
 

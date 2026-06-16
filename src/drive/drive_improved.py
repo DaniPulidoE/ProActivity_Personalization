@@ -274,6 +274,49 @@ def _load_latest_system_decision_snapshot(session_id=''):
         return {}
     return {}
 
+""" Alternative (more efficient - doesn't read the whole decisions.csv file each time). Need to test it before uncommenting it.
+def _load_latest_system_decision_snapshot(session_id=''):
+    global _decisions_file_offset, _decisions_last_match
+    path = os.path.join(os.getcwd(), 'data', 'decisions.csv')
+
+    if not os.path.exists(path):
+        return _decisions_last_match
+
+    # If the file shrank (deleted and recreated mid-session), reset.
+    if os.path.getsize(path) < _decisions_file_offset:
+        _decisions_file_offset = 0
+
+    if os.path.getsize(path) == 0:
+        return _decisions_last_match
+
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            # Always read the header from byte 0 — cheap (one line).
+            header_reader = csv.DictReader(f)
+            fieldnames = header_reader.fieldnames   # advances f to just after header
+            if not fieldnames:
+                return _decisions_last_match
+
+            # Seek to where we stopped last time.
+            # On first call _decisions_file_offset == 0, so f is already
+            # positioned just after the header — the seek is skipped.
+            if _decisions_file_offset > 0:
+                f.seek(_decisions_file_offset)
+
+            # Second DictReader reuses the open file but gets fieldnames
+            # explicitly so it doesn't try to re-read the header line.
+            for row in csv.DictReader(f, fieldnames=fieldnames):
+                if session_id and row.get('session_id') not in (None, '', session_id):
+                    continue
+                _decisions_last_match = row   # keep updating — we want the last one
+
+            _decisions_file_offset = f.tell()  # save position for next call
+
+    except Exception:
+        _decisions_file_offset = 0  # corrupted state — start over next call
+
+    return _decisions_last_match
+"""
 
 def _normalize_csv_value(value):
     if isinstance(value, (dict, list, tuple)):
@@ -1591,7 +1634,7 @@ def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2000.0)
+        client.set_timeout(20.0)
 
         sim_world = client.get_world()
         traffic_manager = client.get_trafficmanager()
