@@ -3,13 +3,14 @@ from __future__ import annotations
 import base64
 import datetime
 import os
-import random
 import threading
 import time
 import urllib.request
 import json
 from typing import Any, Dict, Optional, Tuple
 
+import math
+import statistics
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -124,7 +125,7 @@ class DataCollector:
 
             if HAS_RPPG and OnlineRPPG is not None:
                 try:
-                    self.rppg_estimator = OnlineRPPG(frame_rate=20, crop_size=72)  # type: ignore
+                    self.rppg_estimator = OnlineRPPG(frame_rate=10, crop_size=72)  # type: ignore
                 except Exception as e:
                     print(e, "Error initializing rPPG estimator")
                     self.rppg_estimator = None
@@ -148,8 +149,8 @@ class DataCollector:
         self.Roll = 0
         self.Rolleye = 0
         self.Rollmouth = 0
-        self.COUNTER = 0
         self.mCOUNTER = 0
+        self._eye_closed_since: float = 0.0  # monotonic time when EAR first dropped
         # yawn and blink rates (instead of raw counts) should act as better predictors
         self.blink_times = []
         self.blink_rate = 0.0
@@ -164,7 +165,12 @@ class DataCollector:
         # calibration state
         self.calibrated = False
         self._calibration_data = dict({'gaze_score': [], 'ear': [], 'mar': [], 'bpm': [], 'rr': []})
-        self._calibration_frames = 100 # subject to changes...
+        self._calibration_ear_ts = [] # timestamps of EAR values to callibrate blink rate/perclos
+        self._calibration_mar_ts = [] # timestamps of MAR values to callibrate perclos
+
+        # Calibration: 60 s time-based, collects gaze/EAR/MAR/HR/RR
+        self._calibration_duration_s: float = 60.0
+        self._calibration_start_t: float = 0.0
 
     def __del__(self):
         self.stop()
@@ -222,22 +228,7 @@ class DataCollector:
         except Exception as e:
             print(e, "Error computing gaze score")
             return 0.0
-    """
-    def get_gaze_score(self, frame) -> float:
-        if not self.face_mesh or not HAS_MP:
-            return 0.0
-        try:
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore
-            results = self.face_mesh.process(img_rgb)
-            if not results.multi_face_landmarks:
-                return 0.0
-            lm = results.multi_face_landmarks[0].landmark
-            h, w, _ = frame.shape
-            return self.compute_gaze_score(lm, w, h)
-        except Exception as e:
-            print(e, "Error computing gaze score")
-            return 0.0
-    """
+
     
     def get_gaze_score(self, frame, face_mesh_results) -> float:
         if not face_mesh_results:
@@ -264,7 +255,6 @@ class DataCollector:
             return None
 
     def calibrate_step(self) -> None:
-        # check for errors (same as in collect_data)
         if not self.visual_enabled or self.cap is None:
             return
         ok, frame = self.cap.read()
@@ -272,42 +262,59 @@ class DataCollector:
             print("not okay")
             self.latest_frame = None
             return
-        
-        # reuse face mesh in gaze score and emotion detection to avoid double processing
-        face_mesh_results = self.compute_face_mesh(frame) 
-        # gaze score
+
+        now = time.monotonic()
+        if self._calibration_start_t == 0.0:
+            self._calibration_start_t = now
+            print("[Calibration] Starting 60 s calibration.")
+
+        # ── 60-second calibration ─────────────────────────────────────────────
+        face_mesh_results = self.compute_face_mesh(frame)
+
         gaze_score = self.get_gaze_score(frame, face_mesh_results)
-        if gaze_score > 0.0: # filter out frames where gaze score couldn't be computed to avoid skewing calibration
+        if gaze_score > 0.0:
             self._calibration_data['gaze_score'].append(gaze_score)
-        
-        # load face detector - only needed for rPPG and emotion detection, not gaze score
-        """
+
+        if HAS_MYFRAME:
+            try:
+                ret, frame_annot = _perception.frametest(frame, face_mesh_results)
+                lab, eye, mouth = ret
+                if eye > 0.15:
+                    self._calibration_data['ear'].append(eye)
+                self._calibration_ear_ts.append((now, eye))
+                self._calibration_data['mar'].append(mouth)
+                self._calibration_mar_ts.append((now, mouth))
+            except Exception as e:  # noqa: BLE001
+                print(e, "Error computing perception.frametest")
+                frame_annot = frame
+        else:
+            frame_annot = frame
+
+        # Face detector — needed for both rPPG and emotion (mirrors _visual_process)
         if _face_detector is not None and (
-                self.rppg_estimator is not None or (_emotion_model is not None and _emotion_input_size is not None)):
+                self.rppg_estimator is not None or
+                (_emotion_model is not None and _emotion_input_size is not None)):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # type: ignore
             faces = _face_detector.detectMultiScale(gray, 1.3, 5)  # type: ignore
         else:
             gray = None
             faces = []
-        """
-        
-        # face data for EAR/MAR and Perclos
-        if HAS_MYFRAME:
-            try:
-                ret, frame_annot = _perception.frametest(frame, face_mesh_results)
-                lab, eye, mouth = ret
-                if eye > 0.15: # filter out frames where eye is too closed to avoid skewing calibration
-                    self._calibration_data['ear'].append(eye)
-                self._calibration_data['mar'].append(mouth)
-            except Exception as e:  # noqa: BLE001 (perception code crosses C extensions)
-                print(e, "Error computing perception.frametest")
-                frame_annot = frame
-                lab, eye, mouth = ([], 0.3, 0.5)
-        else:
-            frame_annot = frame
-            lab, eye, mouth = ([], 0.3, 0.5)
 
-        self.latest_frame = frame_annot # so frame appears on webpage
+        # Feed rPPG — collect HR/RR once the model starts producing values
+        if self.rppg_estimator is not None and len(faces) > 0:
+            x, y, w, h = faces[0]
+            hr, rr = self.rppg_estimator.add_frame(frame[y:y + h, x:x + w])
+            print(f"[Calibration] rPPG: HR={hr}, RR={rr}")
+            if hr is not None and not (hr != hr):  # excludes NaN
+                self._calibration_data['bpm'].append(float(hr))
+            if rr is not None and not (rr != rr):
+                self._calibration_data['rr'].append(float(rr))
+
+
+        self.latest_frame = frame_annot
+        print(f"[Calibration] Phase 2: {now - self._calibration_start_t:.1f}/{self._calibration_duration_s:.1f} s elapsed. ")
+        if (now - self._calibration_start_t) >= self._calibration_duration_s:
+            self.compute_calibration()
 
     def compute_calibration(self):
         # compute mean and std for each metric, set calibrated flag
@@ -326,7 +333,39 @@ class DataCollector:
                 # default values originally in the script
                 thres = 0.2 if key in ['gaze_score', 'ear'] else 0.65
                 self.calibrate[key] = {'mean': 0.0, 'std': 0.0, 'threshold': thres}
+                
+        # blink rate
+        threshold_ear = self.calibrate['ear']['threshold']
+        blink_count = 0
+        eye_closed_since = 0.0
+        for ts, ear in self._calibration_ear_ts:
+            if ear < threshold_ear:
+                if eye_closed_since == 0.0:
+                    eye_closed_since = ts
+            else:
+                if eye_closed_since > 0.0:
+                    duration_ms = (ts - eye_closed_since) * 1000
+                    if 100 <= duration_ms <= 500:
+                        blink_count += 1
+                eye_closed_since = 0.0
+        self.calibrate['blink_rate'] = {'mean': blink_count / (60 / 60)}  # blinks/min
+        
+        # perclos
+        threshold_mar = self.calibrate['mar']['threshold']
+        n = len(self._calibration_ear_ts)
+        chunk_perclos = []
+        for i in range(0, n - 49, 50):
+            chunk_ear = [ear for _, ear in self._calibration_ear_ts[i:i+50]]
+            chunk_mar = [mar for _, mar in self._calibration_mar_ts[i:i+50]]
+            eye_c = sum(1 for e in chunk_ear if e < threshold_ear)
+            mar_c = sum(1 for m in chunk_mar if m > threshold_mar)
+            chunk_perclos.append((eye_c + mar_c * 0.2) / 50)
+        mean_perclos = np.mean(chunk_perclos) if chunk_perclos else 0
+        std_perclos = np.std(chunk_perclos) if chunk_perclos else 1e-6
+        self.calibrate['perclos'] = {'mean': mean_perclos, 'std': max(std_perclos, 1e-6)}
+
         self.calibrated = True
+        self._session_start_t = time.monotonic()
         
         print("Calibration completed:", self.calibrate)    
         
@@ -344,7 +383,9 @@ class DataCollector:
         face_mesh_results = self.compute_face_mesh(frame) 
         # gaze score
         gaze_score = self.get_gaze_score(frame, face_mesh_results)
-        data['gaze_score'] = round(float(gaze_score), 3)
+        # standardize gaze score based on calibration mean and std, if available
+        normalized_gaze_score = (gaze_score - self.calibrate['gaze_score']['mean']) / self.calibrate['gaze_score']['std'] if self.calibrate['gaze_score']['std'] != 0 else 0.0
+        data['gaze_score'] = round(normalized_gaze_score, 3)
         data['gaze_distracted'] = bool(gaze_score > self.calibrate['gaze_score']['threshold'])
 
         if _face_detector is not None and (
@@ -355,12 +396,13 @@ class DataCollector:
             gray = None
             faces = []
 
-        # rPPG
+
         if self.rppg_estimator is not None:  # type: ignore
             if len(faces) > 0:
                 x, y, w, h = faces[0]
                 face_roi = frame[y:y + h, x:x + w]
                 hr, rr = self.rppg_estimator.add_frame(face_roi)
+                #print(f"rPPG: HR={hr}, RR={rr}")
                 if hr is not None:
                     # Heart rate
                     data['bpm'] = round(float(hr), 1)
@@ -378,19 +420,20 @@ class DataCollector:
                         self.rr_history.pop(0)
                     data['rr_history'] = self.rr_history
                     
-                # set flag if there is an anomalous increase or decrease in hr
-                # also add deviation from mean as a feature
+                # hr_delta: deviation from calibration baseline (if available) else rolling mean
                 if len(self.bpm_history) >= 10:
-                    hr_mean = sum(self.bpm_history) / len(self.bpm_history)
-                    hr_std = (sum((x - hr_mean)**2 for x in self.bpm_history) / len(self.bpm_history)) ** 0.5
-                    #data['hr_anomaly'] = bool(abs(data.get('bpm', hr_mean) - hr_mean) > 2.5 * hr_std)
-                    data['hr_delta'] = round(data.get('bpm', hr_mean) - hr_mean, 1)
-                # same for rr
+                    cal_hr = self.calibrate.get('bpm', {}).get('mean', 0.0) if hasattr(self, 'calibrate') else 0.0
+                    hr_baseline = cal_hr if cal_hr > 0.0 else sum(self.bpm_history) / len(self.bpm_history)
+                    cal_hr_std = self.calibrate.get('bpm', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
+                    hr_std = cal_hr_std if cal_hr_std > 0.0 else statistics.stdev(self.bpm_history)
+                    data['hr_delta'] = round((data.get('bpm', hr_baseline) - hr_baseline)/hr_std, 1)
+                # rr_delta: same pattern
                 if len(self.rr_history) >= 10:
-                    rr_mean = sum(self.rr_history) / len(self.rr_history)
-                    rr_std = (sum((x - rr_mean)**2 for x in self.rr_history) / len(self.rr_history)) ** 0.5
-                    #data['rr_anomaly'] = bool(abs(data.get('breaths-per-minute', rr_mean) - rr_mean) > 2.5 * rr_std)
-                    data['rr_delta'] = round(data.get('breaths-per-minute', rr_mean) - rr_mean, 1)
+                    cal_rr = self.calibrate.get('rr', {}).get('mean', 0.0) if hasattr(self, 'calibrate') else 0.0
+                    rr_baseline = cal_rr if cal_rr > 0.0 else sum(self.rr_history) / len(self.rr_history)
+                    cal_rr_std = self.calibrate.get('rr', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
+                    rr_std = cal_rr_std if cal_rr_std > 0.0 else statistics.stdev(self.rr_history)
+                    data['rr_delta'] = round((data.get('breaths-per-minute', rr_baseline) - rr_baseline)/rr_std, 1)
                     
         emo = self.detect_emotion(faces, gray)
         if emo:
@@ -408,20 +451,22 @@ class DataCollector:
             frame_annot = frame
             lab, eye, mouth = ([], 0.3, 0.5)
 
-        #EYE_AR_THRESH = 0.2
-        EYE_AR_CONSEC_FRAMES = 2
-        #MAR_THRESH = 0.65
         MOUTH_AR_CONSEC_FRAMES = 3
+        BLINK_MIN_MS = 100   # below this is EAR noise, not a blink (this is equivalent to 2 frames at 20Hz)
+        BLINK_MAX_MS = 500  # above this is eye closure / drowsiness, not a blink
 
+        now = time.monotonic()
         if eye < self.calibrate['ear']['threshold']:
-            self.COUNTER += 1
+            if self._eye_closed_since == 0.0:
+                self._eye_closed_since = now
             self.Rolleye += 1
         else:
-            if self.COUNTER >= EYE_AR_CONSEC_FRAMES:
-                self.blink_count += 1
-                self.blink_times.append(time.monotonic())
-
-            self.COUNTER = 0
+            if self._eye_closed_since > 0.0:
+                duration_ms = (now - self._eye_closed_since) * 1000
+                if BLINK_MIN_MS <= duration_ms <= BLINK_MAX_MS:
+                    self.blink_count += 1
+                    self.blink_times.append(now)
+            self._eye_closed_since = 0.0
 
         if mouth > self.calibrate['mar']['threshold']:
             self.mCOUNTER += 1
@@ -440,19 +485,29 @@ class DataCollector:
             self.Rolleye = 0
             self.Rollmouth = 0
 
-        # yawn and blink rates )
-        blink_window = 30.0 # 30 second window for blinks
+        # yawn and blink rates
         now = time.monotonic()
+        blink_window = 30.0 # 30 second window for blinks
         self.blink_times = [t for t in self.blink_times if now - t <= blink_window]
-        data['blink_rate'] = len(self.blink_times) / (blink_window / 60)  # blinks per minute
-        yawn_window = 180 # 3 minute window for yawms
+        elapsed_s = min(now - self._session_start_t, blink_window)
+        self.blink_rate = len(self.blink_times) / (elapsed_s / 60)  # blinks per minute
+        yawn_window = 180 # 3 minute window for yawns
         self.yawn_times = [t for t in self.yawn_times if now - t <= yawn_window]
-        data['yawn_rate'] = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
-        
+        self.yawn_rate = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
+
+
         self.latest_frame = frame_annot
-        data['blink_count'] = int(self.blink_count)
-        data['yawn_count'] = int(self.yawn_count)
-        data['perclos'] = round(float(self.perclos), 3)
+        
+        # Add the computed metrics to the data dictionary (normalized)
+        # normalize blink rate (it is a Poisson divided by a specific value - Variance=X/n)
+        normalized_blink_rate = (self.blink_rate - self.calibrate.get('blink_rate', {}).get('mean', 0.0)) / math.sqrt((self.calibrate.get('blink_rate', {}).get('mean', 1.0)/(elapsed_s / 60))) if self.calibrate.get('blink_rate', {}).get('mean', 0.0) > 0 else 0.0
+        data['blink_rate'] = round(float(normalized_blink_rate), 3)
+        # Anscombe transform to normalize yawn rate
+        normalized_yawn_rate = 2*math.sqrt((self.yawn_rate*(yawn_window / 60)) + 3/8) 
+        # normalize perclos
+        normalized_perclos = (self.perclos - self.calibrate.get('perclos', {}).get('mean', 0.0)) / self.calibrate.get('perclos', {}).get('std', 1.0)
+        data['perclos'] = round(float(normalized_perclos), 3)
+        data['yawn_rate'] = round(float(normalized_yawn_rate), 3)   
         data['drowsiness_alert'] = bool(self.drowsiness_alert)
         data['eye_ar'] = float(eye)
         data['mar'] = float(mouth)
@@ -507,17 +562,15 @@ class DataCollector:
 
 
     def _run_loop(self) -> None:
-        calibration_counter = 0
+        # Old: frame-count calibration counter
+        # calibration_counter = 0
 
         next_t = time.monotonic()
         while self._running:
             try:
                 if self.calibrated is False:
-                    # run calibration for _calibration_frames frames 
+                    # Two-phase time-based calibration — completion handled inside calibrate_step()
                     self.calibrate_step()
-                    calibration_counter += 1
-                    if calibration_counter >= self._calibration_frames:
-                        self.compute_calibration()
                 else:
                     data = self.collect_data()
                     
@@ -598,10 +651,13 @@ class DataCollector:
         if self.rppg_estimator:
             self.rppg_estimator.stop()
         self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        if self._state_poll_thread and self._state_poll_thread.is_alive():
-            self._state_poll_thread.join(timeout=2.0)
+        try: 
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=2.0)
+            if self._state_poll_thread and self._state_poll_thread.is_alive():
+                self._state_poll_thread.join(timeout=2.0)
+        except Exception:
+            pass
         self.release()
 
     def release(self) -> None:

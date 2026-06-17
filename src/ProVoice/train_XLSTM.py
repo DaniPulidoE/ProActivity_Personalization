@@ -99,6 +99,7 @@ class SeqDataset(Dataset):
             X = np.stack(xs, axis=0).astype(np.float32)
             self.groups.append((X, y))
 
+
     def __len__(self): return len(self.groups)
     def __getitem__(self, i): return self.groups[i]
 

@@ -1,11 +1,15 @@
 import threading
+import types
 import queue
 from pathlib import Path
 import site
 
 import cv2
 import numpy as np
+from scipy import signal as scipy_signal
 from mmrphys.tools.run_inference.infer_from_frames import RemoteVitalSigns
+
+
 
 class OnlineRPPG(RemoteVitalSigns):
     """
@@ -14,7 +18,7 @@ class OnlineRPPG(RemoteVitalSigns):
 
     See: https://physiologicailab.github.io/mmrphys-live/
     """
-    def __init__(self, frame_rate: int = 20, crop_size: int = 72):
+    def __init__(self, frame_rate: int = 10, crop_size: int = 72):
         self.ingest_count_frame = 0
         sitepackage_paths = site.getsitepackages()
         model_path = None
@@ -29,22 +33,36 @@ class OnlineRPPG(RemoteVitalSigns):
             'video': {'sampling_rate': frame_rate},
             'processing': {
                 'plot_duration': 20,  # seconds
-                'inference_interval': 180  # frames
+                # Old: 'inference_interval': 180  # ~18s at 10fps, too infrequent
+                'inference_interval': 45   # ~6s at 7fps / ~4.5s at 10fps
             }}
 
         super().__init__(config)
 
-        self.inference_thread = threading.Thread(target=self.inference_thread)
-        self.inference_thread.start()
+
+        self.signal_processor.init_filters()   # re-init with the patched method
+
+        self._fs_lock = threading.Lock()
+
+        # Old (naming collision — method overwritten by attribute):
+        # self.inference_thread = threading.Thread(target=self.inference_thread)
+        # self.inference_thread.start()
+        self._thread = threading.Thread(target=self.inference_thread, daemon=True)
+        self._thread.start()
         print("OnlineRPPG STARTED!")
 
-    def __del__(self):
-        self.stop()
 
     def stop(self):
-        self.frame_queue.put(None)
+        # Old (put() could block forever if queue full; no timeout on join):
+        # self.frame_queue.put(None)
+        # self.stop_event.set()
+        # self.inference_thread.join()
+        try:
+            self.frame_queue.put(None, timeout=1.0)
+        except Exception:
+            pass
         self.stop_event.set()
-        self.inference_thread.join()
+        self._thread.join(timeout=3.0)
 
     def add_frame(self, face_frame: np.ndarray) -> tuple[float, float] | tuple[None, None]:
         """
@@ -79,5 +97,5 @@ class OnlineRPPG(RemoteVitalSigns):
         if data is None:
             return None, None
 
-        face_frame, bvp, rsp, hr, rr, face_detected = data
+        _, _, _, hr, rr, _ = data
         return hr, rr
