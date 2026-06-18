@@ -67,6 +67,7 @@ def main() -> None:
     if actor is None:
         print(f"[bridge] Actor id={vehicle_id} not found in CARLA world.")
         sys.exit(1)
+    carla_map = world.get_map()  # cache — get_map() is expensive to call at 20 Hz
     print(f"[bridge] Tracking actor id={vehicle_id} type={actor.type_id}")
     print(f"[bridge] Serving on http://0.0.0.0:{args.port}/")
 
@@ -75,12 +76,43 @@ def main() -> None:
             try:
                 vel = actor.get_velocity()
                 speed_kmh = (vel.x ** 2 + vel.y ** 2 + vel.z ** 2) ** 0.5 * 3.6
-                loc = actor.get_location()
+                acc = actor.get_acceleration()
+                acceleration = (acc.x ** 2 + acc.y ** 2 + acc.z ** 2) ** 0.5
+                control = actor.get_control()
+                speed_limit = actor.get_speed_limit()
+                weather = world.get_weather()
+                waypoint = carla_map.get_waypoint(actor.get_location())
+                try:
+                    tl_state = str(actor.get_traffic_light_state()).split('.')[-1]
+                except Exception:
+                    tl_state = None
+                try:
+                    ls = int(actor.get_light_state())
+                    headlight      = bool(ls & (2 | 4))
+                    fog_light      = bool(ls & 128)
+                    left_indicator = bool(ls & 32)
+                    right_indicator = bool(ls & 16)
+                except Exception:
+                    headlight = fog_light = left_indicator = right_indicator = None
                 payload = json.dumps({
-                    "speed_kmh": round(speed_kmh, 2),
-                    "x": round(loc.x, 2),
-                    "y": round(loc.y, 2),
-                    "z": round(loc.z, 2),
+                    "speed_kmh":          round(speed_kmh, 2),
+                    "brake":              round(float(control.brake), 3),
+                    "steer":              round(float(control.steer), 3),
+                    "throttle":           round(float(control.throttle), 3),
+                    "gear":               int(control.gear),
+                    "hand_brake":         bool(control.hand_brake),
+                    "reverse":            bool(control.reverse),
+                    "acceleration":       round(acceleration, 3),
+                    "speed_limit_kmh":    round(float(speed_limit), 1),
+                    "precipitation":      round(weather.precipitation / 100.0, 3),
+                    "fog_density":        round(weather.fog_density / 100.0, 3),
+                    "is_night":           bool(weather.sun_altitude_angle < 0),
+                    "is_junction":        bool(waypoint.is_junction),
+                    "traffic_light_state": tl_state,
+                    "headlight":          headlight,
+                    "fog_light":          fog_light,
+                    "left_indicator":     left_indicator,
+                    "right_indicator":    right_indicator,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

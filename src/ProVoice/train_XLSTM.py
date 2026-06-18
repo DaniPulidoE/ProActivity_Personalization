@@ -14,6 +14,7 @@ from ProVoice.models.xlstm_model import (
     D_IN,
     STATE_CAT,
     STATE_NUM,
+    STATE_CARLA,
     XLSTMSequenceClassifier,
     save_checkpoint,
     DEFAULT_CONTEXT_LENGTH,
@@ -60,6 +61,14 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out['drowsiness_alert']= pick('drowsiness_alert', 'drowsy', 'fatigue')
     out['gaze_distracted'] = pick('gaze_distracted', 'gaze', 'distraction')
     out['heart_rate']      = pick('heart_rate', 'hr', 'heartrate', 'bpm')
+    # CARLA vehicle/world features — use sentinel defaults matching encode_frame expectations
+    out['speed_ratio_max']   = pick('speed_ratio_max',   default=None)
+    out['speed_ratio_limit'] = pick('speed_ratio_limit', default=-1)
+    out['brake']             = pick('brake',             default=None)
+    out['steer']             = pick('steer',             default=None)
+    out['precipitation']     = pick('precipitation',     default=None)
+    out['is_night']          = pick('is_night',          default=None)
+    out['is_junction']       = pick('is_junction',       default=None)
     for k in LEVELS:
         if k in row and row[k] not in (None, ""):
             out[k] = int(float(row[k]))
@@ -188,6 +197,10 @@ def main():
     for k in STATE_NUM:
         if k not in df.columns: df[k] = 0.0
         df[k] = df[k].apply(_as01)
+    for k in STATE_CARLA:
+        default = -1 if k == 'speed_ratio_limit' else 0.0
+        if k not in df.columns: df[k] = default
+        df[k] = df[k].fillna(default)
     
     """ Original case: train-val split done randomly, not by participant
     gids = df['segment_id'].drop_duplicates().sample(frac=1.0, random_state=args.seed).values

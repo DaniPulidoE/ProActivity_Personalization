@@ -92,6 +92,24 @@ class DataCollector:
         self.carla_vehicle = carla_vehicle
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
         self._cached_speed: int = 0
+        self._cached_steer: int = 0
+        self._cached_brake: int = 0
+        self._cached_precipitation: int = 0
+        self._cached_speed_limit: int = 0
+        self._cached_night: int = 0
+        self._cached_junction: int = 0
+        self._cached_throttle: float = 0.0
+        self._cached_gear: int = 0
+        self._cached_hand_brake: bool = False
+        self._cached_reverse: bool = False
+        self._cached_acceleration: float = 0.0
+        self._cached_fog_density: float = 0.0
+        self._cached_traffic_light_state: Optional[str] = None
+        self._cached_headlight: bool = False
+        self._cached_fog_light: bool = False
+        self._cached_left_indicator: bool = False
+        self._cached_right_indicator: bool = False
+
         self._state_poll_thread: Optional[threading.Thread] = None
         # If a CARLA actor is present, attempt to retrieve the vehicle_id
         self.vehicle_id = None
@@ -164,6 +182,8 @@ class DataCollector:
         
         # calibration state
         self.calibrated = False
+        self.calibrate: Dict[str, Any] = {}      # populated by compute_calibration()
+        self._session_start_t: float = 0.0       # set when calibration completes
         self._calibration_data = dict({'gaze_score': [], 'ear': [], 'mar': [], 'bpm': [], 'rr': []})
         self._calibration_ear_ts = [] # timestamps of EAR values to callibrate blink rate/perclos
         self._calibration_mar_ts = [] # timestamps of MAR values to callibrate perclos
@@ -348,7 +368,7 @@ class DataCollector:
                     if 100 <= duration_ms <= 500:
                         blink_count += 1
                 eye_closed_since = 0.0
-        self.calibrate['blink_rate'] = {'mean': blink_count / (60 / 60)}  # blinks/min
+        self.calibrate['blink_rate'] = {'mean': blink_count / (self._calibration_duration_s / 60)}  # blinks/min
         
         # perclos
         threshold_mar = self.calibrate['mar']['threshold']
@@ -368,7 +388,7 @@ class DataCollector:
         self._session_start_t = time.monotonic()
         
         print("Calibration completed:", self.calibrate)    
-        
+    
 
     def _visual_process(self, data: Dict[str, Any]) -> None:
         if not self.visual_enabled or self.cap is None:
@@ -512,6 +532,152 @@ class DataCollector:
         data['eye_ar'] = float(eye)
         data['mar'] = float(mouth)
         data['lab'] = [str(x) for x in (lab or [])]
+        
+    def _carla_process(self, data: Dict[str, Any]):
+        # Logging-only extras default to None; overwritten below when data is available.
+        throttle = gear = hand_brake = reverse = acceleration = None
+        fog_density = traffic_light_state = None
+        headlight = fog_light = left_indicator = right_indicator = None
+
+        if self.carla_vehicle is not None:
+            try:
+                vel = self.carla_vehicle.get_velocity()
+                speed = int((vel.x**2 + vel.y**2 + vel.z**2)**0.5 * 3.6)
+
+                control = self.carla_vehicle.get_control()
+                brake = control.brake
+                steer = control.steer
+                throttle = control.throttle
+                gear = control.gear
+                hand_brake = bool(control.hand_brake)
+                reverse = bool(control.reverse)
+
+                acc = self.carla_vehicle.get_acceleration()
+                acceleration = round((acc.x**2 + acc.y**2 + acc.z**2)**0.5, 3)
+
+                speed_lim = self.carla_vehicle.get_speed_limit()
+
+                world = self.carla_vehicle.get_world()
+                weather = world.get_weather()
+                precipitation = round(weather.precipitation / 100.0, 3)
+                is_night = bool(weather.sun_altitude_angle < 0)
+                fog_density = round(weather.fog_density / 100.0, 3)
+
+                location = self.carla_vehicle.get_location()
+                waypoint = world.get_map().get_waypoint(location)
+                is_junction = bool(waypoint.is_junction)
+
+                # traffic light state (Red/Yellow/Green/Off/Unknown)
+                try:
+                    traffic_light_state = str(self.carla_vehicle.get_traffic_light_state()).split('.')[-1]
+                except Exception:
+                    pass
+
+                # vehicle light state (bitmask: LowBeam=2, HighBeam=4, RightBlinker=16, LeftBlinker=32, Fog=128)
+                try:
+                    ls = int(self.carla_vehicle.get_light_state())
+                    headlight = bool(ls & (2 | 4))
+                    fog_light = bool(ls & 128)
+                    left_indicator = bool(ls & 32)
+                    right_indicator = bool(ls & 16)
+                except Exception:
+                    pass
+
+                self._cached_speed = speed
+                self._cached_steer = steer
+                self._cached_brake = brake
+                self._cached_speed_limit = speed_lim
+                self._cached_precipitation = precipitation
+                self._cached_night = is_night
+                self._cached_junction = is_junction
+                self._cached_throttle = throttle
+                self._cached_gear = gear
+                self._cached_hand_brake = hand_brake
+                self._cached_reverse = reverse
+                self._cached_acceleration = acceleration
+                self._cached_fog_density = fog_density
+                if traffic_light_state is not None:
+                    self._cached_traffic_light_state = traffic_light_state
+                if headlight is not None:
+                    self._cached_headlight = headlight
+                    self._cached_fog_light = fog_light
+                    self._cached_left_indicator = left_indicator
+                    self._cached_right_indicator = right_indicator
+
+            except Exception as e:
+                print("[DataCollector] Error reading vehicle state:", e)
+                speed = self._cached_speed
+                steer = self._cached_steer
+                brake = self._cached_brake
+                speed_lim = self._cached_speed_limit
+                precipitation = self._cached_precipitation
+                is_night = self._cached_night
+                is_junction = self._cached_junction
+                throttle = self._cached_throttle
+                gear = self._cached_gear
+                hand_brake = self._cached_hand_brake
+                reverse = self._cached_reverse
+                acceleration = self._cached_acceleration
+                fog_density = self._cached_fog_density
+                traffic_light_state = self._cached_traffic_light_state
+                headlight = self._cached_headlight
+                fog_light = self._cached_fog_light
+                left_indicator = self._cached_left_indicator
+                right_indicator = self._cached_right_indicator
+
+        elif self.vehicle_state_url is not None:
+            # Updated by _poll_vehicle_state background thread — just read cache.
+            speed = self._cached_speed
+            brake = self._cached_brake
+            steer = self._cached_steer
+            speed_lim = self._cached_speed_limit
+            precipitation = self._cached_precipitation
+            is_night = self._cached_night
+            is_junction = self._cached_junction
+            throttle = self._cached_throttle
+            gear = self._cached_gear
+            hand_brake = self._cached_hand_brake
+            reverse = self._cached_reverse
+            acceleration = self._cached_acceleration
+            fog_density = self._cached_fog_density
+            traffic_light_state = self._cached_traffic_light_state
+            headlight = self._cached_headlight
+            fog_light = self._cached_fog_light
+            left_indicator = self._cached_left_indicator
+            right_indicator = self._cached_right_indicator
+
+        else:
+            # No CARLA actor or bridge — minimal env-var fallback.
+            pv = os.getenv('PV_SPEED')
+            speed = int(pv) if pv not in (None, '') else None
+            brake = None
+            steer = None
+            speed_lim = None
+            precipitation = None
+            is_night = None
+            is_junction = None
+
+        MAX_SPEED = 150
+        data['speed_ratio_max']   = speed / MAX_SPEED if speed is not None else None
+        data['speed_ratio_limit'] = speed / speed_lim if speed_lim is not None else -1
+        data['brake']             = brake
+        data['steer']             = steer
+        data['precipitation']     = precipitation
+        data['is_night']          = is_night
+        data['is_junction']       = is_junction
+        data['speed_kmh']           = speed
+        data['speed_limit_kmh']     = speed_lim
+        data['throttle']            = throttle
+        data['gear']                = gear
+        data['hand_brake']          = hand_brake
+        data['reverse']             = reverse
+        data['acceleration']        = acceleration
+        data['fog_density']         = fog_density
+        data['traffic_light_state'] = traffic_light_state
+        data['headlight']           = headlight
+        data['fog_light']           = fog_light
+        data['left_indicator']      = left_indicator
+        data['right_indicator']     = right_indicator
 
     def collect_data(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {}
@@ -525,24 +691,7 @@ class DataCollector:
             data['heart_rate'] = None
 
         if self.context_enabled:
-            if self.carla_vehicle is not None:
-                try:
-                    vel = self.carla_vehicle.get_velocity()
-                    speed = (vel.x**2 + vel.y**2 + vel.z**2)**0.5
-                    speed = int(speed * 3.6)
-                    self._cached_speed = speed
-                except Exception as e:
-                    print("[DataCollector] Error reading vehicle speed:", e)
-                    speed = self._cached_speed
-            elif self.vehicle_state_url is not None:
-                # Updated by _poll_vehicle_state background thread — just read cache
-                speed = self._cached_speed
-            else:
-                # No CARLA actor / bridge — report unknown unless PV_SPEED is set,
-                # rather than fabricating a random speed.
-                pv = os.getenv('PV_SPEED')
-                speed = int(pv) if pv not in (None, '') else None
-            data['speed'] = speed
+            self._carla_process(data)
 
         data['timestamp'] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
@@ -611,6 +760,8 @@ class DataCollector:
                             fcd = action.get('fcd') or action.get('fcd_scores')
                             if isinstance(fcd, dict):
                                 raw_with_decision['FCD'] = fcd
+                        raw_with_decision.pop('bpm_history', None)
+                        raw_with_decision.pop('rr_history', None)
                         self.logger.log_raw(raw_with_decision)
 
 
@@ -630,10 +781,26 @@ class DataCollector:
             try:
                 with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
                     state = json.loads(resp.read())
-                print(f"[DataCollector] Polled vehicle state: {state}")
-                self._cached_speed = int(state.get("speed_kmh", self._cached_speed))
+                self._cached_speed               = int(state.get("speed_kmh", self._cached_speed))
+                self._cached_brake               = float(state.get("brake", self._cached_brake))
+                self._cached_steer               = float(state.get("steer", self._cached_steer))
+                self._cached_speed_limit         = float(state.get("speed_limit_kmh", self._cached_speed_limit))
+                self._cached_precipitation       = float(state.get("precipitation", self._cached_precipitation))
+                self._cached_night               = bool(state.get("is_night", self._cached_night))
+                self._cached_junction            = bool(state.get("is_junction", self._cached_junction))
+                self._cached_throttle            = float(state.get("throttle", self._cached_throttle))
+                self._cached_gear                = int(state.get("gear", self._cached_gear))
+                self._cached_hand_brake          = bool(state.get("hand_brake", self._cached_hand_brake))
+                self._cached_reverse             = bool(state.get("reverse", self._cached_reverse))
+                self._cached_acceleration        = float(state.get("acceleration", self._cached_acceleration))
+                self._cached_fog_density         = float(state.get("fog_density", self._cached_fog_density))
+                self._cached_traffic_light_state = state.get("traffic_light_state", self._cached_traffic_light_state)
+                self._cached_headlight           = bool(state.get("headlight", self._cached_headlight))
+                self._cached_fog_light           = bool(state.get("fog_light", self._cached_fog_light))
+                self._cached_left_indicator      = bool(state.get("left_indicator", self._cached_left_indicator))
+                self._cached_right_indicator     = bool(state.get("right_indicator", self._cached_right_indicator))
             except Exception:
-                pass  # keep using last cached value on any error
+                pass  # keep using last cached values on any error
             time.sleep(interval)
 
     def start(self) -> None:

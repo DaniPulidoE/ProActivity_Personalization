@@ -43,6 +43,7 @@ except ImportError:  # pragma: no cover - exercised only when xlstm is absent
 # Canonical feature schema (ONE fixed order, used everywhere).
 # --------------------------------------------------------------------------- #
 STATE_NUM = ['perclos', 'gaze_score', 'hr_delta', 'rr_delta', 'blink_rate', 'yawn_rate']
+STATE_CARLA = ['speed_ratio_max', 'speed_ratio_limit', 'brake', 'steer', 'precipitation', 'is_night', 'is_junction']
 STATE_CAT_LEN = ['environment', 'secondary_task']
 STATE_CAT_ONE_HOT = ['emotion', 'lab']
 STATE_CAT = STATE_CAT_LEN + STATE_CAT_ONE_HOT
@@ -55,7 +56,7 @@ LAB_VOCAB = ['face', 'phone', 'drink', 'smoke', 'distracted', 'safe'] # leave on
 # FCD values, then each NUM (1 value), then each CAT (2 values).
 #D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
 # with one-hot encoding for emotion and lab categories
-D_IN = len(FCD_NAMES) + len(STATE_NUM) +  len(STATE_CAT_LEN) + len(EMOTION_VOCAB) + len(LAB_VOCAB)
+D_IN = len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA) + len(STATE_CAT_LEN) + len(EMOTION_VOCAB) + len(LAB_VOCAB) 
 
 DEFAULT_CONTEXT_LENGTH = 400
 
@@ -82,9 +83,11 @@ def _as01(x: Any) -> float:
 def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     """Encode a single timestep into a ``float32`` vector of length ``D_IN``.
 
-    Layout: 12 FCD values (normalised [1,5]→[0,1]), 6 NUM values, 2 string-length
-    CAT values (environment, secondary_task), 7 emotion one-hot values, 6 lab
-    multi-hot values. Total: D_IN = 33.
+    Layout: 12 FCD values (normalised [1,5]→[0,1]), 6 driver-state NUM values,
+    7 CARLA vehicle/world values (speed_ratio_max, speed_ratio_limit, brake,
+    steer, precipitation, is_night, is_junction), 2 string-length CAT values
+    (environment, secondary_task), 7 emotion one-hot values, 6 lab multi-hot
+    values. Total: D_IN = 40.
 
     ``lab`` can be a Python list (from live DataCollector or JSONL), a
     string-encoded list (``"['face', 'phone']"`` — produced when pandas
@@ -94,6 +97,7 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     fcd = get_fcd_for_function(functionname or "")
     fcd_vec = [(float(fcd[k]) - 1.0) / 4.0 for k in FCD_NAMES]   # [1,5] → [0,1]
     num = [_as01(row.get(k)) for k in STATE_NUM]
+    num_carla = [_as01(row.get(k)) for k in STATE_CARLA]
     catv = []
     for k in STATE_CAT:
         v = row.get(k, "")
@@ -114,7 +118,7 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
             c = "" if v is None else str(v)
             vec = [min(len(c) / 16.0, 1.0)]
         catv.extend(vec)
-    vec = np.asarray([*fcd_vec, *num, *catv], dtype=np.float32)
+    vec = np.asarray([*fcd_vec, *num, *num_carla, *catv], dtype=np.float32)
     return vec
 
 
