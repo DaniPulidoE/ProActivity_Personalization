@@ -18,6 +18,8 @@ from ProVoice.models.xlstm_model import (
     XLSTMSequenceClassifier,
     save_checkpoint,
     DEFAULT_CONTEXT_LENGTH,
+    FEATURE_NAMES,
+    log_encoded_frames,
 )
 from ProVoice.models.xlstm_model import _as01
 
@@ -69,6 +71,13 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out['precipitation']     = pick('precipitation',     default=None)
     out['is_night']          = pick('is_night',          default=None)
     out['is_junction']       = pick('is_junction',       default=None)
+    out['perclos']       = pick('perclos',       default=0.0)
+    out['gaze_score']    = pick('gaze_score',    default=0.0)
+    out['hr_delta']      = pick('hr_delta',      default=0.0)
+    out['rr_delta']      = pick('rr_delta',      default=0.0)
+    out['blink_rate']    = pick('blink_rate',    default=0.0)
+    out['yawn_rate']     = pick('yawn_rate',     default=0.0)
+
     for k in LEVELS:
         if k in row and row[k] not in (None, ""):
             out[k] = int(float(row[k]))
@@ -94,7 +103,13 @@ def load_label_map(path: str | None) -> Dict[str, List[int]]:
 
 
 class SeqDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, context_length: int = DEFAULT_CONTEXT_LENGTH):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        context_length: int = DEFAULT_CONTEXT_LENGTH,
+        split: str = "train",
+        log_fh=None,
+    ):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
         self.groups: List[Tuple[np.ndarray, int]] = []
@@ -107,6 +122,8 @@ class SeqDataset(Dataset):
             xs = [encode_frame(g.iloc[i].get('functionname') or "", g.iloc[i].to_dict()) for i in range(len(g))]
             X = np.stack(xs, axis=0).astype(np.float32)
             self.groups.append((X, y))
+            if log_fh is not None:
+                log_encoded_frames(log_fh, split, str(gid), X, label=y)
 
 
     def __len__(self): return len(self.groups)
@@ -157,6 +174,8 @@ def main():
     ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
     ap.add_argument("--out",       dest="out_pt",   default="trained_models/state_xlstm.pt")
+    ap.add_argument("--log",       dest="log_path", default="state_data.log",
+                    help="Path for the JSONL log of exact features fed to the xLSTM (one line per frame). Pass '' to disable.")
     ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch",  type=int, default=16)
@@ -209,18 +228,34 @@ def main():
     tr_df = df[df['segment_id'].isin(tr_ids)].reset_index(drop=True)
     te_df = df[df['segment_id'].isin(te_ids)].reset_index(drop=True)
     """
-    # Train-validation split performed by participantid: 80% of participants for training, 20% for validation)
+    # Train-validation split: by participant when ≥2 participants, else by segment.
     if df[SPLIT_VARIABLE].eq("").all():
         raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
     pids = df[SPLIT_VARIABLE].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
-    ntr = max(1, int(0.8 * len(pids)))
-    tr_pids, te_pids = set(pids[:ntr]), set(pids[ntr:])
-    print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
-    tr_df = df[df[SPLIT_VARIABLE].isin(tr_pids)].reset_index(drop=True)
-    te_df = df[df[SPLIT_VARIABLE].isin(te_pids)].reset_index(drop=True)
+    if len(pids) >= 2:
+        ntr = max(1, int(0.8 * len(pids)))
+        tr_pids, te_pids = set(pids[:ntr]), set(pids[ntr:])
+        print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
+        tr_df = df[df[SPLIT_VARIABLE].isin(tr_pids)].reset_index(drop=True)
+        te_df = df[df[SPLIT_VARIABLE].isin(te_pids)].reset_index(drop=True)
+    else:
+        print(f"[split] only {len(pids)} participant(s) — falling back to segment-level 80/20 split")
+        gids = df['segment_id'].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
+        ntr = max(1, int(0.8 * len(gids)))
+        tr_ids, te_ids = set(gids[:ntr]), set(gids[ntr:])
+        tr_df = df[df['segment_id'].isin(tr_ids)].reset_index(drop=True)
+        te_df = df[df['segment_id'].isin(te_ids)].reset_index(drop=True)
+        print(f"[split] train segments={len(tr_ids)}  val segments={len(te_ids)}")
 
-    train_ds = SeqDataset(tr_df, context_length=args.context_length)
-    test_ds  = SeqDataset(te_df, context_length=args.context_length)
+    log_fh = open(args.log_path, "w", encoding="utf-8") if args.log_path else None
+    if log_fh:
+        print(f"[log] writing feature log → {args.log_path}")
+    try:
+      train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh)
+      test_ds  = SeqDataset(te_df, context_length=args.context_length, split="val",   log_fh=log_fh)
+    finally:
+      if log_fh:
+          log_fh.close()
     if len(train_ds) == 0 or len(test_ds) == 0:
         raise ValueError(f"Insufficient segments: train={len(train_ds)}, val={len(test_ds)}. Ensure Level_* labels exist.")
     collate = make_collate(args.context_length)

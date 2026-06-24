@@ -61,7 +61,10 @@ def to_float(x: Any) -> float | None:
     try:
         if x is None or x == '':
             return None
-        return float(x)
+        v = float(x)
+        if v != v:  # NaN check (NaN is the only float not equal to itself)
+            return None
+        return v
     except Exception as e:
         print(f"[Error] Failed to convert to float: {e}")
         return None

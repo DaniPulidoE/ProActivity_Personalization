@@ -14,6 +14,17 @@ It writes two files, matching exactly what the trainers expect:
 
   * ``labeled_data.jsonl`` — every labelled frame + ``segment_id`` + ``Level_1..5``
       (feed to ``python -m ProVoice.train_XLSTM --in labeled_data.jsonl``)
+
+      All raw frame fields are passed through verbatim, including:
+        - xLSTM model features: perclos, gaze_score, hr_delta, rr_delta,
+          blink_rate, yawn_rate, emotion, lab, environment, secondary_task
+        - STATE_CARLA model features: speed_ratio_max, speed_ratio_limit,
+          brake, steer, precipitation, is_night, is_junction
+        - Logging extras (not used by model, kept for analysis):
+          speed_kmh, speed_limit_kmh, throttle, gear, hand_brake, reverse,
+          acceleration, fog_density, traffic_light_state, headlight,
+          fog_light, left_indicator, right_indicator, eye_ar, mar
+
   * ``fcd_out.csv``        — per-segment aggregated FCD features + ``Level_1..5``
       (feed to ``ProVoice.train_fcd_loa`` / ``data/processed_data/fcd_out.csv``)
 

@@ -8,6 +8,7 @@ from ProVoice.models.xlstm_model import (
     D_IN,
     DEFAULT_CONTEXT_LENGTH,
     load_checkpoint,
+    log_encoded_frames,
 )
 import torch
 
@@ -187,7 +188,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
 
 class StateXLSTMLoAStrategy(BaseStrategy):
     def __init__(self, model_path: Optional[str], default_function: str, window: int = 256, conservative: bool = True,
-                 fcd_fallback: Optional[BaseStrategy] = None):
+                 fcd_fallback: Optional[BaseStrategy] = None, log_path: Optional[str] = None):
         self.model = None
         # `window` is only a fallback; the authoritative sequence length is
         # `context_length` taken from the loaded checkpoint's arch.
@@ -206,6 +207,18 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         self.default_key = resolve_function_key(default_function)
         self.conservative = conservative
         self.fcd_fallback = fcd_fallback
+        self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+
+    def close(self) -> None:
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def _try_fcd_fallback(self, state: Dict[str, Any], fn: str) -> Dict[str, Any]:
         fcd = get_fcd_for_function(fn)
@@ -222,11 +235,22 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             seq: List[Dict[str, Any]] = state.get("sequence") or []
             if not seq:
                 return self._try_fcd_fallback(state, fn)
-            Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
-            T = len(Xs)
+            # Encode actual frames first, then left-pad separately so we can log
+            # the real data independently of the zero padding.
+            Xs_actual = [encode_frame(fn, s) for s in seq[-self.context_length:]]
+            T = len(Xs_actual)
             if T < self.context_length:
-                # LEFT-pad with zero vectors so the last timestep is valid.
-                Xs = [np.zeros(D_IN, np.float32)] * (self.context_length - T) + Xs
+                Xs = [np.zeros(D_IN, np.float32)] * (self.context_length - T) + Xs_actual
+            else:
+                Xs = Xs_actual
+            if self._log_fh is not None:
+                # Log only the last actual frame (most recent driver state) to keep
+                # the file manageable at 20 Hz. frame_idx=T-1 marks it as the tail.
+                log_encoded_frames(
+                    self._log_fh, "infer",
+                    state.get("timestamp", ""),
+                    np.stack(Xs_actual[-1:], axis=0),
+                )
             with torch.no_grad():
                 xb = torch.from_numpy(np.stack(Xs, 0))[None, ...]
                 logits = self.model(xb)

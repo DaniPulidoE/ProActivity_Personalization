@@ -332,7 +332,7 @@ class DataCollector:
 
 
         self.latest_frame = frame_annot
-        print(f"[Calibration] Phase 2: {now - self._calibration_start_t:.1f}/{self._calibration_duration_s:.1f} s elapsed. ")
+        print(f"[Calibration] {now - self._calibration_start_t:.1f}/{self._calibration_duration_s:.1f} s elapsed. ")
         if (now - self._calibration_start_t) >= self._calibration_duration_s:
             self.compute_calibration()
 
@@ -423,19 +423,19 @@ class DataCollector:
                 face_roi = frame[y:y + h, x:x + w]
                 hr, rr = self.rppg_estimator.add_frame(face_roi)
                 #print(f"rPPG: HR={hr}, RR={rr}")
-                if hr is not None:
+                if hr is not None and not (hr != hr):
                     # Heart rate
-                    data['bpm'] = round(float(hr), 1)
-                    data['heart_rate'] = data['bpm']
-                    self.bpm_history.append(data['bpm'])
+                    bpm = round(float(hr), 1)
+                    data['heart_rate'] = bpm
+                    self.bpm_history.append(data['heart_rate'])
                     if len(self.bpm_history) > 80:
                         self.bpm_history.pop(0)
                     data['bpm_history'] = self.bpm_history
-                if rr is not None:
+                if rr is not None and not (rr != rr):
                     # Respiratory Rate
-                    data['breaths-per-minute'] = round(float(rr), 1)
-                    data['respiratory_rate'] = data['breaths-per-minute']
-                    self.rr_history.append(data['breaths-per-minute'])
+                    breaths_per_min = round(float(rr), 1)
+                    data['respiratory_rate'] = breaths_per_min
+                    self.rr_history.append(data['respiratory_rate'])
                     if len(self.rr_history) > 80:
                         self.rr_history.pop(0)
                     data['rr_history'] = self.rr_history
@@ -446,14 +446,14 @@ class DataCollector:
                     hr_baseline = cal_hr if cal_hr > 0.0 else sum(self.bpm_history) / len(self.bpm_history)
                     cal_hr_std = self.calibrate.get('bpm', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
                     hr_std = cal_hr_std if cal_hr_std > 0.0 else statistics.stdev(self.bpm_history)
-                    data['hr_delta'] = round((data.get('bpm', hr_baseline) - hr_baseline)/hr_std, 1)
+                    data['hr_delta'] = round((data.get('heart_rate', hr_baseline) - hr_baseline)/hr_std, 1)
                 # rr_delta: same pattern
                 if len(self.rr_history) >= 10:
                     cal_rr = self.calibrate.get('rr', {}).get('mean', 0.0) if hasattr(self, 'calibrate') else 0.0
                     rr_baseline = cal_rr if cal_rr > 0.0 else sum(self.rr_history) / len(self.rr_history)
                     cal_rr_std = self.calibrate.get('rr', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
                     rr_std = cal_rr_std if cal_rr_std > 0.0 else statistics.stdev(self.rr_history)
-                    data['rr_delta'] = round((data.get('breaths-per-minute', rr_baseline) - rr_baseline)/rr_std, 1)
+                    data['rr_delta'] = round((data.get('respiratory_rate', rr_baseline) - rr_baseline)/rr_std, 1)
                     
         emo = self.detect_emotion(faces, gray)
         if emo:
@@ -510,7 +510,7 @@ class DataCollector:
         blink_window = 30.0 # 30 second window for blinks
         self.blink_times = [t for t in self.blink_times if now - t <= blink_window]
         elapsed_s = min(now - self._session_start_t, blink_window)
-        self.blink_rate = len(self.blink_times) / (elapsed_s / 60)  # blinks per minute
+        self.blink_rate = len(self.blink_times) / (elapsed_s / 60) if elapsed_s > 0 else 0.0  # blinks per minute
         yawn_window = 180 # 3 minute window for yawns
         self.yawn_times = [t for t in self.yawn_times if now - t <= yawn_window]
         self.yawn_rate = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
@@ -520,7 +520,7 @@ class DataCollector:
         
         # Add the computed metrics to the data dictionary (normalized)
         # normalize blink rate (it is a Poisson divided by a specific value - Variance=X/n)
-        normalized_blink_rate = (self.blink_rate - self.calibrate.get('blink_rate', {}).get('mean', 0.0)) / math.sqrt((self.calibrate.get('blink_rate', {}).get('mean', 1.0)/(elapsed_s / 60))) if self.calibrate.get('blink_rate', {}).get('mean', 0.0) > 0 else 0.0
+        normalized_blink_rate = (self.blink_rate - self.calibrate.get('blink_rate', {}).get('mean', 0.0)) / math.sqrt((self.calibrate.get('blink_rate', {}).get('mean', 1.0)/(elapsed_s / 60))) if (self.calibrate.get('blink_rate', {}).get('mean', 0.0) > 0 and elapsed_s > 0) else 0.0
         data['blink_rate'] = round(float(normalized_blink_rate), 3)
         # Anscombe transform to normalize yawn rate
         normalized_yawn_rate = 2*math.sqrt((self.yawn_rate*(yawn_window / 60)) + 3/8) 
@@ -659,7 +659,7 @@ class DataCollector:
 
         MAX_SPEED = 150
         data['speed_ratio_max']   = speed / MAX_SPEED if speed is not None else None
-        data['speed_ratio_limit'] = speed / speed_lim if speed_lim is not None else -1
+        data['speed_ratio_limit'] = speed / speed_lim if (speed_lim is not None and speed_lim > 0) else -1
         data['brake']             = brake
         data['steer']             = steer
         data['precipitation']     = precipitation
@@ -688,7 +688,14 @@ class DataCollector:
         if self.phys_enabled and 'heart_rate' not in data:
             # No live rPPG reading this cycle — report unknown rather than
             # fabricating a value that pollutes the model input and dashboard.
-            data['heart_rate'] = None
+            if 'heart_rate' not in data:
+                data['heart_rate'] = None
+                data['hr_delta'] = None
+            
+            if 'respiratory_rate' not in data:
+                data['respiratory_rate'] = None
+                data['rr_delta'] = None
+
 
         if self.context_enabled:
             self._carla_process(data)
@@ -740,7 +747,7 @@ class DataCollector:
                         action = self.decision_engine.decide(dict(data_for_decision))
                         if self.logger and isinstance(action, dict):
                             action_for_log = dict(action)
-                            for key in ('session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
+                            for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
                                 value = data.get(key)
                                 if value not in (None, ''):
                                     action_for_log.setdefault(key, value)
@@ -769,6 +776,7 @@ class DataCollector:
                         self.actuator.execute(action)
 
             except Exception as e:
+                import traceback; traceback.print_exc()
                 print('[DataCollector] loop error:', e)
 
             next_t += self.sampling_interval

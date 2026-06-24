@@ -12,7 +12,8 @@ Uses the OFFICIAL nx-ai/xlstm library (``xlstm==2.0.5``), classic
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, Optional, Tuple
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -59,6 +60,45 @@ LAB_VOCAB = ['face', 'phone', 'drink', 'smoke', 'distracted', 'safe'] # leave on
 D_IN = len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA) + len(STATE_CAT_LEN) + len(EMOTION_VOCAB) + len(LAB_VOCAB) 
 
 DEFAULT_CONTEXT_LENGTH = 400
+
+# Canonical feature names — same order as the 40-dim vector produced by encode_frame().
+# Used to label log entries so they can be read without the source code.
+FEATURE_NAMES: List[str] = (
+    list(FCD_NAMES)                                       # 12  FCD dims (normalised [1,5]→[0,1])
+    + list(STATE_NUM)                                     #  6  driver state numerics
+    + list(STATE_CARLA)                                   #  7  CARLA vehicle/world
+    + ["environment_len", "secondary_task_len"]           #  2  string-length context encoding
+    + [f"emotion_{e}" for e in EMOTION_VOCAB]             #  7  one-hot emotion
+    + [f"lab_{l}"     for l in LAB_VOCAB]                 #  6  multi-hot distraction
+)
+assert len(FEATURE_NAMES) == D_IN, f"FEATURE_NAMES length {len(FEATURE_NAMES)} != D_IN {D_IN}"
+
+
+def log_encoded_frames(
+    fh,
+    mode: str,
+    tag: str,
+    frames: np.ndarray,
+    label: Optional[int] = None,
+) -> None:
+    """Append one JSONL line per frame to an open file handle.
+
+    Args:
+        fh:     open writable text file handle
+        mode:   "train", "val", or "infer"
+        tag:    segment_id (train/val) or timestamp string (infer)
+        frames: float32 array shape (T, D_IN) — only real frames, no zero padding
+        label:  integer LoA class 0-4 (train/val only; omit for infer)
+    """
+    for i in range(len(frames)):
+        vec = frames[i]
+        entry: Dict[str, Any] = {"mode": mode, "tag": tag, "frame_idx": i}
+        if label is not None:
+            entry["label"] = label
+        for j, name in enumerate(FEATURE_NAMES):
+            entry[name] = round(float(vec[j]), 6)
+        fh.write(json.dumps(entry) + "\n")
+    fh.flush()
 
 
 def _as01(x: Any) -> float:

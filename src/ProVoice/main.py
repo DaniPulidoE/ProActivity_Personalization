@@ -156,6 +156,8 @@ def main():
     vehicle_state_url = args.get("vehicle_state_url")  # e.g. http://0.tcp.ngrok.io:PORT
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
+    xlstm_log = args.get("log_path") # e.g. "state_data.log"; empty/unset = disabled
+
     strategy = None
     fcd_engine = None
     state_engine = None
@@ -195,6 +197,7 @@ def main():
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
+                    log_path=xlstm_log or None,
                 )
                 print("[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt")
             else:
@@ -227,12 +230,12 @@ def main():
         # STATE
         try:
             if state_model == "xlstm":
-                # TODO
                 state_engine = StateXLSTMLoAStrategy(
                     model_path="trained_models/state_xlstm.pt",
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
+                    log_path=xlstm_log or None,
                 )
                 print("[main] Combined-STATE (xLSTM) part loaded successfully.")
             else:
@@ -357,6 +360,12 @@ def main():
     finally:
         data_collector.stop()
         logger.close()
+        for _s in (state_engine, fcd_engine, strategy):
+            if hasattr(_s, "close"):
+                try:
+                    _s.close()
+                except Exception:
+                    pass
         print("App exiting cleanly")
 
 if __name__ == "__main__":
