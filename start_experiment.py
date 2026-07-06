@@ -70,6 +70,7 @@ def build_provoice_cmd(session, args):
         f"modeltype={args.modeltype}",
         f"state_model={args.state_model}",
         f"w_fcd={args.w_fcd}",
+        *([f"window_seconds={args.window_seconds}"] if args.window_seconds is not None else []),
         f"host={args.host}",
         f"port={args.port}"
     ]
@@ -133,6 +134,10 @@ def main():
     parser.add_argument("--modeltype", default="combined")
     parser.add_argument("--state-model", default="xlstm")
     parser.add_argument("--w-fcd", type=float, default=0.7)
+    parser.add_argument("--window-seconds", type=float, default=None,
+                        help="Time span (s) of the driver-state window fed to the xLSTM. "
+                             "Unset = inherit the window the checkpoint was trained with. "
+                             "0 disables the time cap.")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
 

@@ -146,7 +146,13 @@ def main():
     state_model = args.get("state_model", args.get("statemodel", "classic")).lower()
     w_fcd = float(args.get("w_fcd", "0.5"))
     session_id = args.get("session_id") or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    window_sz = int(args.get("window", "400"))  # default 400 samples (20 seconds at 20Hz)
+    window_sz = int(args.get("window", "400"))  # frame-count cap on the model input (safety bound)
+    # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
+    # window the checkpoint was trained with (falling back to 20 s for legacy
+    # checkpoints). Explicit value overrides; 0 disables the time cap, leaving
+    # the rate-dependent frame-count cap only (400 frames ≈ 100 s at ~4 Hz).
+    _ws_arg = args.get("window_seconds")
+    window_seconds = float(_ws_arg) if _ws_arg not in (None, "") else None
     camera_source = args.get("camera_source", "front")
     camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
     vehicle_id_arg = args.get("vehicle_id")  # optional: skip file-based discovery when set
@@ -198,8 +204,9 @@ def main():
                     window=window_sz,
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
+                    window_seconds=window_seconds,
                 )
-                print("[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt")
+                print(f"[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt (window={state_engine.window_seconds}s)")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
@@ -236,8 +243,9 @@ def main():
                     window=window_sz,
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
+                    window_seconds=window_seconds,
                 )
-                print("[main] Combined-STATE (xLSTM) part loaded successfully.")
+                print(f"[main] Combined-STATE (xLSTM) part loaded successfully (window={state_engine.window_seconds}s).")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",

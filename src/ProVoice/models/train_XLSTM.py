@@ -20,8 +20,11 @@ from ProVoice.models.xlstm_model import (
     DEFAULT_CONTEXT_LENGTH,
     FEATURE_NAMES,
     log_encoded_frames,
+    logits_to_probs,
 )
 from ProVoice.models.xlstm_model import _as01
+from ProVoice.decision_engine import truncate_frames_by_seconds
+from coral_pytorch.losses import corn_loss
 
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -53,6 +56,8 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             if k in row and row[k] not in (None, ""): return row[k]
         return default
     out = {}
+    # timestamp is needed by the --window-seconds truncation (and harmless otherwise)
+    out['timestamp']       = pick('timestamp', 'ts', 'time')
     out['segment_id']      = pick('segment_id', 'segment', 'trial_id', 'trial', 'block_id')
     out['participantid']   = pick('participantid', 'participant_id', 'participant', 'pid')
     out['functionname']    = pick('functionname', 'function', 'func_name', 'FunctionName')
@@ -84,7 +89,7 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def load_label_map(path: str | None) -> Dict[str, List[int]]:
+def load_label_map(path: str | None) -> Dict[str, List[int]]: # NOT USED !!!
     if not path: return {}
     p = pathlib.Path(path)
     if not p.exists(): return {}
@@ -109,6 +114,7 @@ class SeqDataset(Dataset):
         context_length: int = DEFAULT_CONTEXT_LENGTH,
         split: str = "train",
         log_fh=None,
+        window_seconds: float | None = None,
     ):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
@@ -119,7 +125,11 @@ class SeqDataset(Dataset):
                 continue
             level_vec = g[LEVELS].iloc[0].astype(float).values
             y = int(np.argmax(level_vec))  # single-label 5-class target
-            xs = [encode_frame(g.iloc[i].get('functionname') or "", g.iloc[i].to_dict()) for i in range(len(g))]
+            rows = [g.iloc[i].to_dict() for i in range(len(g))]
+            # Keep only the LAST window_seconds of the segment (frames are
+            # chronological within a segment). None/0 = use the full segment.
+            rows = truncate_frames_by_seconds(rows, window_seconds)
+            xs = [encode_frame(r.get('functionname') or "", r) for r in rows]
             X = np.stack(xs, axis=0).astype(np.float32)
             self.groups.append((X, y))
             if log_fh is not None:
@@ -143,8 +153,10 @@ def make_collate(context_length: int):
                 X = X[-context_length:]
             pad = context_length - X.shape[0]
             if pad > 0:
-                # LEFT-pad with zero vectors so h[:, -1, :] is always valid.
-                X = np.concatenate([np.zeros((pad, X.shape[1]), dtype=X.dtype), X], axis=0)
+                # RIGHT-pad with zero vectors. forward() reads the hidden state
+                # at index length-1 (the last real frame); the stack is causal,
+                # so the pad frames after it have exactly zero influence.
+                X = np.concatenate([X, np.zeros((pad, X.shape[1]), dtype=X.dtype)], axis=0)
             xs.append(torch.from_numpy(X))
             ys.append(int(y))
             ls.append(min(T, context_length))
@@ -170,6 +182,27 @@ def macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> floa
     return float(np.mean(f1s))
 
 
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Mean absolute error in LoA levels — ordinal metric: off-by-1 < off-by-4."""
+    if len(y_true) == 0: return 0.0
+    return float(np.abs(y_true.astype(float) - y_pred.astype(float)).mean())
+
+
+def qwk(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
+    """Quadratic weighted kappa — chance-corrected ordinal agreement in [-1, 1].
+
+    Undefined (0/0) when labels and predictions are both constant, e.g. a
+    single-segment validation tail; defined here as 1.0 on exact agreement
+    and 0.0 otherwise, so degenerate tails don't produce NaNs in logs/CSVs.
+    """
+    if len(y_true) == 0: return 0.0
+    from sklearn.metrics import cohen_kappa_score
+    k = cohen_kappa_score(y_true, y_pred, labels=list(range(n_classes)), weights="quadratic")
+    if np.isfinite(k):
+        return float(k)
+    return 1.0 if np.array_equal(y_true, y_pred) else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
@@ -186,7 +219,18 @@ def main():
     ap.add_argument("--embedding-dim", dest="embedding_dim", type=int, default=64)
     ap.add_argument("--num-blocks", dest="num_blocks", type=int, default=2)
     ap.add_argument("--num-heads", dest="num_heads", type=int, default=4)
+    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=20.0,
+                    help="Truncate each segment to its LAST k seconds before encoding "
+                         "(by frame timestamps, so it is robust to the actual sampling "
+                         "rate). Default 20 = the full label window. 0 disables. "
+                         "Stored in the checkpoint so fine-tuning and inference inherit it.")
+    ap.add_argument("--loss", choices=["ce", "corn"], default="ce",
+                    help="'ce': softmax head + cross-entropy (nominal). 'corn': rank-consistent "
+                         "ordinal head (K-1 conditional logits) + CORN loss (Shi et al. 2023). "
+                         "The choice is baked into the checkpoint and picked up automatically "
+                         "by fine_tune_XLSTM.py and the decision engine.")
     args = ap.parse_args()
+    head_type = "corn" if args.loss == "corn" else "softmax"
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -251,8 +295,10 @@ def main():
     if log_fh:
         print(f"[log] writing feature log → {args.log_path}")
     try:
-      train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh)
-      test_ds  = SeqDataset(te_df, context_length=args.context_length, split="val",   log_fh=log_fh)
+      train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh,
+                            window_seconds=args.window_seconds)
+      test_ds  = SeqDataset(te_df, context_length=args.context_length, split="val",   log_fh=log_fh,
+                            window_seconds=args.window_seconds)
     finally:
       if log_fh:
           log_fh.close()
@@ -269,24 +315,35 @@ def main():
         num_blocks=args.num_blocks,
         num_heads=args.num_heads,
         context_length=args.context_length,
-        pool='last',
+        #pool='last',
+        head_type=head_type,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = nn.CrossEntropyLoss()
+    if head_type == "corn":
+        # CORN trains each of the K-1 logits as P(y>k | y>k-1) on its
+        # conditional subset; corn_loss builds those subsets internally.
+        loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=5)
+    else:
+        loss_fn = nn.CrossEntropyLoss()
 
     best = -1.0  # ensures the first epoch always saves, so a checkpoint always exists
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
     arch = dict(
         d_in=D_IN, n_classes=5, embedding_dim=args.embedding_dim,
         num_blocks=args.num_blocks, num_heads=args.num_heads,
-        context_length=args.context_length, pool='last',
+        context_length=args.context_length,
+        head_type=head_type,
+        # Data contract, not a model kwarg: the time window segments were cut
+        # to. load_checkpoint() keeps it in arch but does not pass it to the
+        # constructor; fine-tuning and inference inherit it from here.
+        window_seconds=(args.window_seconds if args.window_seconds and args.window_seconds > 0 else None),
     )
 
     for ep in range(args.epochs):
         model.train()
         for xb, yb, lb in train_dl:
             xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
-            logits = model(xb, lb)
+            logits = model(xb, lengths=lb)
             loss = loss_fn(logits, yb)
             opt.zero_grad(); loss.backward(); opt.step()
 
@@ -294,12 +351,15 @@ def main():
         with torch.no_grad():
             for xb, yb, lb in test_dl:
                 xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
-                logits = model(xb, lb)
-                pred = logits.argmax(dim=-1)
+                logits = model(xb, lengths=lb)
+                # logits_to_probs maps either head type to a 5-class PMF, so
+                # argmax decoding is identical for CE and CORN.
+                pred = logits_to_probs(logits, head_type).argmax(dim=-1)
                 y_true.append(yb.cpu().numpy()); y_pred.append(pred.cpu().numpy())
         Yt = np.concatenate(y_true, 0); Yp = np.concatenate(y_pred, 0)
         acc = accuracy(Yt, Yp); mf1 = macro_f1(Yt, Yp, 5)
-        print(f"[epoch {ep:02d}] acc={acc:.3f} macro-F1={mf1:.3f} (val_n={len(Yt)})")
+        err = mae(Yt, Yp); kappa = qwk(Yt, Yp, 5)
+        print(f"[epoch {ep:02d}] acc={acc:.3f} macro-F1={mf1:.3f} MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
 
         if acc > best:
             best = acc

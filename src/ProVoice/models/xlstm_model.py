@@ -142,7 +142,7 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     for k in STATE_CAT:
         v = row.get(k, "")
         if k == 'emotion':
-            vec = [1.0 if v == e else 0.0 for e in EMOTION_VOCAB]
+            vec = [1.0 if v.strip().lower() == e else 0.0 for e in EMOTION_VOCAB]
         elif k == 'lab':
             if isinstance(v, list):
                 lab_list = v
@@ -184,7 +184,15 @@ def _stack_cfg(embedding_dim: int, num_blocks: int, num_heads: int, context_leng
 
 
 class XLSTMSequenceClassifier(nn.Module):
-    """Input proj -> xLSTMBlockStack -> last-step pool -> linear classifier."""
+    """Input proj -> xLSTMBlockStack -> readout at last real frame -> linear classifier.
+
+    ``head_type`` selects the output parameterization:
+      - 'softmax': ``Linear(embedding_dim, n_classes)`` logits for CE/softmax.
+      - 'corn':    ``Linear(embedding_dim, n_classes - 1)`` logits, where logit k
+        models the conditional P(y > k | y > k-1) (Shi, Cao & Raschka 2023).
+        Class probabilities are recovered with :func:`logits_to_probs`; train
+        with ``coral_pytorch.losses.corn_loss``.
+    """
 
     def __init__(
         self,
@@ -194,7 +202,8 @@ class XLSTMSequenceClassifier(nn.Module):
         num_blocks: int = 2,
         num_heads: int = 4,
         context_length: int = DEFAULT_CONTEXT_LENGTH,
-        pool: str = 'last',
+        #pool: str = 'last',
+        head_type: str = 'softmax',
     ):
         super().__init__()
         if not XLSTM_AVAILABLE:
@@ -206,32 +215,70 @@ class XLSTMSequenceClassifier(nn.Module):
                 f"embedding_dim ({embedding_dim}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
+        if head_type not in ('softmax', 'corn'):
+            raise ValueError(f"head_type must be 'softmax' or 'corn', got {head_type!r}")
         self.d_in = d_in
         self.n_classes = n_classes
         self.embedding_dim = embedding_dim
         self.num_blocks = num_blocks
         self.num_heads = num_heads
         self.context_length = context_length
-        self.pool = pool
+        #self.pool = pool
+        self.head_type = head_type
 
         self.in_proj = nn.Linear(d_in, embedding_dim)
         self.backbone = xLSTMBlockStack(
             _stack_cfg(embedding_dim, num_blocks, num_heads, context_length)
         )
-        self.head = nn.Linear(embedding_dim, n_classes)
+        n_out = n_classes - 1 if head_type == 'corn' else n_classes
+        self.head = nn.Linear(embedding_dim, n_out)
         self.backbone.reset_parameters()
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Batches are RIGHT-padded; ``lengths`` holds the true frame counts.
+
+        The readout is the hidden state at the last REAL frame (index
+        ``lengths-1``). The stack is causal, so pad frames sit after the
+        readout point and cannot influence the output — padding is exactly
+        neutral, not merely learned-to-ignore. Omit ``lengths`` for unpadded
+        input (e.g. batch-of-1 inference), where the last timestep is real.
+        """
         x = x.to(torch.float32)
         h = self.in_proj(x)
         h = self.backbone(h)
-        # Sequences are LEFT-padded, so the last timestep is always valid.
-        pooled = h[:, -1, :]
+        if lengths is None:
+            pooled = h[:, -1, :]
+        else:
+            idx = (lengths.to(h.device).long() - 1).clamp(min=0)
+            pooled = h[torch.arange(h.size(0), device=h.device), idx]
         return self.head(pooled)
 
 
+def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
+    """Convert head logits to a (B, n_classes) probability distribution.
+
+    SINGLE source of truth for decoding, shared by the trainers and the
+    inference strategy so train/serve decoding cannot diverge.
+
+    - 'softmax': plain softmax over n_classes logits.
+    - 'corn': logits are K-1 conditionals P(y>k | y>k-1). The chain rule gives
+      cumulative probs q_k = P(y>k) as a running product of sigmoids (monotone
+      non-increasing by construction => rank-consistent), and differencing the
+      q_k yields a valid PMF: p_0 = 1-q_1, p_k = q_k - q_{k+1}, p_{K-1} = q_{K-1}.
+    """
+    if head_type == 'softmax':
+        return torch.softmax(logits, dim=-1)
+    if head_type == 'corn':
+        q = torch.cumprod(torch.sigmoid(logits), dim=-1)      # (B, K-1), q_k = P(y > k-1)
+        ones = torch.ones_like(q[..., :1])
+        upper = torch.cat([ones, q], dim=-1)                  # [1, q_1, ..., q_{K-1}]
+        lower = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)  # [q_1, ..., q_{K-1}, 0]
+        return upper - lower                                  # non-negative because q is monotone
+    raise ValueError(f"Unknown head_type: {head_type!r}")
+
+
 def save_checkpoint(model: XLSTMSequenceClassifier, path: str, arch: Dict[str, Any]) -> None:
-    """Persist model weights, arch kwargs, and feature normalisation stats."""
+    """Persist model weights, arch kwargs."""
     torch.save(
         {
             "format_version": 1,
@@ -249,8 +296,16 @@ def load_checkpoint(path: str, map_location: str = 'cpu') -> Tuple[XLSTMSequence
     if ckpt.get("format_version") != 1:
         raise ValueError(f"Unsupported checkpoint format_version: {ckpt.get('format_version')!r}")
 
-    arch = ckpt["arch"]
-    model = XLSTMSequenceClassifier(**arch)
+    arch = dict(ckpt["arch"])
+    # Legacy key: older checkpoints stored pool='last'. Pooling is now fixed to
+    # last-step (the only behaviour forward() ever implemented), so the key is
+    # dropped rather than passed to a constructor that no longer accepts it.
+    arch.pop("pool", None)
+    # 'window_seconds' is a DATA contract (how segments were cut at training),
+    # not a model kwarg: keep it in the returned arch for callers (fine-tuning,
+    # sweep, inference) but don't pass it to the constructor.
+    ctor_kwargs = {k: v for k, v in arch.items() if k != "window_seconds"}
+    model = XLSTMSequenceClassifier(**ctor_kwargs)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
     return model, arch
