@@ -73,6 +73,7 @@ def main():
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train-frac must be in (0, 1], got {args.train_frac}")
     
+    # seed and cuda
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
