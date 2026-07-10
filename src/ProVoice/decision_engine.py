@@ -1,4 +1,5 @@
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, List
 import math, os
 import numpy as np
@@ -92,8 +93,10 @@ def truncate_frames_by_seconds(seq: List[Dict[str, Any]], window_seconds: float)
         t = _secs_of_day(frame.get("timestamp"))
         if t is not None:
             age = t_last - t
-            if age < 0:
-                age += 86400.0  # timestamps are time-of-day; tolerate midnight wrap
+            if age < -43200.0:      # more than half a day "in the future" → midnight wrap
+                age += 86400.0
+            elif age < 0:           # small backward clock jitter → treat as same-instant
+                age = 0.0
             if age > window_seconds:
                 break  # buffer is chronological: everything earlier is older still
         kept.append(frame)
@@ -114,9 +117,10 @@ def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]]
     }
 
 
-class BaseStrategy:
+class BaseStrategy(ABC):
+    @abstractmethod
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        raise Exception("BaseStrategy is abstract and cannot decide; use a subclass with a concrete implementation.")
+        raise NotImplementedError
 
 
 class XGBoostLoAStrategy(BaseStrategy):
@@ -280,7 +284,11 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         self.default_key = resolve_function_key(default_function)
         self.conservative = conservative
         self.fcd_fallback = fcd_fallback
-        self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+        try:
+            self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+        except Exception as e:
+            print(f"Error opening log file: {e}")
+            self._log_fh = None
 
     def close(self) -> None:
         if self._log_fh is not None:

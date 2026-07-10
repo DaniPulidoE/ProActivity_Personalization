@@ -119,11 +119,15 @@ class SeqDataset(Dataset):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
         self.groups: List[Tuple[np.ndarray, int]] = []
+        skipped = []
         for gid, g in df.groupby('segment_id'):
             g = g.reset_index(drop=True)
             if not all(k in g.columns for k in LEVELS):
                 continue
             level_vec = g[LEVELS].iloc[0].astype(float).values
+            if np.isnan(level_vec).any() or level_vec.sum() <= 0:
+                skipped.append(gid)
+                continue
             y = int(np.argmax(level_vec))  # single-label 5-class target
             rows = [g.iloc[i].to_dict() for i in range(len(g))]
             # Keep only the LAST window_seconds of the segment (frames are
@@ -134,6 +138,9 @@ class SeqDataset(Dataset):
             self.groups.append((X, y))
             if log_fh is not None:
                 log_encoded_frames(log_fh, split, str(gid), X, label=y)
+        if skipped:
+            print(f"[warn] skipped {len(skipped)} segment(s) with missing/empty Level_* labels: "
+                f"{skipped[:5]}{' ...' if len(skipped) > 5 else ''}")
 
 
     def __len__(self): return len(self.groups)
@@ -207,8 +214,11 @@ def main():
     ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
     ap.add_argument("--out",       dest="out_pt",   default="trained_models/state_xlstm.pt")
-    ap.add_argument("--log",       dest="log_path", default="state_data.log",
-                    help="Path for the JSONL log of exact features fed to the xLSTM (one line per frame). Pass '' to disable.")
+    ap.add_argument("--log",       dest="log_path", default="",
+                    help="Optional path for a JSONL log of the exact features fed to the "
+                         "xLSTM (one line per frame). Off by default — it writes one JSON "
+                         "object per frame (~thousands of large lines on a full dataset). "
+                         "Pass a path to enable for debugging.")
     ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch",  type=int, default=16)
@@ -326,7 +336,7 @@ def main():
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    best = -1.0  # ensures the first epoch always saves, so a checkpoint always exists
+    best = float("inf")  # select on MAE (lower is better); +inf ensures the first epoch always saves
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
     arch = dict(
         d_in=D_IN, n_classes=5, embedding_dim=args.embedding_dim,
@@ -361,12 +371,15 @@ def main():
         err = mae(Yt, Yp); kappa = qwk(Yt, Yp, 5)
         print(f"[epoch {ep:02d}] acc={acc:.3f} macro-F1={mf1:.3f} MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
 
-        if acc > best:
-            best = acc
+        # Select on MAE: LoA is ordinal, so off-by-1 << off-by-4, and accuracy
+        # is blind to error distance (and to majority-class collapse under the
+        # class imbalance). MAE is the design-doc primary metric.
+        if err < best:
+            best = err
             save_checkpoint(model, str(outp), arch=arch)
-            print(f"[OK] saved -> {outp}")
+            print(f"[OK] saved -> {outp} (MAE={err:.3f})")
 
-    print(f"[BEST] acc={best:.3f}")
+    print(f"[BEST] MAE={best:.3f}")
 
 
 if __name__ == "__main__":

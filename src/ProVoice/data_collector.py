@@ -8,6 +8,7 @@ import time
 import urllib.request
 import json
 from typing import Any, Dict, Optional, Tuple
+from collections import deque
 
 import math
 import statistics
@@ -46,8 +47,21 @@ def _load_emotion_model(path: str) -> None:
     if _emotion_model is not None:
         return
     if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    _emotion_model = load_model(path, compile=False)  # type: ignore
+        # The default path is CWD-relative; when launched from another directory, fall back to the copy shipped next to this module.
+        fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'trained_models', os.path.basename(path))
+        if os.path.exists(fallback):
+            path = fallback
+        else:
+            print(f"[_load_emotion_model] FER model not found at {path!r} "
+                  f"(nor {fallback!r}); emotion detection disabled.")
+            return
+    try:
+        _emotion_model = load_model(path, compile=False)  # type: ignore
+    except Exception as e:
+        print(e, f"Error loading emotion model from {path}; emotion detection disabled")
+        _emotion_model = None
+        return
     print(f"[_load_emotion_model] Emotion model loaded successfully from {path}")
     _face_detector = cv2.CascadeClassifier(  # type: ignore
         os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
@@ -73,6 +87,14 @@ class DataCollector:
         window_size: int = 400, # 20 seconds at 20Hz (as user inputs label each 20 seconds)
         vehicle_state_url: Optional[str] = None,
     ) -> None:
+        # Everything stop()/__del__ touches is set FIRST, so a constructor
+        # that fails part-way still leaves a safely destructible object.
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._state_poll_thread: Optional[threading.Thread] = None
+        self.rppg_estimator = None
+        self.cap = None
+
         self.visual_enabled = bool(visual and HAS_CV2)
         self.phys_enabled = bool(physiological)
         self.context_enabled = bool(context)
@@ -87,7 +109,6 @@ class DataCollector:
         self.cam_index = cam_index
         self.static_context: Dict[str, Any] = dict(static_context or {})
 
-        self.cap = None
         self.face_mesh = None
         self.carla_vehicle = carla_vehicle
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
@@ -110,7 +131,6 @@ class DataCollector:
         self._cached_left_indicator: bool = False
         self._cached_right_indicator: bool = False
 
-        self._state_poll_thread: Optional[threading.Thread] = None
         # If a CARLA actor is present, attempt to retrieve the vehicle_id
         self.vehicle_id = None
         if self.carla_vehicle is not None:
@@ -147,27 +167,31 @@ class DataCollector:
                 except Exception as e:
                     print(e, "Error initializing rPPG estimator")
                     self.rppg_estimator = None
-                    raise e
-        else:
-            self.rppg_estimator = None
+                    #raise e
 
         if HAS_KERAS and HAS_CV2:
             _load_emotion_model(fer_model_path)
 
         self.latest_frame = None  # BGR
         self.latest_data: Dict[str, Any] = {}
-        self.bpm_history: list = []
-        self.rr_history: list = []
-        self.data_history: list = []
+        self.bpm_history: deque = deque(maxlen=80)
+        self.rr_history: deque = deque(maxlen=80)
+        # rPPG carry-forward
+        self._last_hr: Optional[float] = None
+        self._last_rr: Optional[float] = None
+        self._last_hr_t: float = 0.0
+        self._last_rr_t: float = 0.0
+        self._rppg_staleness_s: float = 15.0
+        self.data_history: deque = deque(maxlen=window_size)
         self.window_size = window_size
         self.blink_count = 0
         self.yawn_count = 0
         self.perclos = 0.0
         self.drowsiness_alert = False
-        self.Roll = 0
-        self.Rolleye = 0
-        self.Rollmouth = 0
         self.mCOUNTER = 0
+        # PERCLOS over a fixed TIME window (rate-independent)
+        self._perclos_buf: deque = deque()
+        self._perclos_window_s: float = 10.0
         self._eye_closed_since: float = 0.0  # monotonic time when EAR first dropped
         # yawn and blink rates (instead of raw counts) should act as better predictors
         self.blink_times = []
@@ -177,9 +201,7 @@ class DataCollector:
 
 
         self._lock = threading.Lock()
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        
+
         # calibration state
         self.calibrated = False
         self.calibrate: Dict[str, Any] = {}      # populated by compute_calibration()
@@ -191,9 +213,17 @@ class DataCollector:
         # Calibration: 60 s time-based, collects gaze/EAR/MAR/HR/RR
         self._calibration_duration_s: float = 60.0
         self._calibration_start_t: float = 0.0
+        # Transient camera-read failures (warm-up frames, momentary USB glitches)
+        # must NOT abort calibration; only give up after this many seconds of
+        # UNBROKEN failures. Resets on any successful read.
+        self._read_fail_since: float = 0.0
+        self._read_fail_grace_s: float = 5.0
 
     def __del__(self):
-        self.stop()
+        try:
+            self.stop()
+        except Exception:
+            pass  # never raise during interpreter teardown
 
     def detect_emotion(self, faces, gray) -> Optional[Dict[str, Any]]:
         if _emotion_model is None or _emotion_input_size is None:
@@ -276,14 +306,32 @@ class DataCollector:
 
     def calibrate_step(self) -> None:
         if not self.visual_enabled or self.cap is None:
+            # No camera at all — no baseline is obtainable; finish immediately
+            # with defaults so the context/CARLA pipeline can proceed.
+            print("[Calibration] Visual disabled or camera unavailable — "
+                  "finishing calibration with default baselines.")
+            self.compute_calibration()
             return
         ok, frame = self.cap.read()
-        if not ok:
-            print("not okay")
-            self.latest_frame = None
-            return
-
         now = time.monotonic()
+        if not ok:
+            # Tolerate transient read failures (camera warm-up, brief glitches):
+            # keep trying until the grace window elapses, then give up loudly.
+            if self._read_fail_since == 0.0:
+                self._read_fail_since = now
+            self.latest_frame = None
+            failed_for = now - self._read_fail_since
+            if failed_for >= self._read_fail_grace_s:
+                print(f"[Calibration] Camera read failed for "
+                      f"{failed_for:.1f}s (>{self._read_fail_grace_s:.0f}s grace) — "
+                      f"finishing calibration with whatever baselines exist.")
+                self.compute_calibration()
+            else:
+                print(f"[Calibration] Camera read failed ({failed_for:.1f}s) — "
+                      f"waiting for frames...")
+            return
+        self._read_fail_since = 0.0  # good frame — reset the failure timer
+
         if self._calibration_start_t == 0.0:
             self._calibration_start_t = now
             print("[Calibration] Starting 60 s calibration.")
@@ -299,11 +347,12 @@ class DataCollector:
             try:
                 ret, frame_annot = _perception.frametest(frame, face_mesh_results)
                 lab, eye, mouth = ret
-                if eye > 0.15:
+                # Only fold EAR/MAR into the baseline when a face is actually present. 
+                if "face" in (lab or []):
                     self._calibration_data['ear'].append(eye)
-                self._calibration_ear_ts.append((now, eye))
-                self._calibration_data['mar'].append(mouth)
-                self._calibration_mar_ts.append((now, mouth))
+                    self._calibration_data['mar'].append(mouth)
+                    self._calibration_ear_ts.append((now, eye))
+                    self._calibration_mar_ts.append((now, mouth))
             except Exception as e:  # noqa: BLE001
                 print(e, "Error computing perception.frametest")
                 frame_annot = frame
@@ -370,25 +419,57 @@ class DataCollector:
                 eye_closed_since = 0.0
         self.calibrate['blink_rate'] = {'mean': blink_count / (self._calibration_duration_s / 60)}  # blinks/min
         
-        # perclos
+        # perclos baseline: perclos over sliding window
         threshold_mar = self.calibrate['mar']['threshold']
-        n = len(self._calibration_ear_ts)
-        chunk_perclos = []
-        for i in range(0, n - 49, 50):
-            chunk_ear = [ear for _, ear in self._calibration_ear_ts[i:i+50]]
-            chunk_mar = [mar for _, mar in self._calibration_mar_ts[i:i+50]]
-            eye_c = sum(1 for e in chunk_ear if e < threshold_ear)
-            mar_c = sum(1 for m in chunk_mar if m > threshold_mar)
-            chunk_perclos.append((eye_c + mar_c * 0.2) / 50)
-        mean_perclos = np.mean(chunk_perclos) if chunk_perclos else 0
-        std_perclos = np.std(chunk_perclos) if chunk_perclos else 1e-6
-        self.calibrate['perclos'] = {'mean': mean_perclos, 'std': max(std_perclos, 1e-6)}
+        perclos_series = []
+        if self._calibration_ear_ts:
+            t0 = self._calibration_ear_ts[0][0]
+            buf: deque = deque()
+            for (ts, ear), (_, mar) in zip(self._calibration_ear_ts, self._calibration_mar_ts):
+                buf.append((ts, ear < threshold_ear, mar > threshold_mar))
+                while buf and ts - buf[0][0] > self._perclos_window_s:
+                    buf.popleft()
+                if ts - t0 < self._perclos_window_s:
+                    continue  # window not yet full — skip warm-up
+                nb = len(buf)
+                eye_frac = sum(1 for _, e, _ in buf if e) / nb
+                mouth_frac = sum(1 for _, _, m in buf if m) / nb
+                perclos_series.append(eye_frac + mouth_frac * 0.2)
+        mean_perclos = float(np.mean(perclos_series)) if perclos_series else 0.0
+        if len(perclos_series) > 1:
+            std_perclos = max(float(np.std(perclos_series)), 1e-3)
+        else:  # no full-window samples collected -> std=1.0 (not 1e-6)
+            std_perclos = 1.0
+        self.calibrate['perclos'] = {'mean': mean_perclos, 'std': std_perclos}
 
         self.calibrated = True
         self._session_start_t = time.monotonic()
         
         print("Calibration completed:", self.calibrate)    
     
+
+    def _standardized_delta(self, value: float, cal_key: str, history) -> float:
+        """(value - baseline) / std as a z-score.
+
+        Baseline and std come from the 60 s calibration for ``cal_key`` when it
+        produced samples; otherwise they fall back to the rolling ``history``
+        stats. Every degenerate case (no calibration, short history, zero std)
+        collapses to a unit std, so the result is the raw deviation — never a
+        divide-by-zero or an exploded value.
+        """
+        cal = self.calibrate.get(cal_key, {}) if hasattr(self, 'calibrate') else {}
+        cal_mean = cal.get('mean', 0.0)
+        baseline = cal_mean if cal_mean > 0.0 else (sum(history) / len(history) if history else 0.0)
+        cal_std = cal.get('std', 0.0)
+        if cal_std > 0.0:
+            std = cal_std
+        elif len(history) > 1:
+            std = statistics.stdev(history)
+        else:
+            std = 1.0
+        if std == 0.0:
+            std = 1.0
+        return round((value - baseline) / std, 1)
 
     def _visual_process(self, data: Dict[str, Any]) -> None:
         if not self.visual_enabled or self.cap is None:
@@ -418,43 +499,36 @@ class DataCollector:
 
 
         if self.rppg_estimator is not None:  # type: ignore
+            # rPPG: heart rate and respiratory rate are computed from the face region, if detected
+            now = time.monotonic()
+            # Only feed rPPG (and update the held reading) when a face is present.
+            # rPPG emits a fresh value only every ~45 face frames; on the frames
+            # in between it returns None and the held value is left untouched.
             if len(faces) > 0:
                 x, y, w, h = faces[0]
-                face_roi = frame[y:y + h, x:x + w]
-                hr, rr = self.rppg_estimator.add_frame(face_roi)
+                hr, rr = self.rppg_estimator.add_frame(frame[y:y + h, x:x + w])
                 #print(f"rPPG: HR={hr}, RR={rr}")
-                if hr is not None and not (hr != hr):
-                    # Heart rate
-                    bpm = round(float(hr), 1)
-                    data['heart_rate'] = bpm
-                    self.bpm_history.append(data['heart_rate'])
-                    if len(self.bpm_history) > 80:
-                        self.bpm_history.pop(0)
-                    data['bpm_history'] = self.bpm_history
+                if hr is not None and not (hr != hr):   # fresh, non-NaN reading
+                    self._last_hr = round(float(hr), 1)
+                    self._last_hr_t = now
+                    self.bpm_history.append(self._last_hr)
                 if rr is not None and not (rr != rr):
-                    # Respiratory Rate
-                    breaths_per_min = round(float(rr), 1)
-                    data['respiratory_rate'] = breaths_per_min
-                    self.rr_history.append(data['respiratory_rate'])
-                    if len(self.rr_history) > 80:
-                        self.rr_history.pop(0)
-                    data['rr_history'] = self.rr_history
-                    
-                # hr_delta: deviation from calibration baseline (if available) else rolling mean
-                if len(self.bpm_history) >= 10:
-                    cal_hr = self.calibrate.get('bpm', {}).get('mean', 0.0) if hasattr(self, 'calibrate') else 0.0
-                    hr_baseline = cal_hr if cal_hr > 0.0 else sum(self.bpm_history) / len(self.bpm_history)
-                    cal_hr_std = self.calibrate.get('bpm', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
-                    hr_std = cal_hr_std if cal_hr_std > 0.0 else statistics.stdev(self.bpm_history)
-                    data['hr_delta'] = round((data.get('heart_rate', hr_baseline) - hr_baseline)/hr_std, 1)
-                # rr_delta: same pattern
-                if len(self.rr_history) >= 10:
-                    cal_rr = self.calibrate.get('rr', {}).get('mean', 0.0) if hasattr(self, 'calibrate') else 0.0
-                    rr_baseline = cal_rr if cal_rr > 0.0 else sum(self.rr_history) / len(self.rr_history)
-                    cal_rr_std = self.calibrate.get('rr', {}).get('std', 1.0) if hasattr(self, 'calibrate') else 1.0
-                    rr_std = cal_rr_std if cal_rr_std > 0.0 else statistics.stdev(self.rr_history)
-                    data['rr_delta'] = round((data.get('respiratory_rate', rr_baseline) - rr_baseline)/rr_std, 1)
-                    
+                    self._last_rr = round(float(rr), 1)
+                    self._last_rr_t = now
+                    self.rr_history.append(self._last_rr)
+
+            # Carry the last reading forward while it is fresh (avoids most inputs being null)
+            if self._last_hr is not None and (now - self._last_hr_t) <= self._rppg_staleness_s:
+                data['heart_rate'] = self._last_hr
+                # snapshot as list: deque is not JSON-serializable (dashboard
+                # emit), and a live reference would mutate under stored frames
+                data['bpm_history'] = list(self.bpm_history)
+                data['hr_delta'] = self._standardized_delta(self._last_hr, 'bpm', self.bpm_history)
+            if self._last_rr is not None and (now - self._last_rr_t) <= self._rppg_staleness_s:
+                data['respiratory_rate'] = self._last_rr
+                data['rr_history'] = list(self.rr_history)
+                data['rr_delta'] = self._standardized_delta(self._last_rr, 'rr', self.rr_history)
+
         emo = self.detect_emotion(faces, gray)
         if emo:
             data.update(emo)  # emotion, emotion_prob
@@ -476,10 +550,13 @@ class DataCollector:
         BLINK_MAX_MS = 500  # above this is eye closure / drowsiness, not a blink
 
         now = time.monotonic()
-        if eye < self.calibrate['ear']['threshold']:
+        eye_closed = eye < self.calibrate['ear']['threshold']
+        mouth_open = mouth > self.calibrate['mar']['threshold']
+
+        # blink detection (duration-gated; unchanged)
+        if eye_closed:
             if self._eye_closed_since == 0.0:
                 self._eye_closed_since = now
-            self.Rolleye += 1
         else:
             if self._eye_closed_since > 0.0:
                 duration_ms = (now - self._eye_closed_since) * 1000
@@ -488,22 +565,25 @@ class DataCollector:
                     self.blink_times.append(now)
             self._eye_closed_since = 0.0
 
-        if mouth > self.calibrate['mar']['threshold']:
+        # yawn detection (consecutive-frame gated; unchanged)
+        if mouth_open:
             self.mCOUNTER += 1
-            self.Rollmouth += 1
         else:
             if self.mCOUNTER >= MOUTH_AR_CONSEC_FRAMES:
                 self.yawn_count += 1
-                self.yawn_times.append(time.monotonic())
+                self.yawn_times.append(now)
             self.mCOUNTER = 0
 
-        self.Roll += 1
-        if self.Roll >= 50:
-            self.perclos = (self.Rolleye / self.Roll) + (self.Rollmouth / self.Roll) * 0.2
+        # PERCLOS over a fixed TIME window
+        self._perclos_buf.append((now, eye_closed, mouth_open))
+        while self._perclos_buf and now - self._perclos_buf[0][0] > self._perclos_window_s:
+            self._perclos_buf.popleft()
+        n_buf = len(self._perclos_buf)
+        if n_buf > 0:
+            eye_frac = sum(1 for _, e, _ in self._perclos_buf if e) / n_buf
+            mouth_frac = sum(1 for _, _, m in self._perclos_buf if m) / n_buf
+            self.perclos = eye_frac + mouth_frac * 0.2
             self.drowsiness_alert = self.perclos > 0.38
-            self.Roll = 0
-            self.Rolleye = 0
-            self.Rollmouth = 0
 
         # yawn and blink rates
         now = time.monotonic()
@@ -525,13 +605,20 @@ class DataCollector:
         # Anscombe transform to normalize yawn rate
         normalized_yawn_rate = 2*math.sqrt((self.yawn_rate*(yawn_window / 60)) + 3/8) 
         # normalize perclos
-        normalized_perclos = (self.perclos - self.calibrate.get('perclos', {}).get('mean', 0.0)) / self.calibrate.get('perclos', {}).get('std', 1.0)
+        normalized_perclos = (self.perclos - self.calibrate.get('perclos', {}).get('mean', 0.0)) / self.calibrate.get('perclos', {}).get('std', 1.0) if self.calibrate.get('perclos', {}).get('std', 1.0) > 0 else 0.0
         data['perclos'] = round(float(normalized_perclos), 3)
         data['yawn_rate'] = round(float(normalized_yawn_rate), 3)   
         data['drowsiness_alert'] = bool(self.drowsiness_alert)
         data['eye_ar'] = float(eye)
         data['mar'] = float(mouth)
         data['lab'] = [str(x) for x in (lab or [])]
+        # Raw (non-normalized) values for the dashboard display only; the model
+        # reads the normalized keys above. EAR/MAR are already raw. These extras
+        # are ignored by encode_frame and dropped from decisions.csv's schema.
+        data['gaze_score_raw'] = round(float(gaze_score), 3)          # raw gaze deviation
+        data['blink_rate_raw'] = round(float(self.blink_rate), 2)     # blinks/min
+        data['yawn_rate_raw'] = round(float(self.yawn_rate), 2)       # yawns/min
+        data['perclos_raw'] = round(float(self.perclos), 3)           # fraction [0,1]
         
     def _carla_process(self, data: Dict[str, Any]):
         # Logging-only extras default to None; overwritten below when data is available.
@@ -685,7 +772,7 @@ class DataCollector:
         if self.visual_enabled:
             self._visual_process(data)
 
-        if self.phys_enabled and 'heart_rate' not in data:
+        if self.phys_enabled:
             # No live rPPG reading this cycle — report unknown rather than
             # fabricating a value that pollutes the model input and dashboard.
             if 'heart_rate' not in data:
@@ -730,11 +817,12 @@ class DataCollector:
                 else:
                     data = self.collect_data()
                     
-                    # Add sequence for LSTM models
+                    # Add sequence for LSTM models.
+                    seq_entry = dict(data)
+                    seq_entry.pop('bpm_history', None)
+                    seq_entry.pop('rr_history', None)
                     with self._lock:
-                        self.data_history.append(dict(data))
-                        if len(self.data_history) > self.window_size:
-                            self.data_history.pop(0)
+                        self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
 
                     action = None
                     if self.decision_engine:
@@ -747,7 +835,7 @@ class DataCollector:
                         action = self.decision_engine.decide(dict(data_for_decision))
                         if self.logger and isinstance(action, dict):
                             action_for_log = dict(action)
-                            for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
+                            for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
                                 value = data.get(key)
                                 if value not in (None, ''):
                                     action_for_log.setdefault(key, value)
@@ -780,7 +868,11 @@ class DataCollector:
                 print('[DataCollector] loop error:', e)
 
             next_t += self.sampling_interval
-            time.sleep(max(0.0, min(self.sampling_interval, next_t - time.monotonic())))
+            now = time.monotonic()
+            if next_t < now: # fell behind — skip missed ticks
+                next_t = now
+            time.sleep(max(0.0, next_t - now))
+
         print("data collector stopped!")
 
     def _poll_vehicle_state(self, interval: float = 0.5) -> None:
@@ -823,16 +915,21 @@ class DataCollector:
             print(f"[DataCollector] Vehicle state polling started → {self.vehicle_state_url}")
 
     def stop(self) -> None:
-        if self.rppg_estimator:
-            self.rppg_estimator.stop()
+        # Halt the loop BEFORE stopping the rPPG estimator / releasing the
+        # camera, so no tick can touch an already-stopped resource.
         self._running = False
-        try: 
+        try:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=2.0)
             if self._state_poll_thread and self._state_poll_thread.is_alive():
                 self._state_poll_thread.join(timeout=2.0)
         except Exception:
             pass
+        if self.rppg_estimator is not None:
+            try:
+                self.rppg_estimator.stop()
+            except Exception as e:
+                print(e, "Error stopping rPPG estimator")
         self.release()
 
     def release(self) -> None:

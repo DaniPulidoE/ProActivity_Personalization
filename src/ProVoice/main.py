@@ -5,6 +5,7 @@ import sys
 import time
 import os
 import uuid
+import argparse as ap
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -47,31 +48,82 @@ class LoAZeroFallback:
         }
 
 
-def _parse_kv_argv(argv):
-    out = {}
-    for tok in argv[1:]:
-        tok = tok.strip().strip(",")
-        if not tok or "=" not in tok:
+import re as _re
+
+_ARG_KEY_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _normalize_argv(tokens):
+    """Rewrite bare ``key=value`` tokens into ``--key=value`` so argparse can
+    parse BOTH styles the project uses: ``key=value`` (README examples and
+    ``start_experiment.py``) and ``--flag value`` (CLAUDE.md). Underscores in
+    the key become dashes to match the dash-form option strings. Tokens whose
+    part before ``=`` is not a bare identifier (e.g. a ``http://…?a=b`` value)
+    are left untouched.
+    """
+    out = []
+    for tok in tokens:
+        t = tok.strip().strip(",")
+        if not t:
             continue
-        k, v = tok.split("=", 1)
-        out[k.strip().lower()] = v.strip()
+        if not t.startswith("-") and "=" in t and _ARG_KEY_RE.match(t.split("=", 1)[0]):
+            k, v = t.split("=", 1)
+            out.append(f"--{k.replace('_', '-')}={v}")
+        else:
+            out.append(t)
     return out
+
+
+def _build_parser() -> ap.ArgumentParser:
+    p = ap.ArgumentParser(
+        prog="ProVoice.main",
+        description="ProVoice decision engine + dashboard.",
+        formatter_class=ap.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--participantid", default="")
+    p.add_argument("--environment", default="")
+    p.add_argument("--secondary-task", dest="secondary_task", default="")
+    p.add_argument("--functionname", default="Adjust seat positioning")
+    p.add_argument("--emotion", "--affect", dest="emotion", default="")
+    p.add_argument("--modeltype", default="combined",
+                   help="fcd | state | combined | collection")
+    p.add_argument("--state-model", "--statemodel", dest="state_model", default="classic",
+                   help="classic | xlstm")
+    p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.5)
+    p.add_argument("--session-id", dest="session_id", default=None)
+    p.add_argument("--window", type=int, default=400,
+                   help="Frame-count cap on the model input window (safety bound).")
+    p.add_argument("--window-seconds", dest="window_seconds", type=float, default=None,
+                   help="Time span (s) of the xLSTM window; unset inherits the checkpoint's.")
+    p.add_argument("--camera-source", dest="camera_source", default="front")
+    p.add_argument("--camera-url", dest="camera_url", default="udp://127.0.0.1:8554")
+    p.add_argument("--vehicle-id", dest="vehicle_id", default=None,
+                   help="Skip vehicle_id.txt discovery when set.")
+    p.add_argument("--host", default="localhost")
+    p.add_argument("--port", type=int, default=2000)
+    p.add_argument("--carla-timeout", dest="carla_timeout", type=float, default=10.0)
+    p.add_argument("--vehicle-state-url", dest="vehicle_state_url", default=None)
+    p.add_argument("--log-path", dest="log_path", default=None,
+                   help="JSONL log of features fed to the xLSTM; unset disables.")
+    return p
+
+
+def _parse_args(argv):
+    args, unknown = _build_parser().parse_known_args(_normalize_argv(argv))
+    if unknown:
+        # Surface stray tokens instead of silently dropping them (the old
+        # key=value parser ignored anything without an '=').
+        print(f"[main] ignoring unrecognized argument(s): {unknown}")
+    return args
 
 def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int | None:
     """
-    Read the vehicle ID from src/drive/vehicle_id.txt relative to the parent directory of this file.
+    Read the vehicle ID from vehicle_id.txt in the project root (written by the Drive UI).
     """
-    # Directory of the current file, e.g., .../src/ProVoice/
-    current_file_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Parent directory, i.e., src/
-    src_dir = os.path.dirname(current_file_dir)
-
-    # Default file location: src/drive/vehicle_id.txt
-    default_path = os.path.join(src_dir, "drive", "vehicle_id.txt")
-
-    src_dir = os.path.dirname(src_dir)
-    default_path = os.path.join(src_dir, "vehicle_id.txt")
+    # Project root = two levels up from src/ProVoice/
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # vehicle id file path
+    default_path = os.path.join(project_root, "vehicle_id.txt")
 
     # Use default_path if path is not specified
     path = path or default_path
@@ -136,33 +188,32 @@ def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 
 
 
 def main():
-    args = _parse_kv_argv(sys.argv)
-    participantid = args.get("participantid", "")
-    environment = args.get("environment", "")
-    secondary_task = args.get("secondary_task", "")
-    functionname = args.get("functionname", "Adjust seat positioning")
-    emotion = args.get("emotion", args.get("affect", ""))
-    modeltype = args.get("modeltype", "combined").lower()  # fcd | state | combined
-    state_model = args.get("state_model", args.get("statemodel", "classic")).lower()
-    w_fcd = float(args.get("w_fcd", "0.5"))
-    session_id = args.get("session_id") or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    window_sz = int(args.get("window", "400"))  # frame-count cap on the model input (safety bound)
+    args = _parse_args(sys.argv[1:])
+    participantid = args.participantid
+    environment = args.environment
+    secondary_task = args.secondary_task
+    functionname = args.functionname
+    emotion = args.emotion
+    modeltype = args.modeltype.lower()  # fcd | state | combined | collection
+    state_model = args.state_model.lower()
+    w_fcd = args.w_fcd
+    session_id = args.session_id or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    window_sz = args.window  # frame-count cap on the model input (safety bound)
     # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
     # window the checkpoint was trained with (falling back to 20 s for legacy
     # checkpoints). Explicit value overrides; 0 disables the time cap, leaving
     # the rate-dependent frame-count cap only (400 frames ≈ 100 s at ~4 Hz).
-    _ws_arg = args.get("window_seconds")
-    window_seconds = float(_ws_arg) if _ws_arg not in (None, "") else None
-    camera_source = args.get("camera_source", "front")
-    camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
-    vehicle_id_arg = args.get("vehicle_id")  # optional: skip file-based discovery when set
-    host = args.get("host", "localhost")
-    port = int(args.get("port", "2000"))
-    carla_timeout = float(args.get("carla_timeout", "10.0"))
-    vehicle_state_url = args.get("vehicle_state_url")  # e.g. http://0.tcp.ngrok.io:PORT
+    window_seconds = args.window_seconds
+    camera_source = args.camera_source
+    camera_url = args.camera_url
+    vehicle_id_arg = args.vehicle_id  # optional: skip file-based discovery when set
+    host = args.host
+    port = args.port
+    carla_timeout = args.carla_timeout
+    vehicle_state_url = args.vehicle_state_url  # e.g. http://0.tcp.ngrok.io:PORT
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
-    xlstm_log = args.get("log_path") # e.g. "state_data.log"; empty/unset = disabled
+    xlstm_log = args.log_path  # e.g. "state_data.log"; empty/unset = disabled
 
     strategy = None
     fcd_engine = None
@@ -351,7 +402,7 @@ def main():
 
     data_collector.start()
 
-    config = uvicorn.Config(dashboard.app, host="0.0.0.0", port=8001, reload=False)
+    config = uvicorn.Config(dashboard.app, host="127.0.0.1", port=8001, reload=False)
     server = uvicorn.Server(config)
 
     def handle_exit(_, __):

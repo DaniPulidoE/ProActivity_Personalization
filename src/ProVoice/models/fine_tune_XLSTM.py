@@ -48,8 +48,10 @@ def main():
     ap.add_argument("--in-data",        dest="in_jsonl", required=True)
     ap.add_argument("--in-model",        dest="in_model", required=True)
     ap.add_argument("--out",       dest="out_pt",   default="trained_models/state_xlstm_finetune.pt")
-    ap.add_argument("--log",       dest="log_path", default="state_data_finetune.log",
-                    help="Path for the JSONL log of exact features fed to the xLSTM (one line per frame). Pass '' to disable.")
+    ap.add_argument("--log",       dest="log_path", default="",
+                    help="Optional path for a JSONL log of the exact features fed to the "
+                         "xLSTM (one line per frame). Off by default — pass a path to enable "
+                         "for debugging.")
     #ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch",  type=int, default=16)
@@ -198,8 +200,8 @@ def main():
         # save model if best so far (or always, for now)
         if acc > best:
             best = acc
-        # so far, save always (even if not best) - may be high variance between epochs -> decide after testing
-        save_checkpoint(model, str(outp), arch=arch)
+            # DECIDE IN HOW TO MANAGE THIS LOGIC AFTERWARDS
+            save_checkpoint(model, str(outp), arch=arch)
         print(f"[OK] saved-> {outp}")
         
     print(f"[BEST] acc={best:.3f}")

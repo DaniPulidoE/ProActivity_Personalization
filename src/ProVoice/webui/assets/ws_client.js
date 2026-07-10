@@ -27,13 +27,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if(data.frame) document.getElementById('live-image').src = 'data:image/jpeg;base64,' + data.frame;
         const banner = document.getElementById('calibration-banner');
         if (banner) banner.style.display = data.calibrating ? 'block' : 'none';
-        document.getElementById('blink-count').innerText = data.blink_count;
-        document.getElementById('yawn-count').innerText = data.yawn_count;
-        document.getElementById('perclos-score').innerText = data.perclos;
+        document.getElementById('blink-rate').innerText = data.blink_rate_raw;
+        document.getElementById('yawn-rate').innerText = data.yawn_rate_raw;
+        document.getElementById('perclos-score').innerText = data.perclos_raw;
         document.getElementById('drowsiness-status').innerText = data.drowsiness_alert ? 'YES' : 'NO';
         highlightAlerts(document.getElementById('drowsiness-status'));
 
-        document.getElementById('gaze-score').innerText = data.gaze_score;
+        document.getElementById('gaze-score').innerText = data.gaze_score_raw;
         document.getElementById('gaze-distracted').innerText = data.gaze_distracted ? 'YES' : 'NO';
         highlightAlerts(document.getElementById('gaze-distracted'));
 
