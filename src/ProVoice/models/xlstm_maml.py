@@ -1,17 +1,35 @@
-# First-order ANIL meta-training for the xLSTM LoA model.
+# ANIL meta-training for the xLSTM LoA model (second-order by default,
+# first-order as ablation via --order).
 #
 # ANIL (Raghu et al. 2020) = MAML with the inner loop restricted to the output
 # head. The inner loop here is a few PROXIMAL SGD steps on the CORN/softmax
 # head *including the L2-SP anchor term* — i.e. exactly the adaptation that is
 # deployed per-driver by fine_tune_XLSTM.py — so meta-training optimizes the
 # initialization for the adaptation procedure actually used at test time.
-# The outer loop is FIRST-ORDER (FOMAML-style, no second derivatives):
-#   - support embeddings are computed under no_grad (the gradient of the query
-#     loss w.r.t. the backbone THROUGH the inner-loop trajectory is the
-#     second-order term we deliberately drop),
-#   - the query loss is backpropagated into backbone+in_proj through the query
-#     forward pass, and the gradient w.r.t. the head INITIALIZATION is
-#     approximated by the gradient at the ADAPTED head parameters.
+# The outer loop runs in one of three modes (--order):
+#   - 'second' (default — standard ANIL as published): the inner-loop
+#     trajectory is differentiated exactly (create_graph, no detach). Support
+#     embeddings stay in the graph, so the backbone receives BOTH the query
+#     pathway and the support pathway (how the support embeddings shaped the
+#     adapted head — the term that trains the representation for
+#     adaptability). The double backward is confined to the tiny head + loss;
+#     the xLSTM backbone itself only ever does ordinary first-order backprop,
+#     so no second derivatives pass through the recurrent unroll.
+#   - 'first' (FOMAML-style ablation, FO-ANIL — Yüksel et al. 2024): support
+#     embeddings are computed under no_grad (dropping the support pathway) and
+#     the gradient w.r.t. the head INITIALIZATION is approximated by the
+#     gradient at the ADAPTED head parameters. Cheaper, immune to
+#     inner-Jacobian amplification, but biased toward joint training.
+#   - 'imaml' (implicit MAML, Rajeswaran et al. 2019): the inner problem is
+#     SOLVED to its argmin (full-batch LBFGS) and the meta-gradient comes from
+#     implicit differentiation of the stationarity condition — i.e.
+#     meta-learning the anchor of the CONVERGED L2-SP adaptation, independent
+#     of inner-lr/steps. Exact at this head size (dense Hessian solve, no
+#     CG/GGN approximation), and captures both the anchor and the support
+#     pathways. Only meaningful when λ is binding enough that the deployed
+#     fine-tune also (approximately) converges its proximal problem; the
+#     implicit gradient is biased whenever the inner solve stops early, so
+#     the solver residual is reported per epoch.
 # Head-only inner loop != meta-learning only the head: the outer loop still
 # meta-trains the whole backbone for adaptability; that is what distinguishes
 # the result from the joint-trained warm start it begins from.
@@ -147,10 +165,11 @@ def embed(model, xb: torch.Tensor, lb: torch.Tensor, device: str,
           grad: bool = False) -> torch.Tensor:
     """in_proj + backbone + last-real-frame readout (same readout as forward()).
 
-    grad=False (support / eval): no graph — in first-order ANIL the backbone
-    gradient through the inner-loop trajectory is exactly the term we drop.
-    grad=True (query): the graph through the backbone is the ONLY path by
-    which the outer loop trains the backbone.
+    grad=False (first-order support / eval): no graph — in first-order ANIL
+    the backbone gradient through the inner-loop trajectory is exactly the
+    term we drop.
+    grad=True (query; also support under --order second): the graph through
+    the backbone is how the outer loop trains the backbone.
     """
     with torch.enable_grad() if grad else torch.no_grad():
         h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
@@ -161,23 +180,135 @@ def embed(model, xb: torch.Tensor, lb: torch.Tensor, device: str,
 def adapt_head(Z: torch.Tensor, y: torch.Tensor,
                w0: torch.Tensor, b0: torch.Tensor,
                loss_fn, inner_steps: int, inner_lr: float, l2sp: float,
+               second_order: bool = False,
                ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Proximal SGD on the head only: loss + λ·||θ − θ_meta||² — the deployed
-    L2-SP adaptation with the meta head as anchor. Detaching after every step
-    makes this first-order; the returned tensors are leaves whose .grad after
-    a query-loss backward is the FOMAML head-initialization gradient.
+    L2-SP adaptation with the meta head as anchor.
+
+    second_order=False (FOMAML): anchor detached, every step detached; the
+    returned tensors are leaves whose .grad after a query-loss backward is the
+    first-order approximation of the head-initialization gradient.
+    second_order=True (standard ANIL): the trajectory stays in the graph
+    (create_graph, no detach), so a query-loss backward computes the exact
+    Jacobian-weighted gradient w.r.t. the meta head — which is both the INIT
+    and the ANCHOR here, matching deployment where the L2-SP anchor is the
+    meta head itself, so gradient also flows through the anchor pathway — and
+    w.r.t. Z (the support pathway into the backbone).
     """
-    anchor_w, anchor_b = w0.detach(), b0.detach()
-    w = anchor_w.clone().requires_grad_(True)
-    b = anchor_b.clone().requires_grad_(True)
+    if second_order:
+        anchor_w, anchor_b = w0, b0
+        w, b = w0, b0
+    else:
+        anchor_w, anchor_b = w0.detach(), b0.detach()
+        w = anchor_w.clone().requires_grad_(True)
+        b = anchor_b.clone().requires_grad_(True)
     for _ in range(inner_steps):
         logits = F.linear(Z, w, b)
         loss = loss_fn(logits, y)
         loss = loss + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum())
-        gw, gb = torch.autograd.grad(loss, (w, b))
-        w = (w - inner_lr * gw).detach().requires_grad_(True)
-        b = (b - inner_lr * gb).detach().requires_grad_(True)
+        gw, gb = torch.autograd.grad(loss, (w, b), create_graph=second_order)
+        if second_order:
+            w, b = w - inner_lr * gw, b - inner_lr * gb
+        else:
+            w = (w - inner_lr * gw).detach().requires_grad_(True)
+            b = (b - inner_lr * gb).detach().requires_grad_(True)
     return w, b
+
+
+def solve_head_proximal(Z: torch.Tensor, y: torch.Tensor,
+                        w0: torch.Tensor, b0: torch.Tensor,
+                        loss_fn, l2sp: float, max_iter: int, tol: float,
+                        ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Solve the proximal head problem argmin_θ loss(θ) + λ·||θ − θ_meta||²
+    to (near-)optimality with full-batch LBFGS. The objective is strictly
+    convex (GLM losses + the 2λI of the prox term), so the argmin is unique.
+
+    Returns (w*, b*, residual) where residual = ||∇(inner objective)|| at the
+    returned point. The implicit iMAML gradient is exact only at the argmin —
+    callers should surface residual > tol instead of silently trusting it.
+    """
+    anchor_w, anchor_b = w0.detach(), b0.detach()
+    w = anchor_w.clone().requires_grad_(True)
+    b = anchor_b.clone().requires_grad_(True)
+
+    def objective():
+        return (loss_fn(F.linear(Z, w, b), y)
+                + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum()))
+
+    opt = torch.optim.LBFGS([w, b], lr=1.0, max_iter=max_iter,
+                            tolerance_grad=0.1 * tol, tolerance_change=0.0,
+                            history_size=20, line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        loss = objective()
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    gw, gb = torch.autograd.grad(objective(), (w, b))
+    residual = float((gw.pow(2).sum() + gb.pow(2).sum()).sqrt())
+    return w.detach(), b.detach(), residual
+
+
+def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
+                    Zq: torch.Tensor, yq: torch.Tensor,
+                    w0: torch.Tensor, b0: torch.Tensor,
+                    loss_fn, l2sp: float, scale: float,
+                    max_iter: int, tol: float) -> Tuple[float, float]:
+    """One iMAML episode: implicit meta-gradients from the stationarity of
+    the proximal inner problem (Rajeswaran et al. 2019), computed exactly at
+    this head size (dense solve, no CG).
+
+    Let G(θ; ψ) = loss_s(θ; Zs) + λ·||θ − θ_meta||², θ* = argmin_θ G, and ψ
+    any meta-input (θ_meta, or Zs and through it the backbone). From
+    ∇_θ G(θ*; ψ) = 0:   dθ*/dψ = −(∇²_θ G)⁻¹ · ∂²G/∂ψ∂θ.
+    With v = (∇²_θ G)⁻¹ · ∇_θ L_q(θ*), every meta-gradient is one
+    vector-Jacobian product:  dL_q/dψ = −(∂/∂ψ)[∇_θ G(θ*; ψ) · v],
+    which yields 2λ·v for the head (θ_meta enters only the anchor term) and
+    the support pathway for the backbone (ψ = Zs) in a single backward.
+
+    Side effects: accumulates gradients into w0/b0 (.grad) and into the
+    graphs of Zs and Zq (i.e. the backbone). `scale` multiplies the query
+    loss (pass 1/meta_batch). Returns (scaled query loss, inner residual).
+    """
+    Zs_det = Zs.detach()
+    ws, bs, residual = solve_head_proximal(Zs_det, ys, w0, b0, loss_fn,
+                                           l2sp, max_iter, tol)
+
+    # Query pathway: backbone grads through Zq; g_q lands on the wl/bl leaves.
+    wl = ws.clone().requires_grad_(True)
+    bl = bs.clone().requires_grad_(True)
+    loss_q = loss_fn(F.linear(Zq, wl, bl), yq) * scale
+    loss_q.backward()
+    gq = torch.cat([wl.grad.reshape(-1), bl.grad.reshape(-1)])
+
+    # v = (∇²G at θ*)⁻¹ · g_q. The Hessian includes the prox term's +2λI, so
+    # it is PD and the dense solve is exact.
+    n_out, d = ws.shape
+    anchor_w, anchor_b = w0.detach(), b0.detach()
+    theta_star = torch.cat([ws.reshape(-1), bs.reshape(-1)])
+
+    def flat_objective(t: torch.Tensor) -> torch.Tensor:
+        wf, bf = t[:n_out * d].view(n_out, d), t[n_out * d:]
+        return (loss_fn(F.linear(Zs_det, wf, bf), ys)
+                + l2sp * (((wf - anchor_w) ** 2).sum() + ((bf - anchor_b) ** 2).sum()))
+
+    H = torch.autograd.functional.hessian(flat_objective, theta_star)
+    v = torch.linalg.solve(H, gq)
+    vw, vb = v[:n_out * d].view(n_out, d), v[n_out * d:]
+
+    # One VJP delivers the remaining meta-gradients: −(∂/∂ψ)[∇_θG · v] puts
+    # the anchor pathway into the LIVE w0/b0 (= 2λ·v·scale) and the support
+    # pathway into the backbone through Zs's graph.
+    wr = ws.clone().requires_grad_(True)
+    br = bs.clone().requires_grad_(True)
+    inner = (loss_fn(F.linear(Zs, wr, br), ys)
+             + l2sp * (((wr - w0) ** 2).sum() + ((br - b0) ** 2).sum()))
+    rw, rb = torch.autograd.grad(inner, (wr, br), create_graph=True)
+    corr = -((rw * vw).sum() + (rb * vb).sum())
+    corr.backward()
+    return float(loss_q.detach()), residual
 
 
 def adapt_head_deployed(Z: torch.Tensor, y: torch.Tensor,
@@ -235,8 +366,9 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
 
 def main():
     ap = argparse.ArgumentParser(
-        description="First-order ANIL meta-training of the xLSTM LoA model "
-                    "(head-only proximal inner loop, full-model outer loop).")
+        description="ANIL meta-training of the xLSTM LoA model "
+                    "(head-only proximal inner loop, full-model outer loop; "
+                    "--order selects exact second-order or FOMAML-style first-order).")
     ap.add_argument("--in",     dest="in_jsonl", required=True,
                     help="Multi-driver labeled JSONL (needs participantid per row).")
     ap.add_argument("--init",   dest="init_pt", default="trained_models/state_xlstm.pt",
@@ -256,14 +388,32 @@ def main():
                          "deployment match, few distinct episodes). 'any': support starts at a "
                          "random segment — a pseudo session start; more episode diversity.")
     # --- inner loop (must mirror the deployed L2-SP head adaptation) ---
-    ap.add_argument("--inner-steps", type=int, default=5)
+    ap.add_argument("--order", choices=["second", "first", "imaml"], default="second",
+                    help="'second' (standard ANIL): differentiate exactly through the inner "
+                         "loop; the backbone also receives the support-pathway gradient. "
+                         "'first' (FO-ANIL ablation): gradients taken at the adapted head, "
+                         "support embedded under no_grad — cheaper, biased toward joint training. "
+                         "'imaml': solve the inner problem to its argmin (LBFGS) and use exact "
+                         "implicit gradients — meta-learns the anchor of the CONVERGED L2-SP "
+                         "adaptation; inner-steps/inner-lr are ignored, and λ should be binding.")
+    ap.add_argument("--inner-steps", type=int, default=5,
+                    help="Head inner-loop SGD steps (orders first/second; ignored for imaml).")
     ap.add_argument("--inner-lr",    type=float, default=0.1,
                     help="Plain-SGD step size for the head inner loop (the head is a ~260-param "
-                         "GLM; SGD needs a larger lr than fine_tune_XLSTM's AdamW).")
+                         "GLM; SGD needs a larger lr than fine_tune_XLSTM's AdamW). Orders "
+                         "first/second only; ignored for imaml.")
     ap.add_argument("--l2sp",  type=float, default=0.01,
                     help="λ of the proximal/L2-SP term inside the inner loop, anchoring the "
                          "adapted head to the meta head. Keep equal to the λ used by "
                          "fine_tune_XLSTM.py at deployment so meta-training matches it.")
+    ap.add_argument("--imaml-max-iter", type=int, default=200,
+                    help="LBFGS iteration cap for the iMAML inner solve.")
+    ap.add_argument("--imaml-tol", type=float, default=1e-4,
+                    help="Gradient-norm tolerance for the iMAML inner solve. The implicit "
+                         "meta-gradient is exact only at the argmin, so episodes ending above "
+                         "this are counted and reported per epoch. Default matches float32's "
+                         "realistic LBFGS floor (~1e-4); the induced meta-gradient bias is "
+                         "~residual/(2λ), negligible when λ is binding.")
     # --- outer loop ---
     ap.add_argument("--meta-epochs",  type=int, default=60)
     ap.add_argument("--episodes",     type=int, default=200,
@@ -303,6 +453,9 @@ def main():
     rng = np.random.default_rng(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    second = args.order == "second"
+    imaml = args.order == "imaml"
+
     # checkpoint properties: context_length, head_type, window_seconds
     model, arch = load_checkpoint(args.init_pt)
     model.to(device).train()
@@ -310,7 +463,8 @@ def main():
     head_type = arch.get("head_type", "softmax")
     window_seconds = arch.get("window_seconds")
     print(f"[model] warm start from {args.init_pt}: head_type={head_type} "
-          f"context_length={context_length} window_seconds={window_seconds}")
+          f"context_length={context_length} window_seconds={window_seconds} "
+          f"order={args.order}")
     # CORN or softmax loss
     if head_type == "corn":
         loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=model.n_classes)
@@ -387,6 +541,7 @@ def main():
     for ep in range(args.meta_epochs):
         # ---- outer loop over sampled episodes ----
         ep_losses = []
+        ep_res = []  # iMAML inner-solve residuals (empty for other orders)
         # iterate through episodes (each episode has args.meta_batch drivers, each with one support/query sample)
         for start in range(0, args.episodes, args.meta_batch):
             # clip number of drivers if the last batch is smaller than meta_batch
@@ -404,32 +559,57 @@ def main():
                     query = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y)
                              for X, y in query]
 
-                # Inner: adapt the head on support (no backbone graph — first-order).
+                # Embed support/query. Support keeps its graph whenever the
+                # support pathway into the backbone is used (second/imaml);
+                # first order drops it. Query always keeps its graph.
                 xs, ys, ls = collate(support)
-                Zs = embed(model, xs, ls, device)
-                w, b = adapt_head(Zs, ys.to(device), model.head.weight, model.head.bias,
-                                  loss_fn, args.inner_steps, args.inner_lr, args.l2sp) # new weights and bias
-
-                # Outer: query loss under the ADAPTED head, backbone in the graph.
+                Zs = embed(model, xs, ls, device, grad=second or imaml)
                 xq, yq, lq = collate(query)
                 Zq = embed(model, xq, lq, device, grad=True)
-                loss_q = loss_fn(F.linear(Zq, w, b), yq.to(device)) / nb # loss with the new weights and bias on query
-                # Populates in_proj/backbone grads through Zq and leaves the
-                # FOMAML head-init gradient on the w/b leaf tensors.
-                loss_q.backward() # gradient through the backbone and the adapted head (not the original head)
-                batch_loss += float(loss_q.detach()) * nb # for logging
-                with torch.no_grad(): # modify head based on the gradient on the adapted head (FOMAML-style)
-                    for p, leaf in ((model.head.weight, w), (model.head.bias, b)):
-                        if leaf.grad is not None:
-                            if p.grad is None:
-                                p.grad = leaf.grad.clone()
-                            else:
-                                p.grad += leaf.grad
+
+                if imaml:
+                    # iMAML: solve the proximal head problem to its argmin and
+                    # accumulate the exact implicit meta-gradients (anchor,
+                    # support and query pathways) — see imaml_meta_step.
+                    lq_val, res = imaml_meta_step(
+                        Zs, ys.to(device), Zq, yq.to(device),
+                        model.head.weight, model.head.bias,
+                        loss_fn, args.l2sp, 1.0 / nb,
+                        args.imaml_max_iter, args.imaml_tol)
+                    batch_loss += lq_val * nb # for logging
+                    ep_res.append(res)
+                else:
+                    # Inner: adapt the head on support with truncated proximal SGD.
+                    w, b = adapt_head(Zs, ys.to(device), model.head.weight, model.head.bias,
+                                      loss_fn, args.inner_steps, args.inner_lr, args.l2sp,
+                                      second_order=second) # new weights and bias
+
+                    # Outer: query loss under the ADAPTED head, backbone in the graph.
+                    loss_q = loss_fn(F.linear(Zq, w, b), yq.to(device)) / nb # loss with the new weights and bias on query
+                    # Second order: this single backward computes everything exactly —
+                    # head-init grads through the inner trajectory, backbone grads
+                    # through BOTH the support and query pathways.
+                    # First order: populates in_proj/backbone grads through Zq only and
+                    # leaves the FOMAML head-init gradient on the w/b leaf tensors.
+                    loss_q.backward() # gradient through the backbone and the adapted head (not the original head)
+                    batch_loss += float(loss_q.detach()) * nb # for logging
+                    if not second:
+                        with torch.no_grad(): # modify head based on the gradient on the adapted head (FOMAML-style)
+                            for p, leaf in ((model.head.weight, w), (model.head.bias, b)):
+                                if leaf.grad is not None:
+                                    if p.grad is None:
+                                        p.grad = leaf.grad.clone()
+                                    else:
+                                        p.grad += leaf.grad
             if args.clip > 0: # gradient clipping (optional)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             meta_opt.step() # weight update
             ep_losses.append(batch_loss / nb)
         train_loss = float(np.mean(ep_losses))
+        # iMAML only: how trustworthy were the implicit gradients this epoch?
+        res_note = (f" inner_res_max={max(ep_res):.1e}"
+                    f" unconverged={sum(r > args.imaml_tol for r in ep_res)}/{len(ep_res)}"
+                    if ep_res else "")
 
         # ---- meta-validation: deployment-style adaptation on held-out drivers ----
         if val_pids:
@@ -446,7 +626,7 @@ def main():
             val_mae, val_qwk = float(np.mean(maes)), float(np.mean(qwks))
             print(f"[epoch {ep:02d}] query_loss={train_loss:.4f} "
                   f"val_MAE={val_mae:.3f} val_QWK={val_qwk:.3f} "
-                  f"(drivers={len(val_pids)}, K={val_ks})")
+                  f"(drivers={len(val_pids)}, K={val_ks}){res_note}")
             if val_mae < best_val:
                 best_val = val_mae
                 bad_epochs = 0
@@ -458,7 +638,7 @@ def main():
                     print(f"[stop] no val-MAE improvement in {args.patience} epochs.")
                     break
         else:
-            print(f"[epoch {ep:02d}] query_loss={train_loss:.4f}")
+            print(f"[epoch {ep:02d}] query_loss={train_loss:.4f}{res_note}")
             save_checkpoint(model, str(outp), arch=arch)
 
     if val_pids:
