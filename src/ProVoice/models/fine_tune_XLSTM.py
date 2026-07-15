@@ -13,6 +13,7 @@ from ProVoice.models.xlstm_model import (
     logits_to_probs,
 )
 from ProVoice.models.xlstm_model import _as01
+from ProVoice.models.laplace_head import LaplacePosterior, attach_laplace_to_checkpoint
 from coral_pytorch.losses import corn_loss
 
 from ProVoice.models.train_XLSTM import (
@@ -69,11 +70,18 @@ def main():
                     help="Fraction of the non-validation segments (earliest first) used for "
                          "training. Sweep this (e.g. 0.2, 0.5, 1.0) to measure personalization "
                          "vs. data collection time against the fixed validation tail.")
+    ap.add_argument("--laplace", action="store_true",
+                    help="After training, fit a Laplace posterior over the adapted CORN head "
+                         "(exact per-unit Hessian on the training embeddings, prior precision "
+                         "from --l2sp) and store it inside the output checkpoint. Requires a "
+                         "CORN population checkpoint and --l2sp > 0.")
     args = ap.parse_args()
     if not (0.0 < args.val_frac < 1.0):
         raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train-frac must be in (0, 1], got {args.train_frac}")
+    if args.laplace and args.l2sp <= 0.0:
+        raise ValueError("--laplace requires --l2sp > 0 (the L2-SP anchor defines the prior).")
     
     # seed and cuda
     set_seed(args.seed)
@@ -131,6 +139,10 @@ def main():
     # population training is a checkpoint property, not a CLI choice here.
     window_seconds = arch.get("window_seconds")
     print(f"[model] head_type={head_type} window_seconds={window_seconds} (from checkpoint)")
+    if args.laplace and head_type != "corn":
+        raise ValueError(
+            f"--laplace requires a CORN population checkpoint, got head_type={head_type!r}."
+        )
     
     # create dataset
     try:
@@ -205,6 +217,19 @@ def main():
         print(f"[OK] saved-> {outp}")
         
     print(f"[BEST] acc={best:.3f}")
+
+    if args.laplace:
+        # The Laplace expansion is only valid at the head being shipped: the
+        # in-memory model holds the LAST epoch, but the checkpoint holds the
+        # best one — reload it and fit on the same adaptation embeddings.
+        best_model, _ = load_checkpoint(str(outp))
+        posterior = LaplacePosterior.fit(
+            best_model.head, Ztr.cpu(), ytr.cpu(),
+            l2sp=args.l2sp, n_classes=best_model.n_classes,
+        )
+        attach_laplace_to_checkpoint(str(outp), posterior)
+        print(f"[laplace] posterior over adapted CORN head attached to {outp} "
+              f"(n_cond={posterior.n_cond_examples}, tau={posterior.prior_precision:.4g})")
 
 if __name__ == "__main__":
     main()
