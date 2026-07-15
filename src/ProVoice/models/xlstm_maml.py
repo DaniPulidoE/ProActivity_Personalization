@@ -34,6 +34,20 @@
 # meta-trains the whole backbone for adaptability; that is what distinguishes
 # the result from the joint-trained warm start it begins from.
 #
+# Outer-loop optimization (decision record: docs/meta_optimization_options.md;
+# neither knob touches the deployed adaptation or the two-arm comparison):
+#   - --outer-opt (default nadam): NAdam's Nesterov look-ahead (Dozat 2016;
+#     LaANIL, Tammisetti et al. 2024) damps oscillation from noisy
+#     meta-gradients — the realistic failure mode at ~15 tasks. Chosen over
+#     cosine LR annealing, whose late-schedule payoff is neutralized here by
+#     best-checkpoint selection + early stopping.
+#   - --fo-warmup-epochs: derivative-order annealing (MAML++, Antoniou et al.
+#     2019) — the first N meta-epochs run in first-order mode before switching
+#     to the requested --order. FO's conservative bias makes it a stabilizing
+#     pretraining stage; MAML++ reports no gradient explosions under DA where
+#     second-order-only runs were unstable. This is the designated remedy if
+#     the pre-registered instability criterion fires.
+#
 # Episode design: support = temporally CONTIGUOUS block of
 # K ∈ [k-min, k-max] segments, query = the segments immediately AFTER it —
 # never a random support/query split, which would leak within-session
@@ -406,6 +420,12 @@ def main():
                     help="λ of the proximal/L2-SP term inside the inner loop, anchoring the "
                          "adapted head to the meta head. Keep equal to the λ used by "
                          "fine_tune_XLSTM.py at deployment so meta-training matches it.")
+    ap.add_argument("--fo-warmup-epochs", type=int, default=0,
+                    help="Derivative-order annealing (MAML++): run the first N meta-epochs "
+                         "in first-order mode, then switch to the requested --order. 0 = off. "
+                         "Stabilizer for --order second/imaml (no-op for --order first); "
+                         "keep --patience comfortably larger than the epochs remaining after "
+                         "the switch, since val-MAE may transiently worsen at the transition.")
     ap.add_argument("--imaml-max-iter", type=int, default=200,
                     help="LBFGS iteration cap for the iMAML inner solve.")
     ap.add_argument("--imaml-tol", type=float, default=1e-4,
@@ -421,8 +441,13 @@ def main():
     ap.add_argument("--meta-batch",   type=int, default=4,
                     help="Episodes averaged into one outer update.")
     ap.add_argument("--outer-lr",     type=float, default=1e-4,
-                    help="AdamW lr for backbone+in_proj+head init. Keep small: this is a "
-                         "warm-started refinement toward adaptability, not training from scratch.")
+                    help="Meta-optimizer lr for backbone+in_proj+head init. Keep small: this is "
+                         "a warm-started refinement toward adaptability, not training from scratch.")
+    ap.add_argument("--outer-opt", choices=["nadam", "adamw"], default="nadam",
+                    help="Meta-optimizer. 'nadam' (default): Nesterov look-ahead momentum — "
+                         "damps meta-gradient oscillation from few tasks (LaANIL 2024, "
+                         "Dozat 2016). 'adamw' reproduces the pre-2026-07-13 behavior. "
+                         "Both run with weight_decay=0 (the L2-SP anchor is the regularizer).")
     ap.add_argument("--clip",         type=float, default=1.0, help="Grad-norm clip (0 disables).")
     # --- meta-validation / early stopping ---
     ap.add_argument("--val-pids", default="",
@@ -447,14 +472,21 @@ def main():
     args = ap.parse_args()
     if not (1 <= args.k_min <= args.k_max):
         raise ValueError(f"Need 1 <= k-min <= k-max, got {args.k_min}, {args.k_max}")
+    if args.fo_warmup_epochs < 0:
+        raise ValueError(f"--fo-warmup-epochs must be >= 0, got {args.fo_warmup_epochs}")
+    if args.fo_warmup_epochs > 0 and args.order == "first":
+        print("[warn] --fo-warmup-epochs has no effect with --order first (already first-order).")
+    if args.fo_warmup_epochs >= args.meta_epochs and args.order != "first":
+        print(f"[warn] --fo-warmup-epochs ({args.fo_warmup_epochs}) >= --meta-epochs "
+              f"({args.meta_epochs}): the requested order '{args.order}' will never run.")
 
     # seed and cuda
     set_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    second = args.order == "second"
-    imaml = args.order == "imaml"
+    # The effective order is per-epoch (derivative-order annealing); see the
+    # top of the meta-epoch loop.
 
     # checkpoint properties: context_length, head_type, window_seconds
     model, arch = load_checkpoint(args.init_pt)
@@ -464,7 +496,9 @@ def main():
     window_seconds = arch.get("window_seconds")
     print(f"[model] warm start from {args.init_pt}: head_type={head_type} "
           f"context_length={context_length} window_seconds={window_seconds} "
-          f"order={args.order}")
+          f"order={args.order}"
+          + (f" (first-order warm-up for {args.fo_warmup_epochs} epoch(s))"
+             if args.fo_warmup_epochs > 0 and args.order != "first" else ""))
     # CORN or softmax loss
     if head_type == "corn":
         loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=model.n_classes)
@@ -527,8 +561,10 @@ def main():
 
     # collate
     collate = make_collate(context_length)
-    # optimizer
-    meta_opt = torch.optim.AdamW(model.parameters(), lr=args.outer_lr, weight_decay=0.0)
+    # meta-optimizer (weight_decay=0 in both: the L2-SP anchor is the regularizer)
+    opt_cls = torch.optim.NAdam if args.outer_opt == "nadam" else torch.optim.AdamW
+    meta_opt = opt_cls(model.parameters(), lr=args.outer_lr, weight_decay=0.0)
+    print(f"[opt] outer optimizer: {args.outer_opt} (lr={args.outer_lr})")
     # output file
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
 
@@ -539,6 +575,13 @@ def main():
     best_val = float("inf")
     bad_epochs = 0
     for ep in range(args.meta_epochs):
+        # Derivative-order annealing (MAML++)
+        warm = ep < args.fo_warmup_epochs
+        second = args.order == "second" and not warm
+        imaml = args.order == "imaml" and not warm
+        if args.order != "first" and args.fo_warmup_epochs > 0 and ep == args.fo_warmup_epochs:
+            print(f"[order] first-order warm-up done -> switching to '{args.order}'")
+
         # ---- outer loop over sampled episodes ----
         ep_losses = []
         ep_res = []  # iMAML inner-solve residuals (empty for other orders)
