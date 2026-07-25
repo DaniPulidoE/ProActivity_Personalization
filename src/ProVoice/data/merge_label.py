@@ -7,7 +7,7 @@ def parse_labels_csv(path: str):
     m = {}
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        # 强制只接受五列 Level_*（不再接受 loa 或 label 字段）
+        # Strictly accept only the five Level_* columns (loa and label fields are no longer accepted)
         miss = [k for k in (["segment_id"]+LEVELS) if k not in r.fieldnames]
         if miss:
             raise ValueError(f"labels.csv is missing columns: {miss}, required columns: ['segment_id']+Level_1..Level_5")
@@ -15,7 +15,7 @@ def parse_labels_csv(path: str):
             sid = str(row.get("segment_id","")).strip()
             if not sid: continue
             vec = [int(float(row[k])) for k in LEVELS]
-            # 归一到 0/1
+            # Normalise to 0/1
             vec = [1 if v>=1 else 0 for v in vec]
             m[sid] = vec
     if not m:
@@ -39,7 +39,8 @@ def main():
             if not line: continue
             try:
                 obj = json.loads(line)
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to parse JSON line: {e}")
                 continue
             cnt_all += 1
             sid = str(obj.get("segment_id","")).strip()

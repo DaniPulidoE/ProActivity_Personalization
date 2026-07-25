@@ -53,6 +53,7 @@ dependencies = [
     "einops",
     "dacite",
     "omegaconf",
+    "coral-pytorch>=1.4.0",
 ]
 
 [tool.uv]

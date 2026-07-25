@@ -85,6 +85,7 @@ try:
     from pygame.locals import K_F1
     from pygame.locals import K_LEFT
     from pygame.locals import K_PERIOD
+    from pygame.locals import K_RETURN
     from pygame.locals import K_RIGHT
     from pygame.locals import K_SLASH
     from pygame.locals import K_SPACE
@@ -274,6 +275,49 @@ def _load_latest_system_decision_snapshot(session_id=''):
         return {}
     return {}
 
+""" Alternative (more efficient - doesn't read the whole decisions.csv file each time). Need to test it before uncommenting it.
+def _load_latest_system_decision_snapshot(session_id=''):
+    global _decisions_file_offset, _decisions_last_match
+    path = os.path.join(os.getcwd(), 'data', 'decisions.csv')
+
+    if not os.path.exists(path):
+        return _decisions_last_match
+
+    # If the file shrank (deleted and recreated mid-session), reset.
+    if os.path.getsize(path) < _decisions_file_offset:
+        _decisions_file_offset = 0
+
+    if os.path.getsize(path) == 0:
+        return _decisions_last_match
+
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            # Always read the header from byte 0 — cheap (one line).
+            header_reader = csv.DictReader(f)
+            fieldnames = header_reader.fieldnames   # advances f to just after header
+            if not fieldnames:
+                return _decisions_last_match
+
+            # Seek to where we stopped last time.
+            # On first call _decisions_file_offset == 0, so f is already
+            # positioned just after the header — the seek is skipped.
+            if _decisions_file_offset > 0:
+                f.seek(_decisions_file_offset)
+
+            # Second DictReader reuses the open file but gets fieldnames
+            # explicitly so it doesn't try to re-read the header line.
+            for row in csv.DictReader(f, fieldnames=fieldnames):
+                if session_id and row.get('session_id') not in (None, '', session_id):
+                    continue
+                _decisions_last_match = row   # keep updating — we want the last one
+
+            _decisions_file_offset = f.tell()  # save position for next call
+
+    except Exception:
+        _decisions_file_offset = 0  # corrupted state — start over next call
+
+    return _decisions_last_match
+"""
 
 def _normalize_csv_value(value):
     if isinstance(value, (dict, list, tuple)):
@@ -304,6 +348,85 @@ def append_user_loa_selection(selection_row):
         writer.writerow(row)
 
 
+def _set_world_frozen(world, frozen):
+    """Freeze/unfreeze the whole scene while the LoA popup is open.
+
+    The experiment runs in CARLA async mode, where the server free-runs and a
+    brake control only makes the ego *coast* to a stop while NPC traffic keeps
+    driving.
+
+    We deliberately do NOT toggle ``set_simulate_physics`` here: disabling and
+    re-enabling a vehicle's physics resets its drivetrain state, so the ego
+    comes back gutless (sluggish acceleration, lower top speed). Instead we use
+    CARLA's constant-velocity hold, which pins each vehicle at 0 m/s server-side
+    every tick while leaving the engine, gearbox and wheels fully alive. On
+    resume we release the hold and restore each vehicle's saved velocity, so the
+    ego keeps the speed it had before the popup and accelerates exactly as
+    before. No-ops harmlessly if the world/actor query fails.
+    """
+    if world is None or getattr(world, 'world', None) is None:
+        return
+    try:
+        vehicles = world.world.get_actors().filter('vehicle.*')
+    except Exception:
+        return
+
+    if frozen:
+        saved = {}
+        for actor in vehicles:
+            try:
+                saved[actor.id] = (actor.get_velocity(), actor.get_angular_velocity())
+                actor.enable_constant_velocity(carla.Vector3D(0, 0, 0))
+            except Exception:
+                pass
+        world._frozen_velocities = saved
+    else:
+        saved = getattr(world, '_frozen_velocities', {})
+        for actor in vehicles:
+            try:
+                actor.disable_constant_velocity()
+                vel, ang = saved.get(actor.id, (None, None))
+                if vel is not None:
+                    actor.set_target_velocity(vel)
+                    actor.set_target_angular_velocity(ang)
+            except Exception:
+                pass
+        world._frozen_velocities = {}
+
+
+# --- LoA selection via the steering wheel -------------------------------------
+# The paddle shifters move the highlight and a front button confirms. Button
+# indices are device-specific, so run scripts/map_wheel_buttons.py once and paste
+# its output here. A D-pad is also accepted if the wheel has one, but this rig's
+# G25 has no hat on the rim, so the paddles are the real navigation.
+#
+# The highlight deliberately starts on NO option — a pre-selected default would
+# anchor the driver's answer — and does not wrap around, so repeated presses
+# cannot jump from 0 straight to 4.
+LOA_WHEEL_BUTTON_CONFIRM = 6
+LOA_WHEEL_BUTTON_PREV = 5
+LOA_WHEEL_BUTTON_NEXT = 4
+
+# The other front button closes the simulation, exactly like the window's X.
+# Unlike the three above, this is honoured everywhere — start screen, driving,
+# and during an LoA prompt — not only while a selection is open.
+WHEEL_BUTTON_QUIT = 7
+
+# Index == the LoA value that gets logged.
+LOA_LABELS = (
+    '0: None (No assistive action is taken)',
+    '1: Suggest (Give Suggestion)',
+    '2: Ask Approval (Ask for user confirmation)',
+    '3: Auto with Veto (Execute automatically but user can veto)',
+    '4: Auto (Fully automatic)',
+)
+
+# Cursor position of the trailing "confirm" row. The driver may mark SEVERAL
+# acceptable LoAs, so the confirm button has to both toggle and submit; parking
+# the cursor on a dedicated row separates the two without a second button.
+CONFIRM_ROW = len(LOA_LABELS)
+
+
 class LoASelectionPopup(object):
     def __init__(self, width, height, interval_seconds=20):
         self.interval_ms = int(interval_seconds * 1000)
@@ -319,6 +442,16 @@ class LoASelectionPopup(object):
         self.window_end_timestamp = ''
         self.width = width
         self.height = height
+        # Cursor row (None until the driver moves it, so nothing is anchored),
+        # and the set of LoAs marked acceptable — more than one is allowed.
+        self.selected = None
+        self.chosen = set()
+        self.wheel_enabled = False
+        # Paddle/confirm indices are device-specific; without them the wheel
+        # cannot drive the popup and we fall back to the keyboard.
+        self.wheel_mapped = (LOA_WHEEL_BUTTON_CONFIRM is not None
+                             and LOA_WHEEL_BUTTON_PREV is not None
+                             and LOA_WHEEL_BUTTON_NEXT is not None)
         self._title_font = pygame.font.Font(pygame.font.get_default_font(), 30)
         self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
         self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
@@ -334,6 +467,9 @@ class LoASelectionPopup(object):
 
     def open(self, now_ms):
         self.active = True
+        # Never carry a choice over from the last window.
+        self.selected = None
+        self.chosen = set()
         self.prompt_started_ms = now_ms
         self.window_idx += 1
         self.window_start_ms = max(self.session_started_ms, now_ms - self.interval_ms)
@@ -349,15 +485,83 @@ class LoASelectionPopup(object):
         self.active = False
         self.next_prompt_ms = now_ms + self.interval_ms
 
+    def _move(self, direction):
+        """Move the cursor, entering the list from whichever end was pressed.
+
+        The cursor spans the five LoA rows plus a trailing CONFIRM row, because
+        the wheel only has one free front button: it toggles the LoA under the
+        cursor, and submits when the cursor is parked on CONFIRM.
+        """
+        if self.selected is None:
+            self.selected = 0 if direction > 0 else CONFIRM_ROW
+        else:
+            self.selected = max(0, min(CONFIRM_ROW, self.selected + direction))
+
+    def _toggle(self, loa):
+        if loa in self.chosen:
+            self.chosen.discard(loa)
+        else:
+            self.chosen.add(loa)
+
+    def _activate(self):
+        """Act on the cursor row. Returns the submitted LoAs, or None."""
+        if self.selected is None:
+            return None
+        if self.selected == CONFIRM_ROW:
+            # Submitting nothing would write an empty label, so it is a no-op.
+            return sorted(self.chosen) if self.chosen else None
+        self._toggle(self.selected)
+        return None
+
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             return 'quit', None
-        if event.type != pygame.KEYDOWN:
+
+        # Keyboard stays available regardless of the wheel.
+        if event.type == pygame.KEYDOWN:
+            if event.key == K_ESCAPE:
+                return 'quit', None
+            if event.unicode in ('0', '1', '2', '3', '4'):
+                # Number keys toggle rather than submit — otherwise a second
+                # LoA could never be added from the keyboard.
+                self._toggle(int(event.unicode))
+                return None, None
+            if event.key in (K_LEFT, K_a):
+                self._move(-1)
+            elif event.key in (K_RIGHT, K_d):
+                self._move(1)
+            elif event.key == K_SPACE:
+                submitted = self._activate()
+                if submitted:
+                    return 'select', submitted
+            elif event.key == K_RETURN and self.chosen:
+                return 'select', sorted(self.chosen)
             return None, None
-        if event.key == K_ESCAPE:
-            return 'quit', None
-        if event.unicode in ('0', '1', '2', '3', '4'):
-            return 'select', int(event.unicode)
+
+        if not self.wheel_enabled:
+            return None, None
+
+        if event.type == pygame.JOYHATMOTION:
+            # value is (x, y); x returns to 0 on release, which we ignore.
+            x = event.value[0]
+            if x:
+                self._move(1 if x > 0 else -1)
+            return None, None
+
+        if event.type == pygame.JOYBUTTONDOWN:
+            # Checked first so quitting works even when navigation is unmapped.
+            if WHEEL_BUTTON_QUIT is not None and event.button == WHEEL_BUTTON_QUIT:
+                return 'quit', None
+            if LOA_WHEEL_BUTTON_PREV is not None and event.button == LOA_WHEEL_BUTTON_PREV:
+                self._move(-1)          # left paddle -> lower LoA
+            elif LOA_WHEEL_BUTTON_NEXT is not None and event.button == LOA_WHEEL_BUTTON_NEXT:
+                self._move(1)           # right paddle -> higher LoA
+            elif (LOA_WHEEL_BUTTON_CONFIRM is not None
+                    and event.button == LOA_WHEEL_BUTTON_CONFIRM):
+                submitted = self._activate()
+                if submitted:
+                    return 'select', submitted
+
         return None, None
 
     def render(self, display):
@@ -366,23 +570,59 @@ class LoASelectionPopup(object):
         overlay.fill((0, 0, 0))
         display.blit(overlay, (0, 0))
 
-        lines = [
+        if self.wheel_enabled and self.wheel_mapped:
+            hint = 'Paddles move  -  front button ticks a level  -  then pick CONFIRM'
+        elif self.wheel_enabled:
+            # Unmapped buttons would make the whole wheel feel dead; say so
+            # rather than leaving the driver pressing an inert control.
+            hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
+                    'Use number keys 0-4 for now.')
+        else:
+            hint = 'Number keys 0-4 tick a level, ENTER confirms'
+
+        header = [
             (self._title_font, 'Level of Proactivity Selection Required'),
-            (self._text_font, 'Please choose the proper Level of Proactivity for the last 20 seconds.'),
-            (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
-            (self._small_font, '0: None (No assistive action is taken)'),
-            (self._small_font, '1: Suggest (Give Suggestion)'),
-            (self._small_font, '2: Ask Approval (Ask for user confirmation)'),
-            (self._small_font, '3: Auto with Veto (Execute automatically but user can veto)'),
-            (self._small_font, '4: Auto (Fully automatic)'),
+            (self._text_font, 'Mark EVERY Level of Proactivity you would accept for the last 20 seconds.'),
+            (self._text_font, hint),
         ]
 
-        y = int(self.height * 0.35)
-        for font, text in lines:
+        y = int(self.height * 0.32)
+        for font, text in header:
             surface = font.render(text, True, (255, 255, 255))
             rect = surface.get_rect(center=(self.width // 2, y))
             display.blit(surface, rect)
             y += 45
+
+        # Markers as well as colour, so the state survives a projector or a
+        # colour-blind participant: [x] is ticked, '>' is the cursor.
+        for idx, label in enumerate(LOA_LABELS):
+            under_cursor = (idx == self.selected)
+            ticked = idx in self.chosen
+            text = '%s %s' % ('[x]' if ticked else '[ ]', label)
+            if under_cursor:
+                text = '> %s <' % text
+            if ticked:
+                colour = (120, 240, 150)
+            elif under_cursor:
+                colour = (255, 220, 0)
+            else:
+                colour = (255, 255, 255)
+            surface = self._small_font.render(text, True, colour)
+            rect = surface.get_rect(center=(self.width // 2, y))
+            display.blit(surface, rect)
+            y += 45
+
+        if self.chosen:
+            confirm_text = 'CONFIRM (%s)' % ', '.join(str(v) for v in sorted(self.chosen))
+            confirm_colour = (255, 220, 0) if self.selected == CONFIRM_ROW else (200, 200, 200)
+        else:
+            confirm_text = 'CONFIRM (tick at least one level first)'
+            confirm_colour = (140, 140, 140)
+        if self.selected == CONFIRM_ROW:
+            confirm_text = '> %s <' % confirm_text
+        surface = self._text_font.render(confirm_text, True, confirm_colour)
+        rect = surface.get_rect(center=(self.width // 2, y + 12))
+        display.blit(surface, rect)
 
 
 class StartScreenOverlay(object):
@@ -402,6 +642,10 @@ class StartScreenOverlay(object):
 
     def handle_event(self, event):
         if event.type == pygame.QUIT:
+            return 'quit'
+        if (event.type == pygame.JOYBUTTONDOWN
+                and WHEEL_BUTTON_QUIT is not None
+                and event.button == WHEEL_BUTTON_QUIT):
             return 'quit'
         if event.type == pygame.KEYDOWN and event.key == K_ESCAPE:
             return 'quit'
@@ -682,13 +926,41 @@ class World(object):
 # ==============================================================================
 
 
+# --- Steering wheel axis mapping ---------------------------------------------
+# Two layouts exist depending on how the wheel enumerates:
+#
+#   NATIVE (Logitech Gaming Software running, G25 = USB PID 0xC299): four axes,
+#   one per pedal. Pedals rest at +1.0 and travel to -1.0 when fully pressed.
+#
+#   COMPATIBILITY ("Driving Force", PID 0xC294 — what you get with no Logitech
+#   driver installed): two axes only. Throttle and brake are SUMMED onto a
+#   single axis resting at centre, so they cannot be pressed independently and
+#   pressing both cancels out. 240 deg of steering travel instead of 900, no FFB.
+#
+# We pick the layout from the axis count at runtime, so the same build works
+# either way. If throttle and brake come out swapped in compatibility mode, flip
+# the sign of WHEEL_COMBINED_THROTTLE_SIGN — that is the only knob needed.
+WHEEL_AXIS_STEER = 0
+WHEEL_AXIS_THROTTLE = 1       # native only
+WHEEL_AXIS_BRAKE = 2          # native only
+WHEEL_AXIS_COMBINED = 1       # compatibility only
+WHEEL_COMBINED_THROTTLE_SIGN = -1.0  # which direction of the combined axis is throttle
+WHEEL_STEER_DEADZONE = 0.02
+WHEEL_PEDAL_DEADZONE = 0.05
+WHEEL_STEER_LIMIT = 1.0       # keyboard caps at 0.7; a wheel should use full lock
+
+
 class KeyboardControl(object):
-    """Class that handles keyboard input."""
-    def __init__(self, world, start_in_autopilot, control_mode='test'):
+    """Class that handles keyboard input, and steering wheel input when present."""
+    def __init__(self, world, start_in_autopilot, control_mode='test', use_wheel=True):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
         self._control_mode = control_mode  # 'test' or 'full'
+        self._wheel = None
+        self._wheel_pedals_combined = False
+        if use_wheel:
+            self._init_wheel()
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
@@ -704,6 +976,44 @@ class KeyboardControl(object):
         self._steer_cache = 0.0
         if self._control_mode == 'full':
             world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
+        if self._wheel is not None:
+            world.hud.notification(
+                "Steering wheel: %s (%s pedals)" % (
+                    self._wheel.get_name(),
+                    "combined" if self._wheel_pedals_combined else "separate"),
+                seconds=4.0)
+
+    @property
+    def has_wheel(self):
+        return self._wheel is not None
+
+    def _init_wheel(self):
+        """Bind the first attached wheel, or stay on keyboard if there is none."""
+        try:
+            pygame.joystick.init()
+            if pygame.joystick.get_count() == 0:
+                print("[INFO] No steering wheel detected — using keyboard control.")
+                return
+            js = pygame.joystick.Joystick(0)
+            js.init()
+            axes = js.get_numaxes()
+            if axes < 2:
+                print("[WARN] '%s' reports only %d axis/axes — too few to drive; "
+                      "using keyboard control." % (js.get_name(), axes))
+                return
+            self._wheel = js
+            # Fewer than three axes means the pedals share one axis.
+            self._wheel_pedals_combined = axes < 3
+            print("[INFO] Steering wheel: '%s' (%d axes, %d buttons)"
+                  % (js.get_name(), axes, js.get_numbuttons()))
+            if self._wheel_pedals_combined:
+                print("[WARN] Wheel is in COMPATIBILITY mode: throttle and brake share "
+                      "one axis (cannot be pressed independently), reduced steering "
+                      "range, no force feedback. Install Logitech Gaming Software to "
+                      "get native mode with separate pedal axes.")
+        except Exception as e:
+            print("[WARN] Steering wheel init failed (%s) — using keyboard control." % e)
+            self._wheel = None
 
     def parse_events(self, client, world, clock, sync_mode, events=None):
         if isinstance(self._control, carla.VehicleControl):
@@ -711,6 +1021,11 @@ class KeyboardControl(object):
         event_list = events if events is not None else pygame.event.get()
         for event in event_list:
             if event.type == pygame.QUIT:
+                return True
+            elif (event.type == pygame.JOYBUTTONDOWN
+                    and WHEEL_BUTTON_QUIT is not None
+                    and event.button == WHEEL_BUTTON_QUIT):
+                # Same effect as closing the window.
                 return True
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
@@ -905,7 +1220,12 @@ class KeyboardControl(object):
 
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+                if self._wheel is not None:
+                    # Wheel owns steer/throttle/brake; the keyboard would fight it
+                    # (it zeroes throttle on every frame no key is held).
+                    self._parse_vehicle_wheel()
+                else:
+                    self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
                 self._control.reverse = self._control.gear < 0
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
@@ -933,6 +1253,47 @@ class KeyboardControl(object):
                 world.player.apply_control(self._control)
 
         self._lights = current_lights
+
+    def _parse_vehicle_wheel(self):
+        """Map wheel axes onto the vehicle control.
+
+        Steering is taken raw (no rounding) — the keyboard path quantises to 0.1,
+        which on a wheel would feel like notched steering.
+        """
+        # The caller may already have drained the event queue; pump explicitly so
+        # axis state is current regardless.
+        pygame.event.pump()
+        js = self._wheel
+
+        steer = js.get_axis(WHEEL_AXIS_STEER)
+        if abs(steer) < WHEEL_STEER_DEADZONE:
+            steer = 0.0
+        steer = max(-WHEEL_STEER_LIMIT, min(WHEEL_STEER_LIMIT, steer))
+
+        if self._wheel_pedals_combined:
+            # One axis, resting at centre: one direction is throttle, the other brake.
+            combined = js.get_axis(WHEEL_AXIS_COMBINED) * WHEEL_COMBINED_THROTTLE_SIGN
+            throttle = max(0.0, combined)
+            brake = max(0.0, -combined)
+        else:
+            # Separate axes, resting at +1.0 and travelling to -1.0 when pressed.
+            throttle = 1.0 - (js.get_axis(WHEEL_AXIS_THROTTLE) + 1.0) / 2.0
+            brake = 1.0 - (js.get_axis(WHEEL_AXIS_BRAKE) + 1.0) / 2.0
+
+        if throttle < WHEEL_PEDAL_DEADZONE:
+            throttle = 0.0
+        if brake < WHEEL_PEDAL_DEADZONE:
+            brake = 0.0
+
+        if not self._ackermann_enabled:
+            self._control.steer = round(steer, 4)
+            self._control.throttle = min(1.0, throttle)
+            self._control.brake = min(1.0, brake)
+            # Handbrake stays on the keyboard — no dedicated wheel button is mapped.
+            self._control.hand_brake = pygame.key.get_pressed()[K_SPACE]
+        else:
+            self._ackermann_control.steer = round(steer, 4)
+        self._steer_cache = steer
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         if keys[K_UP] or keys[K_w]:
@@ -1591,7 +1952,7 @@ def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2000.0)
+        client.set_timeout(20.0)
 
         sim_world = client.get_world()
         traffic_manager = client.get_trafficmanager()
@@ -1609,16 +1970,28 @@ def game_loop(args):
             print("WARNING: You are currently in asynchronous mode and could "
                   "experience some issues with the traffic simulation")
 
-        display = pygame.display.set_mode(
-            (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF)
+        flags = pygame.HWSURFACE | pygame.DOUBLEBUF
+        if args.fullscreen:
+            # Adopt the desktop resolution BEFORE anything else reads
+            # args.width/height — the HUD, the LoA popup, the start overlay and
+            # the CARLA camera sensor are all sized from them just below, so a
+            # stale 1280x720 here would letterbox the view and mis-centre the
+            # popup text.
+            info = pygame.display.Info()
+            args.width, args.height = info.current_w, info.current_h
+            flags |= pygame.FULLSCREEN
+            print("[INFO] Fullscreen at %dx%d" % (args.width, args.height))
+        display = pygame.display.set_mode((args.width, args.height), flags)
         display.fill((0,0,0))
         pygame.display.flip()
 
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, traffic_manager, args)
-        controller = KeyboardControl(world, args.autopilot, args.control)
+        controller = KeyboardControl(world, args.autopilot, args.control,
+                                     use_wheel=not args.no_wheel)
         loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
+        # Only advertise wheel controls in the popup if a wheel is actually bound.
+        loa_popup.wheel_enabled = controller.has_wheel
         start_overlay = StartScreenOverlay(args.width, args.height)
         started = False
         session_id = _current_session_id(getattr(args, 'session_id', ''))
@@ -1669,14 +2042,11 @@ def game_loop(args):
 
             if loa_popup.should_open(now_ms):
                 loa_popup.open(now_ms)
+                # Freeze the whole scene (ego + NPC traffic) so nothing moves
+                # while the driver deliberates over the LoA for the last 20 s.
+                _set_world_frozen(world, True)
 
             if loa_popup.active:
-                if isinstance(world.player, carla.Vehicle):
-                    pause_control = carla.VehicleControl()
-                    pause_control.throttle = 0.0
-                    pause_control.brake = 1.0
-                    pause_control.hand_brake = True
-                    world.player.apply_control(pause_control)
                 for event in events:
                     action, selected_loa = loa_popup.handle_event(event)
                     if action == 'quit':
@@ -1697,7 +2067,10 @@ def game_loop(args):
                             'selection_frame': world.hud.frame if world else '',
                             'selection_sim_time': round(world.hud.simulation_time, 3) if world else '',
                             'selection_speed_kmh': round(speed_kmh, 2),
-                            'user_selected_loa': selected_loa,
+                            # Several LoAs may be marked acceptable; joined with
+                            # ';' so a single value still reads as a bare int
+                            # for anything expecting the old format.
+                            'user_selected_loa': ';'.join(str(v) for v in selected_loa),
                             'system_action': system_snapshot.get('action', ''),
                             'system_level': system_snapshot.get('level', ''),
                             'system_loa': system_snapshot.get('LoA', system_snapshot.get('loa', '')),
@@ -1709,6 +2082,8 @@ def game_loop(args):
                             'system_fcd': system_snapshot.get('fcd', system_snapshot.get('FCD', '')),
                         })
                         loa_popup.close(now_ms)
+                        # Resume the simulation now that the label is captured.
+                        _set_world_frozen(world, False)
                 world.render(display)
                 loa_popup.render(display)
                 pygame.display.flip()
@@ -1759,6 +2134,9 @@ def main():
         '--res', metavar='WIDTHxHEIGHT', default='1280x720',
         help='window resolution (default: 1280x720)')
     argparser.add_argument(
+        '--fullscreen', action='store_true',
+        help='run fullscreen at the desktop resolution (overrides --res)')
+    argparser.add_argument(
         '--filter', metavar='PATTERN', default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
     argparser.add_argument(
@@ -1792,7 +2170,7 @@ def main():
         '--state-model', dest='state_model', default='',
         help='state model name for label logging')
     argparser.add_argument(
-        '--w-fcd', dest='w_fcd', default=None, type=float,
+        '--w-fcd', dest='w_fcd', default=0.7, type=float,
         help='FCD weight for label logging')
     argparser.add_argument(
         '--session-id', dest='session_id', default='',
@@ -1805,6 +2183,10 @@ def main():
         choices=['test', 'full'],
         default='test',
         help='Control mode: "test" for basic controls, "full" for all controls (default: test)')
+    argparser.add_argument(
+        '--no-wheel',
+        action='store_true',
+        help='Ignore any attached steering wheel and force keyboard control')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]

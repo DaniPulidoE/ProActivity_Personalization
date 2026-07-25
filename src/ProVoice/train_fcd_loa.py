@@ -26,7 +26,8 @@ def load_csv(path: pathlib.Path):
             try:
                 feats = [float(row[k]) for k in FEATS]
                 y = [int(float(row[k])) for k in LEVELS]
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to process row: {e}")
                 continue
             X.append(feats)
             Y.append(y)
@@ -45,7 +46,8 @@ def build_model():
             reg_lambda=1.0
         )
         return OneVsRestClassifier(base)
-    except NotImplementedError:
+    except Exception as e:
+        print(f"[Error] Failed to build model: {e}")
         from sklearn.ensemble import RandomForestClassifier
         return MultiOutputClassifier(RandomForestClassifier(n_estimators=400, max_depth=12, class_weight='balanced', random_state=RANDOM_SEED))
 

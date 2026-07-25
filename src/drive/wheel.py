@@ -369,6 +369,10 @@ def main():
                 if brake < PEDAL_DEADZONE:
                     brake = 0.0
                 brake = clamp(brake, 0.0, 1.0)
+                
+                forward = True   # no reverse button assigned for wheel
+                reverse = False
+                
             else:
                 # === Full WASD fallback (consistent with drive.py) ===
                 # Use GetAsyncKeyState instead of pygame.key to keep behavior consistent with drive.py
@@ -400,13 +404,11 @@ def main():
                 else:
                     throttle = 0.0
                     brake = 0.0
-                    rev = False
 
                     if forward and not reverse:
                         throttle = 0.55    # BASE_THROTTLE
                     elif reverse and not forward:
                         throttle = 0.55
-                        rev = True
 
                     # boost
                     if boost and throttle > 0.0:
@@ -414,11 +416,11 @@ def main():
 
                     throttle = clamp(throttle, 0.0, 1.0)
 
-                ctrl = carla.VehicleControl()
-                ctrl.steer = steer
-                ctrl.throttle = throttle
-                ctrl.brake = brake
-                ctrl.reverse = reverse and not forward
+            ctrl = carla.VehicleControl()
+            ctrl.steer = steer
+            ctrl.throttle = throttle
+            ctrl.brake = brake
+            ctrl.reverse = reverse and not forward
 
 
             vehicle.apply_control(ctrl)

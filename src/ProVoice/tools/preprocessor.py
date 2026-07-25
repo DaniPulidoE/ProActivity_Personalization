@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 
 def imresize(img, size):
-    # size 为 (h, w)
+    # size is (h, w)
     return np.array(Image.fromarray(img).resize((size[1], size[0]), Image.BILINEAR))
 
 def preprocess_input(x, v2=True):

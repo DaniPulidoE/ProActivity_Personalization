@@ -1,14 +1,18 @@
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, List
 import math, os
 import numpy as np
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function, resolve_function_key, adjust_fcd_by_state
 from ProVoice.models.xlstm_model import (
     encode_frame,
-    D_IN,
     DEFAULT_CONTEXT_LENGTH,
     load_checkpoint,
+    log_encoded_frames,
+    logits_to_probs,
 )
+import torch
+
 
 def _policy_from_loa(loa: int, conservative: bool = True) -> Tuple[str, str]:
     loa = max(0, min(int(loa), 4))
@@ -43,6 +47,63 @@ def _decide_from_probs(probs: List[float], method: str = "argmax", expected_shif
         return 4
     return int(max(range(len(probs)), key=lambda i: probs[i]))
 
+def _secs_of_day(ts: Any) -> Optional[float]:
+    """Parse a frame timestamp ('HH:MM:SS.fff' or full ISO) to seconds-of-day."""
+    if not ts:
+        return None
+    s = str(ts).strip()
+    from datetime import datetime
+    t = None
+    try:
+        t = datetime.fromisoformat(s).time()
+    except Exception:
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S"):
+            try:
+                t = datetime.strptime(s, fmt).time()
+                break
+            except Exception:
+                continue
+    if t is None:
+        return None
+    return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+
+
+def truncate_frames_by_seconds(seq: List[Dict[str, Any]], window_seconds: float) -> List[Dict[str, Any]]:
+    """Keep only the trailing frames whose timestamps lie within ``window_seconds``
+    of the newest frame.
+
+    The DataCollector's buffer is capped in FRAMES, so its time span depends on
+    the achieved sampling rate (measured ~4 Hz, not the nominal 20 Hz) — a
+    frame-count cap alone would feed the model ~100 s of history when it was
+    trained on 20 s label windows. Truncating by time keeps train and serve
+    aligned regardless of the actual rate.
+
+    Frames without a parseable timestamp are kept (their age is unknowable);
+    if the NEWEST frame has no parseable timestamp, the sequence is returned
+    unchanged (frame-count capping still applies upstream). Handles midnight
+    wrap-around, since frame timestamps are time-of-day only.
+    """
+    if not seq or window_seconds is None or window_seconds <= 0:
+        return seq
+    t_last = _secs_of_day(seq[-1].get("timestamp"))
+    if t_last is None:
+        return seq
+    kept: List[Dict[str, Any]] = []
+    for frame in reversed(seq):
+        t = _secs_of_day(frame.get("timestamp"))
+        if t is not None:
+            age = t_last - t
+            if age < -43200.0:      # more than half a day "in the future" → midnight wrap
+                age += 86400.0
+            elif age < 0:           # small backward clock jitter → treat as same-instant
+                age = 0.0
+            if age > window_seconds:
+                break  # buffer is chronological: everything earlier is older still
+        kept.append(frame)
+    kept.reverse()
+    return kept
+
+
 def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
 
     fn_key = resolve_function_key(fn_key_or_name)
@@ -56,7 +117,8 @@ def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]]
     }
 
 
-class BaseStrategy:
+class BaseStrategy(ABC):
+    @abstractmethod
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -70,7 +132,7 @@ class XGBoostLoAStrategy(BaseStrategy):
             import joblib
             if model_path and os.path.exists(model_path):
                 self.model = joblib.load(model_path)
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error loading FCD model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
@@ -98,7 +160,7 @@ class XGBoostLoAStrategy(BaseStrategy):
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             return {"action": action, "level": level, "LoA": loa, "message": "FCD xgboost", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
-        except NotImplementedError as e:
+        except Exception as e:
             fn = state.get("functionname") or self.default_key
             return _loa0_result(f"FCD decide error: {e}", fn)
 
@@ -115,7 +177,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
             import joblib
             if model_path and os.path.exists(model_path):
                 self.model = joblib.load(model_path)
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error loading state model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
@@ -176,7 +238,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             return {"action": action, "level": level, "LoA": loa, "message": "State model", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
-        except NotImplementedError as e:
+        except Exception as e:
             print(f"Error in state model: {e}")
             fn = state.get("functionname") or self.default_key
             fcd = get_fcd_for_function(fn)
@@ -185,25 +247,59 @@ class StateLevelsLoAStrategy(BaseStrategy):
 
 class StateXLSTMLoAStrategy(BaseStrategy):
     def __init__(self, model_path: Optional[str], default_function: str, window: int = 256, conservative: bool = True,
-                 fcd_fallback: Optional[BaseStrategy] = None):
+                 fcd_fallback: Optional[BaseStrategy] = None, log_path: Optional[str] = None,
+                 window_seconds: Optional[float] = None):
         self.model = None
         # `window` is only a fallback; the authoritative sequence length is
         # `context_length` taken from the loaded checkpoint's arch.
         self.context_length = int(window) if window else DEFAULT_CONTEXT_LENGTH
         self.ok = False
+        self.head_type = "softmax"
+        arch: Dict[str, Any] = {}
         try:
             if model_path and os.path.exists(model_path):
                 self.model, arch = load_checkpoint(model_path)
                 self.context_length = int(arch.get("context_length", self.context_length))
+                # 'corn' checkpoints emit K-1 conditional logits; logits_to_probs
+                # turns either head type into a 5-class PMF. Old checkpoints
+                # lack the key -> softmax.
+                self.head_type = str(arch.get("head_type", "softmax"))
                 self.ok = True
         except Exception as e:
             print(f"Error loading state model: {e}")
             self.model = None
             self.ok = False
         self.window = int(window)
+        # Time-based cap on the input window (seconds), matching how segments
+        # were cut at training. Precedence: explicit arg > checkpoint arch >
+        # 20 s (label-window default, for legacy checkpoints without the key).
+        # <=0 disables the cap, leaving only the frame-count cap (context_length).
+        if window_seconds is not None:
+            ws = float(window_seconds)
+        elif "window_seconds" in arch:
+            ws = arch["window_seconds"]  # may be None = trained with cap disabled
+        else:
+            ws = 20.0
+        self.window_seconds = float(ws) if ws and float(ws) > 0 else None
         self.default_key = resolve_function_key(default_function)
         self.conservative = conservative
         self.fcd_fallback = fcd_fallback
+        try:
+            self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+        except Exception as e:
+            print(f"Error opening log file: {e}")
+            self._log_fh = None
+
+    def close(self) -> None:
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def _try_fcd_fallback(self, state: Dict[str, Any], fn: str) -> Dict[str, Any]:
         fcd = get_fcd_for_function(fn)
@@ -220,16 +316,26 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             seq: List[Dict[str, Any]] = state.get("sequence") or []
             if not seq:
                 return self._try_fcd_fallback(state, fn)
-            import torch
+            # Truncate by TIME first (match the 20 s label-window semantics the
+            # model was trained on), then cap by frame count as a safety bound.
+            # No padding at inference: batch size is 1, the model is causal, and
+            # forward() without `lengths` reads the last timestep — which here is
+            # the most recent real frame. Short early-session windows are fine.
+            if self.window_seconds:
+                seq = truncate_frames_by_seconds(seq, self.window_seconds)
             Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
-            T = len(Xs)
-            if T < self.context_length:
-                # LEFT-pad with zero vectors so the last timestep is valid.
-                Xs = [np.zeros(D_IN, np.float32)] * (self.context_length - T) + Xs
+            if self._log_fh is not None:
+                # Log only the last frame (most recent driver state) to keep
+                # the file manageable at 20 Hz.
+                log_encoded_frames(
+                    self._log_fh, "infer",
+                    state.get("timestamp", ""),
+                    np.stack(Xs[-1:], axis=0),
+                )
             with torch.no_grad():
                 xb = torch.from_numpy(np.stack(Xs, 0))[None, ...]
                 logits = self.model(xb)
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
+                probs = logits_to_probs(logits, self.head_type).cpu().numpy()[0].tolist()
             loa = _decide_from_probs(probs, "argmax")
             action, level = _policy_from_loa(loa, conservative=self.conservative)
             fcd = get_fcd_for_function(fn)
@@ -241,7 +347,7 @@ class StateXLSTMLoAStrategy(BaseStrategy):
 
 
 class CombinedFusionStrategy(BaseStrategy):
-    def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.5,
+    def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.7,
                  conservative: bool = True, decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.fcd_strategy = fcd_strategy
         self.state_strategy = state_strategy

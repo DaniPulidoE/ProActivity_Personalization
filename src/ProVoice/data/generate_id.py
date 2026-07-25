@@ -1,17 +1,17 @@
 
 #   python data/generate_id.py --in data/raw_data.jsonl --out data/with_segments.jsonl --chunk 500
-#   （--chunk=0 关闭按帧数切段，仅遇到组合键变化时+1）
+#   (--chunk=0 disables frame-count-based segmentation; segment index only increments on composite-key changes)
 import argparse, json, pathlib
 
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_jsonl", required=True)
     ap.add_argument("--out", dest="out_jsonl", required=True)
-    ap.add_argument("--chunk", type=int, default=0, help="每段最大帧数，0=不按帧数切段")
-    # 组合键字段（可以改）
+    ap.add_argument("--chunk", type=int, default=0, help="Maximum frames per segment; 0 = do not split by frame count")
+    # Composite key fields (configurable)
     ap.add_argument("--keys", default="participantid,environment,secondary_task,functionname",
-                    help="用于组成段键的字段名，逗号分隔")
-    ap.add_argument("--sep", default="|", help="组合键分隔符")
+                    help="Comma-separated field names used to build the segment key")
+    ap.add_argument("--sep", default="|", help="Composite key separator")
     return ap.parse_args()
 
 def main():
@@ -29,14 +29,15 @@ def main():
             if not line: continue
             try:
                 obj = json.loads(line)
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to parse JSON line: {e}")
                 continue
 
-            # 组合键
+            # Composite key
             key_vals = [str(obj.get(k, "")).strip() for k in keys]
             key = args.sep.join(key_vals)
 
-            # 切段条件：组合键变化 或 达到 chunk 上限
+            # Segmentation condition: composite key changes or chunk size limit reached
             if key != cur_key or (args.chunk > 0 and count_in_seg >= args.chunk):
                 cur_key = key
                 seg_idx += 1

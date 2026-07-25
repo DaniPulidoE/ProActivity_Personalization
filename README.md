@@ -99,6 +99,15 @@ python src/ProVoice/main.py \
 - `data/user_loa_labels.csv` is the **user label log** written by the driving UI every 20 seconds.
 - `data/raw_data.jsonl` stores the raw multimodal context samples.
 
+A driver may mark **more than one acceptable LoA** per window. Multiple marks are
+written to `user_selected_loa` as a `;`-joined list; a single mark stays a bare
+integer, so labels recorded before multi-select still parse unchanged:
+
+| `user_selected_loa` | Meaning |
+|---|---|
+| `2` | only LoA 2 acceptable |
+| `2;3` | LoA 2 **and** 3 both acceptable |
+
 For best alignment across the two processes, use the same `session_id` in both commands.
 
 #### Building the training dataset from logged sessions
@@ -119,6 +128,11 @@ python -m ProVoice.train_XLSTM --in data/labeled_data.jsonl --out trained_models
 python -m ProVoice.train_fcd_loa     # reads data/processed_data/fcd_out.csv -> trained_models/fcd_levels.pkl
 ```
 
+`Level_1..5` is a **multi-hot** encoding of the levels the driver marked (LoA
+0–4 → `Level_1..5`). One marked level gives the familiar one-hot, so existing
+datasets are unaffected. If your labels contain multi-marks, pick a loss that
+can represent them — see [State Model](#state-model-xlstm) below.
+
 For the join to work, drive and ProVoice must share a `session_id` (use
 `start_experiment.py` or `PV_SESSION_ID`), and the camera must see the driver's
 face so the per-frame state features are populated. To dry-run the whole chain on
@@ -127,7 +141,8 @@ data under `data/testdata/`) and point `build_loa_dataset.py` at it.
 
 #### Quick Start (Recommended)
 
-Use `start_experiment.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
+Use `start_experiment.py` to generate a session ID and launch every process with
+shared parameters:
 
 ```bash
 python start_experiment.py --participantid 001 --environment city --secondary-task none \
@@ -136,11 +151,26 @@ python start_experiment.py --participantid 001 --environment city --secondary-ta
 
 This script will:
 1. Generate a unique `session_id` and save it to `.session_id`
-2. Open two new terminal windows (PowerShell on Windows, Terminal/gnome-terminal on macOS/Linux)
-3. Launch `drive_improved.py` in the first window
-4. Launch `provoice` in the second window
+2. Start NPC traffic, then `drive_improved.py`, as child processes (their output
+   is interleaved into this terminal — no extra windows are opened)
+3. **Wait for Drive to spawn the ego vehicle and publish `vehicle_id.txt`**
+4. Launch ProVoice, passing that vehicle id explicitly
+5. Monitor all children and shut the rest down if any one exits
 
-Both processes will automatically use the same session ID for data alignment.
+Step 3 replaces a fixed sleep that merely assumed the vehicle existed by then.
+Drive writes `vehicle_id.txt` only after the world tick, so its appearance is a
+real "Drive is initialised" signal. Any stale `vehicle_id.txt` is deleted before
+Drive starts, so the wait cannot be satisfied by the previous run's id, and if
+Drive dies during startup the launcher reports it immediately instead of waiting
+out the timeout.
+
+Launcher options:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--fullscreen` | off | Run the drive window fullscreen at the desktop resolution |
+| `--res WIDTHxHEIGHT` | `1280x720` | Drive window size; ignored with `--fullscreen` |
+| `--vehicle-id-timeout` | `120` | Seconds to wait for Drive to publish the vehicle id |
 
 > **Note**: Please do activate the correct Python environment before running this script.
 
@@ -184,6 +214,9 @@ The web UI dashboard displays real-time metrics and analysis.
 ```
 proactivity-main/
 ├── start_experiment.py        # Launcher script (recommended for starting both processes)
+├── scripts/
+│   ├── build_loa_dataset.py    # Logged sessions -> labelled training data
+│   └── map_wheel_buttons.py    # One-off: map steering wheel buttons for LoA input
 ├── src/
 │   ├── drive/                  # Driving simulation module
 │   │   ├── drive_improved.py   # Enhanced CARLA manual control
@@ -217,7 +250,46 @@ The State→LoA model is a **real xLSTM sequence classifier** built on the
 official [`nx-ai/xlstm`](https://github.com/NX-AI/xlstm) package
 (`xlstm==2.0.5`), trained via `src/ProVoice/train_XLSTM.py`. It consumes the
 per-frame state-feature sequence of a segment and predicts the preferred
-Level of Automation as a **single-label 5-class** output (LoA 0–4).
+Level of Automation over 5 classes (LoA 0–4).
+
+### Choosing a loss (`--loss`)
+
+| `--loss` | Head | Ordinal? | Accepts several marked LoAs? |
+|---|---|---|---|
+| `ce` (default) | softmax, 5 logits | no (nominal) | **yes** — the marked set becomes a uniform distribution |
+| `corn` | K−1 conditional logits | yes | **no** |
+| `coral` | shared weight + K−1 biases | yes | **yes** — the target is a cumulative vector |
+
+**`coral` is the option to use for multi-marked labels while keeping the ordinal
+structure.** Its loss is a sum of binary cross-entropies over the cumulative
+outputs, so the target only has to lie in [0, 1]: the driver's marked set is
+encoded as `q_k = P(y > k)` of a uniform distribution over that set. Marking
+`{2,3}` gives `[1, 1, 0.5, 0]` and `{0,4}` gives `[0.5, 0.5, 0.5, 0.5]`, so
+"two adjacent levels are fine" and "either extreme but nothing between" stay
+distinguishable — unlike independent per-class losses, where both are just two
+bits set. The mapping is invertible, so nothing about which levels were marked
+is lost, and a single mark reproduces the standard 0/1 extended label exactly.
+
+**`corn` cannot represent a marked set** — it partitions samples into hard
+conditional subsets. It does not error on a soft target either, it silently
+rounds it, so the trainer **refuses** multi-marked data on this path rather than
+training on a corrupted label.
+
+```bash
+python -m ProVoice.train_XLSTM --in data/labeled_data.jsonl \
+    --out trained_models/state_xlstm.pt --loss coral
+```
+
+The choice is baked into the checkpoint and picked up automatically by
+`fine_tune_XLSTM.py` and the decision engine. Note `--laplace` fine-tuning
+requires a **CORN** checkpoint and rejects the others.
+
+Training reports two extra metrics alongside the usual ones: **`set-acc`**
+(fraction of predictions the driver marked acceptable) and a **`MAE`** measured
+to the *nearest* marked level. Both reduce exactly to plain accuracy and MAE
+when every window marks a single level, so numbers stay comparable on
+single-label data — but checkpoint selection now optimises "nearest acceptable
+level" once multi-marks are present.
 
 It uses the CPU-compatible mLSTM `xLSTMBlockStack` path (pure PyTorch); the
 triton-based `xlstm.xlstm_large` / `mlstm_kernels` path is **not** used
@@ -309,38 +381,95 @@ Common options:
 - `--host` - CARLA server host (default: 127.0.0.1)
 - `--port` - CARLA server port (default: 2000)
 - `--res WIDTHxHEIGHT` - Window resolution (default: 1280x720)
+- `--fullscreen` - Run fullscreen at the desktop resolution (overrides `--res`)
+- `--no-wheel` - Ignore an attached steering wheel and force keyboard control
 - `--sync` - Enable synchronous mode
 - `--autopilot` - Enable autopilot
 
+The window size also drives the CARLA camera sensor resolution, so a larger
+window costs frame rate — the driver-state pipeline is what pays. If it drops
+noticeably, `--res 1920x1080` is a reasonable middle ground.
+
+### Steering Wheel
+
+A steering wheel is used automatically when one is attached; the keyboard is the
+fallback. The wheel also answers the LoA prompt, so a participant never reaches
+for the keyboard mid-drive:
+
+- **Right / left paddle** — move the cursor up / down the LoA list
+- **Front button** — tick or untick the level under the cursor
+- **Front button on the `CONFIRM` row** — submit
+- **Other front button** — close the simulation (same as the window's X)
+
+Button indices are device-specific and must be mapped once per rig:
+
+```bash
+python scripts/map_wheel_buttons.py
+```
+
+Paste its output into the constants at the top of `src/drive/drive_improved.py`.
+Until then the wheel cannot answer the prompt, and the popup says so on screen.
+
+See **[Steering Wheel Setup](docs/README_STEERING_WHEEL.md)** for axis layouts,
+compatibility vs native mode, and troubleshooting.
+
 ### Camera Options
 
-You can adjust the camera source by modifying the `camera_source` variable in `src/ProVoice/main.py`.
+The camera source is a **command-line argument** to `src/ProVoice/main.py`, not a
+variable to edit. Accepted values:
 
-##### Use the default camera (front-facing camera)
-```python
+| `camera_source` | Resolves to |
+|---|---|
+| `local` | local device index `0` |
+| a digit, e.g. `1` | that local device index |
+| `udp` | the stream at `camera_url` |
+| anything else (default `front`) | local device index `0` |
+
+```bash
+# local webcam (default)
 python src/ProVoice/main.py camera_source=local
-```
-##### Use UDP Streaming:
-```python
-python src/ProVoice/main.py camera_source=udp
-```
-You can specify the UDP streaming port (default port: 8554)
-```python
+
+# a second local camera
+python src/ProVoice/main.py camera_source=1
+
+# UDP stream (default port 8554)
 python src/ProVoice/main.py camera_source=udp camera_url=udp://127.0.0.1:8554
 ```
 
-To enable UDP streaming, run `ffmpeg` in a separate terminal on macOS or Linux:
+> **`start_experiment.py` does not forward these.** The launcher passes no camera
+> arguments, so ProVoice always falls back to local device index `0`. To use a
+> streamed camera you must start `src/ProVoice/main.py` yourself (see
+> [Manual Launch](#manual-launch-alternative)).
+
+To feed a UDP stream, run `ffmpeg` on the machine holding the camera. Note
+`udp://127.0.0.1:8554` only works when sender and receiver are the same machine;
+across machines, the receiver must listen on all interfaces (`udp://@:8554`)
+and the sender targets the receiver's LAN address.
+
 ```bash
+# Windows (DirectShow) — list devices with: ffmpeg -list_devices true -f dshow -i dummy
+ffmpeg -f dshow -i video="HD Pro Webcam C920" -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
+
+# macOS
 ffmpeg -f avfoundation -framerate 30 -i "0" -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
+
+# Linux
+ffmpeg -f v4l2 -framerate 30 -i /dev/video0 -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
 ```
+
+Streaming adds encode/decode latency and jitter to a pipeline that samples driver
+state continuously, so prefer a directly-attached camera for data collection.
 
 
 
 ## Documentation
 
 ### Setup Guides
+- **[Steering Wheel Setup](docs/README_STEERING_WHEEL.md)** - Wheel detection, button mapping, LoA input from the wheel
+- **[Drive Control Modes](docs/README_DRIVE_CONTROL_MODES.md)** - Keyboard and wheel bindings per `--control` mode
 - **[macOS Apple Silicon Setup](docs/README_macOS_carla_setup.md)** - Detailed macOS installation
 - **[Docker Setup](docs/README_macOS_docker_setup.md)** - Docker-based deployment
+- **[Personalization Notes](docs/PERSONALIZATION_NOTES.md)** - Approach ladder for per-driver adaptation
 - **[Original Documentation](docs/README_original.md)** - Archived original guide
 
 ### Additional Resources

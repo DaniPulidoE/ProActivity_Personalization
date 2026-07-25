@@ -105,29 +105,61 @@ def main() -> None:
                     "w_fcd": 0.7, "user_selected_loa": loa,
                 })
                 n_windows += 1
+                MAX_SPEED = 150
+                speed_limit = 50 if env == "city" else 120
                 fcd = get_fcd_for_function(fn)
                 for k in range(FRAMES_PER_WINDOW):
                     # frame timestamp spread across the 20 s window (well inside it)
                     ft = w_start + timedelta(seconds=1 + k * (WINDOW_S - 2) / FRAMES_PER_WINDOW)
-                    lab = ["face"] + (["phone"] if (task == "phone" and random.random() < 0.5) else [])
-                    drowsy = random.random() < 0.1
+                    speed = random.randint(20, 60) if env == "city" else random.randint(70, 130)
+                    is_night = random.random() < 0.3
+                    is_junction = random.random() < 0.2
                     frame = {
+                        # metadata
                         "session_id": sid, "participantid": pid, "environment": env,
                         "secondary_task": task, "functionname": fn,
                         "modeltype": "combined", "state_model": "xlstm", "w_fcd": 0.7,
                         "timestamp": _ts_frame(ft),
+                        # STATE_CAT_ONE_HOT
                         "emotion": random.choice(EMOTIONS),
                         "emotion_prob": round(random.uniform(0.3, 0.9), 3),
+                        "lab": ["face"] + (["phone"] if (task == "phone" and random.random() < 0.5) else []),
+                        # STATE_NUM (normalized — z-score or Anscombe-transformed as in DataCollector)
+                        "perclos":    round(random.gauss(0.0, 0.5), 3),
+                        "gaze_score": round(random.gauss(0.0, 0.5), 3),
+                        "hr_delta":   round(random.gauss(0.0, 0.5), 3),
+                        "rr_delta":   round(random.gauss(0.0, 0.5), 3),
+                        "blink_rate": round(random.gauss(0.0, 0.5), 3),
+                        "yawn_rate":  round(random.uniform(1.0, 2.5), 3),  # Anscombe-transformed, always > 0
+                        # STATE_CARLA (model features)
+                        "speed_ratio_max":   round(speed / MAX_SPEED, 3),
+                        "speed_ratio_limit": round(speed / speed_limit, 3),
+                        "brake":         round(random.uniform(0.1, 0.8) if random.random() < 0.15 else 0.0, 3),
+                        "steer":         round(max(-1.0, min(1.0, random.gauss(0.0, 0.15))), 3),
+                        "precipitation": round(random.uniform(0.1, 0.7) if random.random() < 0.2 else 0.0, 3),
+                        "is_night":      is_night,
+                        "is_junction":   is_junction,
+                        # logging extras (raw vehicle/world values, not used by model)
+                        "speed_kmh":      speed,
+                        "speed_limit_kmh": speed_limit,
+                        "throttle":       round(random.uniform(0.0, 0.6), 3),
+                        "gear":           random.randint(1, 4) if env == "city" else random.randint(3, 6),
+                        "hand_brake":     random.random() < 0.02,
+                        "reverse":        random.random() < 0.01,
+                        "acceleration":   round(abs(random.gauss(0.0, 1.5)), 3),
+                        "fog_density":    round(random.uniform(0.1, 0.5) if random.random() < 0.1 else 0.0, 3),
+                        "traffic_light_state": random.choice(["Green", "Green", "Green", "Red", "Yellow", "Unknown"]),
+                        "headlight":      is_night,  # lights on when dark
+                        "fog_light":      random.random() < 0.05,
+                        "left_indicator": random.random() < 0.1,
+                        "right_indicator": random.random() < 0.1,
+                        # used by StateLevelsLoAStrategy (not in xLSTM schema but harmless to include)
+                        "gaze_distracted":  random.random() < 0.2,
+                        "drowsiness_alert": random.random() < 0.1,
+                        "heart_rate": round(random.uniform(60, 90), 1) if random.random() < 0.5 else None,
                         "eye_ar": round(random.gauss(0.30, 0.03), 3),
-                        "mar": round(abs(random.gauss(0.02, 0.01)), 3),
-                        "gaze_score": round(abs(random.gauss(0.13, 0.02)), 3),
-                        "gaze_distracted": random.random() < 0.2,
-                        "drowsiness_alert": drowsy,
-                        "blink_count": k, "yawn_count": 0,
-                        "perclos": round(random.uniform(0.0, 0.3), 3),
-                        "lab": lab,
-                        "heart_rate": (round(random.uniform(60, 90), 1) if random.random() < 0.5 else None),
-                        "speed": random.randint(0, 90),
+                        "mar":    round(abs(random.gauss(0.02, 0.01)), 3),
+                        # pipeline alignment
                         "FCD": dict(fcd),
                         "LoA": random.randint(0, 4),  # system prediction (ignored by alignment)
                     }

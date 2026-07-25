@@ -1,10 +1,10 @@
 
 # =========================================
 # file: make_labels_template.py
-# 作用：从带 segment_id 的 JSONL 导出标注模板 CSV
-# 用法：
+# Purpose: export annotation template CSV from a JSONL file that contains segment_id
+# Usage:
 #   python data/label_data.py --in data/with_segments.jsonl --out data/labels.csv
-# 你可以只填 loa（0..4），或直接填 Level_1..Level_5（0/1，多热）
+# You can fill in only loa (0..4), or fill in Level_1..Level_5 directly (0/1, multi-hot)
 # =========================================
 import argparse, json, pathlib, csv
 
@@ -22,7 +22,8 @@ def main():
             if not line.strip(): continue
             try:
                 obj = json.loads(line)
-            except NotImplementedError:
+            except Exception as e:                
+                print(f"[Error] Failed to parse JSON line: {e}")  
                 continue
             sid = str(obj.get("segment_id","")).strip()
             if sid:

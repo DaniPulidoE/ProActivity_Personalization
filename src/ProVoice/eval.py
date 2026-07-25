@@ -35,7 +35,7 @@ def read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
                 continue
             try:
                 rows.append(json.loads(line))
-            except NotImplementedError:
+            except Exception:
                 continue
     return rows
 
@@ -45,26 +45,26 @@ def extract_frame_truth_pred(row: Dict[str, Any]) -> Tuple[Optional[np.ndarray],
     if all(k in row for k in LEVELS):
         try:
             y_true = np.array([int(float(row[k])) for k in LEVELS], dtype=np.int32)
-        except NotImplementedError:
+        except Exception:
             y_true = None
 
     pred_label = None
     if "LoA" in row and row["LoA"] is not None:
         try:
             pred_label = int(row["LoA"])
-        except NotImplementedError:
+        except Exception:
             pass
     if pred_label is None and "loa" in row and row["loa"] is not None:
         try:
             pred_label = int(row["loa"])
-        except NotImplementedError:
+        except Exception:
             pass
 
     probs = None
     if "probs" in row and isinstance(row["probs"], (list, tuple)) and len(row["probs"]) == 5:
         try:
             probs = [float(x) for x in row["probs"]]
-        except NotImplementedError:
+        except Exception:
             probs = None
 
     if pred_label is None or probs is None:
@@ -73,12 +73,12 @@ def extract_frame_truth_pred(row: Dict[str, Any]) -> Tuple[Optional[np.ndarray],
             if pred_label is None and "LoA" in la and la["LoA"] is not None:
                 try:
                     pred_label = int(la["LoA"])
-                except NotImplementedError:
+                except Exception:
                     pred_label = None
             if probs is None and "probs" in la and isinstance(la["probs"], (list, tuple)) and len(la["probs"]) == 5:
                 try:
                     probs = [float(x) for x in la["probs"]]
-                except NotImplementedError:
+                except Exception:
                     probs = None
 
     return (y_true, pred_label, probs)
@@ -106,7 +106,7 @@ def aggregate_by_segment(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         })
 
     if not recs:
-        raise ValueError("没有可用于评估的记录（缺少 segment_id 或文件为空）")
+        raise ValueError("No records available for evaluation (missing segment_id or file is empty)")
 
     df = pd.DataFrame(recs)
 
@@ -165,7 +165,7 @@ def aggregate_by_segment(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
     seg_df = pd.DataFrame(groups)
     if seg_df.empty:
-        raise ValueError("聚合后没有有效段（可能缺少 Level_* 真值标签）")
+        raise ValueError("No valid segments after aggregation (possibly missing Level_* ground-truth labels)")
     return seg_df
 
 
@@ -277,7 +277,7 @@ def save_fcd_correlation(seg_df: pd.DataFrame, out: pathlib.Path, title: str):
             continue
         try:
             v = [float(f.get(k, np.nan)) for k in FCD_NAMES]
-        except NotImplementedError:
+        except Exception:
             continue
         if any(np.isnan(v)):
             continue
@@ -310,9 +310,9 @@ def save_fcd_correlation(seg_df: pd.DataFrame, out: pathlib.Path, title: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_jsonl", required=True, help="逐帧 JSONL（含 segment_id、Level_1..Level_5、预测LoA/probs）")
-    ap.add_argument("--outdir", default="reports/eval", help="输出目录")
-    ap.add_argument("--title", default="LoA Evaluation", help="图表标题前缀")
+    ap.add_argument("--in", dest="in_jsonl", required=True, help="Per-frame JSONL (containing segment_id, Level_1..Level_5, predicted LoA/probs)")
+    ap.add_argument("--outdir", default="reports/eval", help="Output directory")
+    ap.add_argument("--title", default="LoA Evaluation", help="Chart title prefix")
     args = ap.parse_args()
 
     in_path = pathlib.Path(args.in_jsonl)

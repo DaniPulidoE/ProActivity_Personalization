@@ -184,6 +184,18 @@ wheels = [
 ]
 
 [[package]]
+name = "coral-pytorch"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "setuptools", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/8a/a361d6338f845441b97d59df37510d19ce2125dffebe2f6fe59738ed2588/coral_pytorch-1.4.0.tar.gz", hash = "sha256:212e94deeee17dc582aaba0c121fc1ef2a4324fa6c4a2a44aec148a783a7554b", size = 7505, upload-time = "2022-07-18T00:30:12.95Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/16/abebcfe69a8d7b526770ee23832fd6fed7a12afd469611c459f6dd500f81/coral_pytorch-1.4.0-py2.py3-none-any.whl", hash = "sha256:79912119327d1f341fe01e1753b11c34c1b81ca8fff747884f3e9edd4c9653cd", size = 7282, upload-time = "2022-07-18T00:30:10.074Z" },
+]
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1088,6 +1100,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "carla", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "coral-pytorch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "dacite", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "dash", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "dash-bootstrap-components", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -1125,6 +1138,7 @@ dependencies = [
 requires-dist = [
     { name = "carla", marker = "python_full_version != '3.12.*' or sys_platform != 'win32'", specifier = ">=0.10.0" },
     { name = "carla", marker = "python_full_version == '3.12.*' and sys_platform == 'win32'", path = "wheels/carla-0.10.0-cp312-cp312-win_amd64.whl" },
+    { name = "coral-pytorch", specifier = ">=1.4.0" },
     { name = "dacite" },
     { name = "dash", specifier = ">=3.3.0" },
     { name = "dash-bootstrap-components", specifier = ">=2.0.4" },

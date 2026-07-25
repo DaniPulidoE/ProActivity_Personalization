@@ -21,11 +21,24 @@ app = FastAPI(lifespan=lifespan)
 
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins="*"
+    cors_allowed_origins=["http://localhost:8001", "http://127.0.0.1:8001"]
 )
 
 sio_app = socketio.ASGIApp(sio, socketio_path="/socket.io")
 app.mount("/socket.io", sio_app)
+
+# Connected dashboard clients; the emitter idles when this is empty.
+_connected_sids: set[str] = set()
+
+
+@sio.event
+async def connect(sid, environ):
+    _connected_sids.add(sid)
+
+
+@sio.event
+async def disconnect(sid):
+    _connected_sids.discard(sid)
 
 external_scripts = [
     "https://cdn.socket.io/4.7.2/socket.io.min.js",
@@ -53,20 +66,18 @@ dash_app.layout = dbc.Container([
         style={"display": "none"},   # hidden by default
     ),
     dbc.Row([
-        # 左侧：实时图像
+        # Left side: live image
         dbc.Col(
             [
                 html.Img(id="live-image",
-                         style={"width": "720px", "height": "auto", "border": "1px solid #333", "minHeight": "480px",
-                                "display": "block", "margin": "0 auto"}),
-                html.Div(id="action-report", className="mt-3",
-                         style={"fontSize": "1.15rem", "color": "#246", "minHeight": "50px"}),
+                         style={"width": "100%", "height": "auto", "border": "1px solid #333",
+                                "minHeight": "480px", "display": "block"}),
+                html.Div(id="action-report", className="mt-2",
+                         style={"fontSize": "1.1rem", "color": "#246"}),
             ],
             width=6,
-            className="d-flex align-items-center",
-            style={"minHeight": "760px"}
         ),
-        # 右侧：数据面板
+        # Right side: data panel
         dbc.Col([
             html.Div([
                 html.Div([
@@ -76,8 +87,8 @@ dash_app.layout = dbc.Container([
 
                 html.Div("Fatigue Detection", className="fw-bold mb-2"),
                 html.Div([
-                    "Blink Count: ", html.Span(id='blink-count', className='me-3'),
-                    "Yawn Count: ", html.Span(id='yawn-count', className='me-3'),
+                    "Blink Rate: ", html.Span(id='blink-rate', className='me-3'),
+                    "Yawn Rate: ", html.Span(id='yawn-rate', className='me-3'),
                     "PERCLOS: ", html.Span(id='perclos-score', className='me-3'),
                     "Fatigue: ", html.Span(id='drowsiness-status', className='me-3'),
                 ], className="mb-3"),
@@ -134,27 +145,41 @@ dash_app.layout = dbc.Container([
 app.mount("/", WSGIMiddleware(dash_app.server))
 
 # =====================================================
-# Async data emitter (20 ms)
+# Async data emitter (20 Hz)
 # =====================================================
 async def emit_data_periodically():
+    last_emitted_ts = None
     while True:
-        if data_collector is None:
-            await asyncio.sleep(0.02)
-            continue
-        
-        
-        # 图像流
-        frame_b64 = data_collector.get_latest_frame()
-        # 数值
-        latest_data = data_collector.get_latest_data()
+        try:
+            if data_collector is None or not _connected_sids:
+                # Nobody listening (or nothing to read): skip the JPEG encode
+                # entirely, don't just skip the emit.
+                await asyncio.sleep(0.05)
+                continue
 
-        if latest_data is None:
-            await asyncio.sleep(0.02)
-            continue
+            # Numeric values (cheap) first — bail before the frame encode
+            # (expensive) if this collector tick was already emitted.
+            latest_data = data_collector.get_latest_data()
 
-        payload = latest_data.copy()
-        payload["frame"] = frame_b64
-        payload["calibrating"] = not data_collector.calibrated
+            if latest_data is None:
+                await asyncio.sleep(0.05)
+                continue
 
-        await sio.emit("new_data", payload)
-        await asyncio.sleep(0.02)
+            ts = latest_data.get("timestamp")
+            if ts is not None and ts == last_emitted_ts:
+                # Collector runs ~4 Hz, this loop 20 Hz: same frame, don't
+                # re-encode/re-send it.
+                await asyncio.sleep(0.05)
+                continue
+
+            payload = latest_data.copy()
+            payload["frame"] = data_collector.get_latest_frame()
+            payload["calibrating"] = not data_collector.calibrated
+
+            await sio.emit("new_data", payload)
+            last_emitted_ts = ts
+
+        except Exception as e:
+            print(f"[emitter] error: {e}")
+
+        await asyncio.sleep(0.05) # 0.05 to match 20Hz of data collection

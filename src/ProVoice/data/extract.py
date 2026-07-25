@@ -1,8 +1,8 @@
-# 按窗口 n 条聚合：类别取众数；bpm/LoA/FCD 取均值并取整（LoA∈[0,4]；FCD∈[1,5]）。
-# 支持两种 Level 编码：
-#   - onehot（默认）：仅把选中的 LoA 对应 Level_k=1（k=1..5），其余为 0
-#   - neighbor_up/neighbor_down：在 onehot 的基础上，再把相邻的上/下一级也置为 1
-# 输入支持 JSONL 或 JSON 数组。输出为 JSONL（一行一条聚合记录）。
+# Aggregate in windows of n records: categories use mode; bpm/LoA/FCD use mean rounded to int (LoA∈[0,4]; FCD∈[1,5]).
+# Supports two Level encodings:
+#   - onehot (default): only the Level_k corresponding to the selected LoA is set to 1 (k=1..5), rest are 0
+#   - neighbor_up/neighbor_down: same as onehot but also sets the adjacent upper/lower level to 1
+# Input supports JSONL or JSON arrays. Output is JSONL (one aggregated record per line).
 from __future__ import annotations
 import json, pathlib, os
 from collections import Counter, defaultdict
@@ -13,14 +13,14 @@ FCD_KEYS_CANON = [
     'Time Consumption','Repetitiveness','Situational Context','Social Risk','Urgency','Complexity'
 ]
 
-# ============= 可配置 =============
-INPUT_PATH = pathlib.Path('data/raw_data.json')          # 输入文件路径（JSONL 或 JSON 数组）
-OUTPUT_PATH = pathlib.Path('data/saved_extracted_data/extracted_1.jsonl')     # 输出 JSONL
-CHUNK_N = 20                                        # 每组样本条数 n
-DROP_INCOMPLETE = False                              # 丢弃缺少 LoA 或 FCD 的组
+# ============= Configurable =============
+INPUT_PATH = pathlib.Path('data/raw_data.json')          # Input file path (JSONL or JSON array)
+OUTPUT_PATH = pathlib.Path('data/saved_extracted_data/extracted_1.jsonl')     # Output JSONL
+CHUNK_N = 20                                        # Number of samples per group n
+DROP_INCOMPLETE = False                              # Drop groups missing LoA or FCD
 LEVEL_ENCODING = 'onehot'                            # 'onehot' | 'neighbor_up' | 'neighbor_down'
-KEEP_LOA_NUMERIC = True                              # 是否同时保留数值型 LoA 字段
-# ==================================
+KEEP_LOA_NUMERIC = True                              # Whether to also keep the numeric LoA field
+# ========================================
 
 # ---------------- I/O ----------------
 
@@ -41,7 +41,8 @@ def load_records(path: pathlib.Path) -> List[Dict[str, Any]]:
                 obj = json.loads(line)
                 if isinstance(obj, dict):
                     recs.append(obj)
-            except NotImplementedError:
+            except Exception as e:
+                print(f"[Error] Failed to process line: {e}")
                 continue
     return recs
 
@@ -60,8 +61,12 @@ def to_float(x: Any) -> float | None:
     try:
         if x is None or x == '':
             return None
-        return float(x)
-    except NotImplementedError:
+        v = float(x)
+        if v != v:  # NaN check (NaN is the only float not equal to itself)
+            return None
+        return v
+    except Exception as e:
+        print(f"[Error] Failed to convert to float: {e}")
         return None
 
 
@@ -125,7 +130,7 @@ def get_fcd(r: Dict[str, Any]) -> Dict[str, float] | None:
 # ---------------- LoA → Levels ----------------
 
 def loa_to_levels(loa_int: int, encoding: str = 'onehot') -> dict:
-    # Level_1..Level_5 对应 LoA 0..4
+    # Level_1..Level_5 correspond to LoA 0..4
     levels = {f'Level_{i}': 0 for i in range(1, 6)}
     idx = clamp(int(loa_int), 0, 4)
     levels[f'Level_{idx+1}'] = 1
@@ -141,23 +146,23 @@ def aggregate_chunk(chunk: List[Dict[str, Any]]) -> Dict[str, Any] | None:
     if not chunk:
         return None
 
-    # 类别/布尔众数
+    # Categorical/boolean mode
     emotion = mode([c.get('emotion') for c in chunk]) or 'neutral'
     lab = mode([c.get('lab') for c in chunk])
     drowsy = mode([to_bool(c.get('drowsiness_alert')) for c in chunk])
     gaze = mode([to_bool(c.get('gaze_distracted')) for c in chunk])
 
-    # bpm 均值（四舍五入为 int）
+    # BPM mean (rounded to int)
     bpms = [get_bpm(c) for c in chunk]
     bpms = [v for v in bpms if v is not None]
     bpm_avg = int(round(sum(bpms)/len(bpms))) if bpms else None
 
-    # LoA 均值→取整夹到[0,4]
+    # LoA mean → round and clamp to [0,4]
     loas = [get_loa(c) for c in chunk]
     loas = [v for v in loas if v is not None]
     loa_avg = clamp(int(round(sum(loas)/len(loas))) if loas else 0, 0, 4)
 
-    # FCD 逐维均值→取整夹到[1,5]
+    # FCD per-dimension mean → round and clamp to [1,5]
     fcd_acc: Dict[str, List[float]] = defaultdict(list)
     for c in chunk:
         fcd = get_fcd(c)
@@ -171,7 +176,7 @@ def aggregate_chunk(chunk: List[Dict[str, Any]]) -> Dict[str, Any] | None:
         if vals:
             fcd_out[k] = clamp((int(round(sum(vals)/len(vals)))), 1, 5)
 
-    # 组装输出：Level_* 替代单一 LoA 字段（可选保留 LoA 数值）
+    # Assemble output: Level_* replaces the single LoA field (optionally keep numeric LoA)
     rec: Dict[str, Any] = {
         'emotion': emotion,
         'lab': lab,
@@ -201,7 +206,7 @@ def main():
         if agg is None:
             continue
         if DROP_INCOMPLETE:
-            # 缺 LoA（若被要求保留数值）或缺 FCD 则丢弃
+            # Drop if numeric LoA is missing (when required) or FCD is absent
             if (KEEP_LOA_NUMERIC and agg.get('LoA') is None) or not agg.get('FCD'):
                 continue
         agg_rows.append(agg)
