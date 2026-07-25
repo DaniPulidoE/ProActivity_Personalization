@@ -89,7 +89,7 @@ def _build_parser() -> ap.ArgumentParser:
                    help="fcd | state | combined | collection")
     p.add_argument("--state-model", "--statemodel", dest="state_model", default="classic",
                    help="classic | xlstm")
-    p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.5)
+    p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.7)
     p.add_argument("--session-id", dest="session_id", default=None)
     p.add_argument("--window", type=int, default=400,
                    help="Frame-count cap on the model input window (safety bound).")

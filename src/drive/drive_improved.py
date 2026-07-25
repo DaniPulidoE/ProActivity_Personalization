@@ -1835,7 +1835,7 @@ def main():
         '--state-model', dest='state_model', default='',
         help='state model name for label logging')
     argparser.add_argument(
-        '--w-fcd', dest='w_fcd', default=None, type=float,
+        '--w-fcd', dest='w_fcd', default=0.7, type=float,
         help='FCD weight for label logging')
     argparser.add_argument(
         '--session-id', dest='session_id', default='',

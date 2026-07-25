@@ -347,7 +347,7 @@ class StateXLSTMLoAStrategy(BaseStrategy):
 
 
 class CombinedFusionStrategy(BaseStrategy):
-    def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.5,
+    def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.7,
                  conservative: bool = True, decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.fcd_strategy = fcd_strategy
         self.state_strategy = state_strategy

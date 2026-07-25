@@ -219,6 +219,11 @@ class DataCollector:
         self._read_fail_since: float = 0.0
         self._read_fail_grace_s: float = 5.0
 
+        # --- DEBUG: frame-rate instrumentation (safe to delete) ---
+        self._dbg_last_tick_t: float = 0.0
+        self._dbg_last_print_t: float = 0.0
+        self._dbg_dt_hist: deque = deque(maxlen=100)
+
     def __del__(self):
         try:
             self.stop()
@@ -281,11 +286,17 @@ class DataCollector:
 
     
     def get_gaze_score(self, frame, face_mesh_results) -> float:
-        if not face_mesh_results:
+        has_face = bool(face_mesh_results and face_mesh_results.multi_face_landmarks)
+        if not has_face:
+            # No face detected. Post-calibration, fall back to the per-driver
+            # gaze baseline so the standardized score is neutral (zero deviation)
+            # rather than a spurious value. During calibration the baseline does
+            # not exist yet and the caller filters on >0.0 to skip the frame, so
+            # keep returning 0.0 there.
+            if self.calibrated:
+                return float(self.calibrate.get('gaze_score', {}).get('mean', 0.0))
             return 0.0
         try:
-            if not face_mesh_results.multi_face_landmarks:
-                return 0.0
             lm = face_mesh_results.multi_face_landmarks[0].landmark
             h, w, _ = frame.shape
             return self.compute_gaze_score(lm, w, h)
@@ -471,18 +482,32 @@ class DataCollector:
             std = 1.0
         return round((value - baseline) / std, 1)
 
-    def _visual_process(self, data: Dict[str, Any]) -> None:
+    def _visual_process(self, data: Dict[str, Any]) -> bool:
+        """Populate ``data`` with visual driver-state features.
+
+        Returns ``False`` only when the camera read itself failed (a transient
+        hardware glitch) so the caller can skip the whole tick instead of
+        emitting a frame with no driver-state features. Returns ``True``
+        otherwise — including when visual is disabled, where there is simply
+        nothing to read.
+        """
         if not self.visual_enabled or self.cap is None:
-            return
+            return True
         ok, frame = self.cap.read()
         if not ok:
-            print("not okay")
             self.latest_frame = None
-            return
+            return False
 
         # reuse face mesh in gaze score and emotion detection to avoid double processing
-        face_mesh_results = self.compute_face_mesh(frame) 
-        # gaze score
+        face_mesh_results = self.compute_face_mesh(frame)
+        # Face presence gates every driver-state buffer below, mirroring how
+        # calibration only sampled face frames (see calibrate_step). MediaPipe
+        # FaceMesh is the single source of truth; frametest's "face" label is
+        # derived from the same result, so the two stay consistent.
+        face_present = bool(face_mesh_results and face_mesh_results.multi_face_landmarks)
+        data['face_present'] = face_present
+        # gaze score — get_gaze_score returns the per-driver baseline when no face
+        # is present, so the standardized value below is neutral (0.0 deviation).
         gaze_score = self.get_gaze_score(frame, face_mesh_results)
         # standardize gaze score based on calibration mean and std, if available
         normalized_gaze_score = (gaze_score - self.calibrate['gaze_score']['mean']) / self.calibrate['gaze_score']['std'] if self.calibrate['gaze_score']['std'] != 0 else 0.0
@@ -548,52 +573,62 @@ class DataCollector:
         MOUTH_AR_CONSEC_FRAMES = 3
         BLINK_MIN_MS = 100   # below this is EAR noise, not a blink (this is equivalent to 2 frames at 20Hz)
         BLINK_MAX_MS = 500  # above this is eye closure / drowsiness, not a blink
+        blink_window = 30.0  # 30 second window for blinks
+        yawn_window = 180    # 3 minute window for yawns
 
         now = time.monotonic()
         eye_closed = eye < self.calibrate['ear']['threshold']
         mouth_open = mouth > self.calibrate['mar']['threshold']
-
-        # blink detection (duration-gated; unchanged)
-        if eye_closed:
-            if self._eye_closed_since == 0.0:
-                self._eye_closed_since = now
-        else:
-            if self._eye_closed_since > 0.0:
-                duration_ms = (now - self._eye_closed_since) * 1000
-                if BLINK_MIN_MS <= duration_ms <= BLINK_MAX_MS:
-                    self.blink_count += 1
-                    self.blink_times.append(now)
-            self._eye_closed_since = 0.0
-
-        # yawn detection (consecutive-frame gated; unchanged)
-        if mouth_open:
-            self.mCOUNTER += 1
-        else:
-            if self.mCOUNTER >= MOUTH_AR_CONSEC_FRAMES:
-                self.yawn_count += 1
-                self.yawn_times.append(now)
-            self.mCOUNTER = 0
-
-        # PERCLOS over a fixed TIME window
-        self._perclos_buf.append((now, eye_closed, mouth_open))
-        while self._perclos_buf and now - self._perclos_buf[0][0] > self._perclos_window_s:
-            self._perclos_buf.popleft()
-        n_buf = len(self._perclos_buf)
-        if n_buf > 0:
-            eye_frac = sum(1 for _, e, _ in self._perclos_buf if e) / n_buf
-            mouth_frac = sum(1 for _, _, m in self._perclos_buf if m) / n_buf
-            self.perclos = eye_frac + mouth_frac * 0.2
-            self.drowsiness_alert = self.perclos > 0.38
-
-        # yawn and blink rates
-        now = time.monotonic()
-        blink_window = 30.0 # 30 second window for blinks
-        self.blink_times = [t for t in self.blink_times if now - t <= blink_window]
+        # Time-only, so valid whether or not a face is visible this frame; drives
+        # the blink-rate std in the normalization below.
         elapsed_s = min(now - self._session_start_t, blink_window)
-        self.blink_rate = len(self.blink_times) / (elapsed_s / 60) if elapsed_s > 0 else 0.0  # blinks per minute
-        yawn_window = 180 # 3 minute window for yawns
-        self.yawn_times = [t for t in self.yawn_times if now - t <= yawn_window]
-        self.yawn_rate = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
+
+        if face_present:
+            # blink detection (duration-gated)
+            if eye_closed:
+                if self._eye_closed_since == 0.0:
+                    self._eye_closed_since = now
+            else:
+                if self._eye_closed_since > 0.0:
+                    duration_ms = (now - self._eye_closed_since) * 1000
+                    if BLINK_MIN_MS <= duration_ms <= BLINK_MAX_MS:
+                        self.blink_count += 1
+                        self.blink_times.append(now)
+                self._eye_closed_since = 0.0
+
+            # yawn detection (consecutive-frame gated)
+            if mouth_open:
+                self.mCOUNTER += 1
+            else:
+                if self.mCOUNTER >= MOUTH_AR_CONSEC_FRAMES:
+                    self.yawn_count += 1
+                    self.yawn_times.append(now)
+                self.mCOUNTER = 0
+
+            # PERCLOS over a fixed TIME window
+            self._perclos_buf.append((now, eye_closed, mouth_open))
+            while self._perclos_buf and now - self._perclos_buf[0][0] > self._perclos_window_s:
+                self._perclos_buf.popleft()
+            n_buf = len(self._perclos_buf)
+            if n_buf > 0:
+                eye_frac = sum(1 for _, e, _ in self._perclos_buf if e) / n_buf
+                mouth_frac = sum(1 for _, _, m in self._perclos_buf if m) / n_buf
+                self.perclos = eye_frac + mouth_frac * 0.2
+                self.drowsiness_alert = self.perclos > 0.38
+
+            # yawn and blink rates (over their respective time windows)
+            self.blink_times = [t for t in self.blink_times if now - t <= blink_window]
+            self.blink_rate = len(self.blink_times) / (elapsed_s / 60) if elapsed_s > 0 else 0.0  # blinks per minute
+            self.yawn_times = [t for t in self.yawn_times if now - t <= yawn_window]
+            self.yawn_rate = len(self.yawn_times) / (yawn_window / 60)  # yawns per minute
+        else:
+            # Face absent → not a driver-state measurement. Leave the blink/yawn/
+            # PERCLOS buffers untouched so self.perclos, self.blink_rate and
+            # self.yawn_rate keep their last face-present values (carried
+            # forward). Reset the in-progress blink/yawn timers so a detection
+            # cannot span the face-absence gap and fire as a false event.
+            self._eye_closed_since = 0.0
+            self.mCOUNTER = 0
 
 
         self.latest_frame = frame_annot
@@ -619,7 +654,8 @@ class DataCollector:
         data['blink_rate_raw'] = round(float(self.blink_rate), 2)     # blinks/min
         data['yawn_rate_raw'] = round(float(self.yawn_rate), 2)       # yawns/min
         data['perclos_raw'] = round(float(self.perclos), 3)           # fraction [0,1]
-        
+        return True
+
     def _carla_process(self, data: Dict[str, Any]):
         # Logging-only extras default to None; overwritten below when data is available.
         throttle = gear = hand_brake = reverse = acceleration = None
@@ -766,23 +802,34 @@ class DataCollector:
         data['left_indicator']      = left_indicator
         data['right_indicator']     = right_indicator
 
-    def collect_data(self) -> Dict[str, Any]:
+    def collect_data(self) -> Tuple[Dict[str, Any], bool]:
+        """Collect one multimodal frame.
+
+        Returns ``(data, read_ok)``. ``read_ok`` is ``False`` when the camera
+        read failed this tick, in which case ``data`` is incomplete and the
+        caller should skip the tick rather than log/decide on a driver-state-less
+        frame. ``latest_data`` is left untouched on failure so the dashboard
+        keeps showing the last good frame.
+        """
         data: Dict[str, Any] = {}
-        
-        if self.visual_enabled:
-            self._visual_process(data)
 
+        # Declare the physiological keys up front so heart_rate/respiratory_rate
+        # (and their deltas) always occupy the SAME position in every logged
+        # frame. When a fresh rPPG reading exists, _visual_process overwrites
+        # these in place (updating an existing dict key preserves its insertion
+        # order); when it doesn't, they stay None here — reported as unknown
+        # rather than fabricated. Without this, a fresh reading was inserted
+        # inside _visual_process (early) while a null was inserted later in a
+        # phys fallback, so the field jumped position between frames.
         if self.phys_enabled:
-            # No live rPPG reading this cycle — report unknown rather than
-            # fabricating a value that pollutes the model input and dashboard.
-            if 'heart_rate' not in data:
-                data['heart_rate'] = None
-                data['hr_delta'] = None
-            
-            if 'respiratory_rate' not in data:
-                data['respiratory_rate'] = None
-                data['rr_delta'] = None
+            data['heart_rate'] = None
+            data['hr_delta'] = None
+            data['respiratory_rate'] = None
+            data['rr_delta'] = None
 
+        if self.visual_enabled:
+            if not self._visual_process(data):
+                return data, False
 
         if self.context_enabled:
             self._carla_process(data)
@@ -801,7 +848,7 @@ class DataCollector:
         with self._lock:
             self.latest_data = dict(data)
 
-        return data
+        return data, True
 
 
     def _run_loop(self) -> None:
@@ -815,53 +862,89 @@ class DataCollector:
                     # Two-phase time-based calibration — completion handled inside calibrate_step()
                     self.calibrate_step()
                 else:
-                    data = self.collect_data()
-                    
-                    # Add sequence for LSTM models.
-                    seq_entry = dict(data)
-                    seq_entry.pop('bpm_history', None)
-                    seq_entry.pop('rr_history', None)
-                    with self._lock:
-                        self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
+                    _dbg_t0 = time.monotonic()  # DEBUG fps (safe to delete)
+                    data, read_ok = self.collect_data()
+                    # --- DEBUG: achieved frame interval + collect() cost (safe to delete) ---
+                    _dbg_collect_ms = (time.monotonic() - _dbg_t0) * 1000.0
+                    if self._dbg_last_tick_t:
+                        _dbg_dt_ms = (_dbg_t0 - self._dbg_last_tick_t) * 1000.0
+                        self._dbg_dt_hist.append(_dbg_dt_ms)
+                        _dbg_avg = sum(self._dbg_dt_hist) / len(self._dbg_dt_hist)
+                        data['frame_dt_ms'] = round(_dbg_dt_ms, 1)       # ms since previous tick
+                        data['collect_ms']  = round(_dbg_collect_ms, 1)  # perception cost this tick
+                        data['fps_inst']    = round(1000.0 / _dbg_dt_ms, 2) if _dbg_dt_ms > 0 else 0.0
+                        data['fps_avg']     = round(1000.0 / _dbg_avg, 2) if _dbg_avg > 0 else 0.0
+                        if _dbg_t0 - self._dbg_last_print_t >= 1.0:  # throttle console to ~1 Hz
+                            self._dbg_last_print_t = _dbg_t0
+                            print(f"[DataCollector][fps] dt={_dbg_dt_ms:6.1f}ms "
+                                  f"collect={_dbg_collect_ms:6.1f}ms "
+                                  f"fps_inst={data['fps_inst']:5.2f} fps_avg={data['fps_avg']:5.2f} "
+                                  f"face={data.get('face_present')}")
+                    self._dbg_last_tick_t = _dbg_t0
+                    # --- end DEBUG ---
 
-                    action = None
-                    if self.decision_engine:
-        
-                        data['functionname'] = data.get('functionname', self.functionname)
-                        # separate dict to avoid adding the whole history to each sequence entry
-                        data_for_decision = dict(data)
-                        data_for_decision['sequence'] = list(self.data_history)
+                    if not read_ok:
+                        # Transient camera read failure: skip the whole tick — no
+                        # sequence entry, no log, no decision/actuation — so we
+                        # never emit a zero-driver-state frame. Stay quiet for a
+                        # short grace window (a momentary USB glitch), then warn
+                        # once the failures persist (mirrors calibrate_step).
+                        now_m = time.monotonic()
+                        if self._read_fail_since == 0.0:
+                            self._read_fail_since = now_m
+                        failed_for = now_m - self._read_fail_since
+                        if failed_for >= self._read_fail_grace_s:
+                            print(f"[DataCollector] Camera read failing for "
+                                  f"{failed_for:.1f}s (>{self._read_fail_grace_s:.0f}s grace) — "
+                                  f"camera likely disconnected; skipping ticks.")
+                    else:
+                        self._read_fail_since = 0.0  # good read — reset the timer
 
-                        action = self.decision_engine.decide(dict(data_for_decision))
-                        if self.logger and isinstance(action, dict):
-                            action_for_log = dict(action)
-                            for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
-                                value = data.get(key)
-                                if value not in (None, ''):
-                                    action_for_log.setdefault(key, value)
-                            self.logger.log_processed(action_for_log)
-                        data['last_action'] = action
-                        # collect_data() snapshotted latest_data BEFORE the
-                        # decision existed; re-publish so the dashboard/get_latest
-                        # actually shows the LoA/action.
+                        # Add sequence for LSTM models.
+                        seq_entry = dict(data)
+                        seq_entry.pop('bpm_history', None)
+                        seq_entry.pop('rr_history', None)
                         with self._lock:
-                            self.latest_data = dict(data)
+                            self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
+
+                        action = None
+                        if self.decision_engine:
+
+                            data['functionname'] = data.get('functionname', self.functionname)
+                            # separate dict to avoid adding the whole history to each sequence entry
+                            data_for_decision = dict(data)
+                            data_for_decision['sequence'] = list(self.data_history)
+
+                            action = self.decision_engine.decide(dict(data_for_decision))
+                            if self.logger and isinstance(action, dict):
+                                action_for_log = dict(action)
+                                for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
+                                    value = data.get(key)
+                                    if value not in (None, ''):
+                                        action_for_log.setdefault(key, value)
+                                self.logger.log_processed(action_for_log)
+                            data['last_action'] = action
+                            # collect_data() snapshotted latest_data BEFORE the
+                            # decision existed; re-publish so the dashboard/get_latest
+                            # actually shows the LoA/action.
+                            with self._lock:
+                                self.latest_data = dict(data)
 
 
-                    if self.logger:
-                        raw_with_decision = dict(data)
-                        if isinstance(action, dict):
-                            raw_with_decision['LoA'] = action.get('LoA')
-                            fcd = action.get('fcd') or action.get('fcd_scores')
-                            if isinstance(fcd, dict):
-                                raw_with_decision['FCD'] = fcd
-                        raw_with_decision.pop('bpm_history', None)
-                        raw_with_decision.pop('rr_history', None)
-                        self.logger.log_raw(raw_with_decision)
+                        if self.logger:
+                            raw_with_decision = dict(data)
+                            if isinstance(action, dict):
+                                raw_with_decision['LoA'] = action.get('LoA')
+                                fcd = action.get('fcd') or action.get('fcd_scores')
+                                if isinstance(fcd, dict):
+                                    raw_with_decision['FCD'] = fcd
+                            raw_with_decision.pop('bpm_history', None)
+                            raw_with_decision.pop('rr_history', None)
+                            self.logger.log_raw(raw_with_decision)
 
 
-                    if self.actuator and action is not None:
-                        self.actuator.execute(action)
+                        if self.actuator and action is not None:
+                            self.actuator.execute(action)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
