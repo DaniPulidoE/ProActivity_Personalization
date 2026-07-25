@@ -352,15 +352,16 @@ def _set_world_frozen(world, frozen):
 
     The experiment runs in CARLA async mode, where the server free-runs and a
     brake control only makes the ego *coast* to a stop while NPC traffic keeps
-    driving. Disabling physics on every vehicle stops them all instantly and in
-    place.
+    driving.
 
-    On resume we re-enable physics and *restore each vehicle's saved velocity*.
-    This does two things: (1) the ego keeps the speed it had before the popup,
-    as requested; (2) it wakes the rigid body — a vehicle whose physics was just
-    re-enabled comes back asleep and ignores throttle until it receives a
-    velocity/impulse, which is why the car "couldn't accelerate" after a plain
-    physics toggle. No-ops harmlessly if the world/actor query fails.
+    We deliberately do NOT toggle ``set_simulate_physics`` here: disabling and
+    re-enabling a vehicle's physics resets its drivetrain state, so the ego
+    comes back gutless (sluggish acceleration, lower top speed). Instead we use
+    CARLA's constant-velocity hold, which pins each vehicle at 0 m/s server-side
+    every tick while leaving the engine, gearbox and wheels fully alive. On
+    resume we release the hold and restore each vehicle's saved velocity, so the
+    ego keeps the speed it had before the popup and accelerates exactly as
+    before. No-ops harmlessly if the world/actor query fails.
     """
     if world is None or getattr(world, 'world', None) is None:
         return
@@ -374,7 +375,7 @@ def _set_world_frozen(world, frozen):
         for actor in vehicles:
             try:
                 saved[actor.id] = (actor.get_velocity(), actor.get_angular_velocity())
-                actor.set_simulate_physics(False)
+                actor.enable_constant_velocity(carla.Vector3D(0, 0, 0))
             except Exception:
                 pass
         world._frozen_velocities = saved
@@ -382,11 +383,9 @@ def _set_world_frozen(world, frozen):
         saved = getattr(world, '_frozen_velocities', {})
         for actor in vehicles:
             try:
-                actor.set_simulate_physics(True)
+                actor.disable_constant_velocity()
                 vel, ang = saved.get(actor.id, (None, None))
                 if vel is not None:
-                    # Order matters: physics must be back on before the target
-                    # velocity is applied, otherwise CARLA drops it.
                     actor.set_target_velocity(vel)
                     actor.set_target_angular_velocity(ang)
             except Exception:
