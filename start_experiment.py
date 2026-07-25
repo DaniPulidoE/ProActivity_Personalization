@@ -54,15 +54,17 @@ def build_drive_cmd(session, args):
         "--state-model", args.state_model,
         "--w-fcd", str(args.w_fcd),
         "--host", args.host,
-        "--port", str(args.port)
+        "--port", str(args.port),
+        *(["--fullscreen"] if args.fullscreen else ["--res", args.res]),
     ]
 
 
-def build_provoice_cmd(session, args):
+def build_provoice_cmd(session, args, vehicle_id):
     return [
         sys.executable,
         "src/ProVoice/main.py",
         f"session_id={session}",
+        f"vehicle_id={vehicle_id}",
         f"participantid={args.participantid}",
         f"environment={args.environment}",
         f"secondary_task={args.secondary_task}",
@@ -120,6 +122,70 @@ def wait_for_carla_ready():
     time.sleep(5)
 
 
+def clear_vehicle_id(root: Path):
+    """Delete any vehicle_id.txt left behind by a previous run.
+
+    drive_improved.py writes the file but never removes it on shutdown, so
+    without this wait_for_vehicle_id() would instantly return the *previous*
+    session's id and ProVoice would attach to a vehicle that no longer exists.
+    """
+    for name in ("vehicle_id.txt", "vehicle_id.txt.tmp"):
+        path = root / name
+        try:
+            path.unlink()
+            print(f"[CLEANUP] removed stale {name}")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[WARN] could not remove {name}: {e}")
+
+
+def wait_for_vehicle_id(root: Path, drive_proc, timeout, poll=0.2):
+    """Block until Drive publishes the spawned vehicle's id, and return it.
+
+    drive_improved.py writes the file atomically (tmp + os.replace) only AFTER
+    the world tick, so its appearance is the signal that Drive is fully
+    initialised and ProVoice can safely connect — this replaces the fixed sleep
+    that merely assumed the write had happened by then.
+    """
+    path = root / "vehicle_id.txt"
+    print(f"[WAIT] vehicle id at {path} (timeout {timeout:.0f}s)...")
+
+    started = time.monotonic()
+    deadline = started + timeout
+    warned = None  # last bad content reported, so a partial write warns once
+
+    while time.monotonic() < deadline:
+        # Drive dying before it spawns is a hard failure: waiting out the full
+        # timeout would only delay an error we can already report.
+        code = drive_proc.poll()
+        if code is not None:
+            raise RuntimeError(f"DRIVE exited with code {code} before writing vehicle_id.txt")
+
+        try:
+            raw = path.read_text().strip()
+        except FileNotFoundError:
+            raw = ""
+        except OSError:
+            raw = ""  # sharing violation mid-os.replace on Windows; retry
+
+        if raw:
+            try:
+                vehicle_id = int(raw)
+            except ValueError:
+                if raw != warned:
+                    warned = raw
+                    print(f"[WARN] invalid vehicle id content {raw!r}, waiting...")
+            else:
+                print(f"[WAIT] vehicle id {vehicle_id} ready after "
+                      f"{time.monotonic() - started:.1f}s")
+                return vehicle_id
+
+        time.sleep(poll)
+
+    raise TimeoutError(f"vehicle id not written within {timeout:.0f}s")
+
+
 # =========================
 # MAIN
 # =========================
@@ -140,6 +206,13 @@ def main():
                              "0 disables the time cap.")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Run the drive window fullscreen at the desktop resolution.")
+    parser.add_argument("--res", default="1280x720",
+                        help="Drive window resolution, e.g. 2560x1440. Ignored with --fullscreen.")
+    parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
+                        help="How long to wait for Drive to spawn the vehicle and write "
+                             "vehicle_id.txt before giving up.")
 
     args = parser.parse_args()
 
@@ -171,13 +244,22 @@ def main():
         # =========================
         # START DRIVE
         # =========================
+        # Clear first: Drive must publish a FRESH id, and a leftover file from
+        # the last run would satisfy the wait below immediately.
+        clear_vehicle_id(root)
+
         drive_cmd = build_drive_cmd(session, args)
-        pm.start(drive_cmd, "DRIVE")
+        drive_proc = pm.start(drive_cmd, "DRIVE")
+
+        # Wait for the vehicle to actually exist instead of guessing at a sleep.
+        vehicle_id = wait_for_vehicle_id(root, drive_proc, args.vehicle_id_timeout)
 
         # =========================
         # START PROVOICE
         # =========================
-        provoice_cmd = build_provoice_cmd(session, args)
+        # Pass the id explicitly so ProVoice skips its own file discovery
+        # (read_vehicle_id) — the file has already been read and validated here.
+        provoice_cmd = build_provoice_cmd(session, args, vehicle_id)
         pm.start(provoice_cmd, "PROVOICE")
 
         # =========================
@@ -194,8 +276,12 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[EXIT] stopping experiment...")
-        
-    
+
+    except (TimeoutError, RuntimeError) as e:
+        # Startup never completed — report it plainly instead of a traceback.
+        print(f"[FATAL] {e}")
+        raise SystemExit(1)
+
     finally:
         pm.stop_all()
         print("[EXIT] experiment stopped")

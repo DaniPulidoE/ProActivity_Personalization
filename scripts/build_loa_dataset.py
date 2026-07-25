@@ -82,10 +82,32 @@ def _secs_of_day(ts: Optional[str]) -> Optional[float]:
     return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
 
 
-def _loa_to_levels(loa: int) -> Dict[str, int]:
+def _parse_loa_set(raw: str) -> List[int]:
+    """Parse ``user_selected_loa`` into a sorted list of distinct LoAs.
+
+    The drive UI lets a driver mark EVERY acceptable level, writing them as
+    ``"2;3"``. A single mark stays a bare ``"2"``, so labels recorded before
+    multi-select still parse unchanged.
+    """
+    out = set()
+    for part in str(raw).replace(",", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(max(0, min(4, int(float(part)))))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
+def _loa_to_levels(loas) -> Dict[str, int]:
+    """Multi-hot over Level_1..5. One marked LoA gives the old one-hot."""
+    if isinstance(loas, int):
+        loas = [loas]
     levels = {k: 0 for k in LEVELS}
-    idx = max(0, min(4, int(loa)))
-    levels[f"Level_{idx + 1}"] = 1
+    for loa in loas:
+        levels[f"Level_{max(0, min(4, int(loa))) + 1}"] = 1
     return levels
 
 
@@ -102,9 +124,8 @@ def load_label_windows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
             if not sid or start_s is None or end_s is None or loa_raw == "":
                 skipped += 1
                 continue
-            try:
-                loa = int(float(loa_raw))
-            except Exception:
+            loa = _parse_loa_set(loa_raw)
+            if not loa:
                 skipped += 1
                 continue
             by_session[sid].append({
@@ -195,11 +216,12 @@ def main() -> None:
             seg_id = f"{sid}|win{int(float(w['window_idx'])):03d}" if str(w["window_idx"]).replace('.', '', 1).isdigit() else f"{sid}|win{w['window_idx']}"
             row = dict(frame)
             row["segment_id"] = seg_id
-            row["user_loa"] = w["loa"]
+            row["user_loa"] = ";".join(str(v) for v in w["loa"])
             row.update(_loa_to_levels(w["loa"]))
             fo.write(json.dumps(row, ensure_ascii=False) + "\n")
             n_labeled += 1
-            loa_hist[w["loa"]] += 1
+            for _loa in w["loa"]:   # a multi-mark counts toward every level it names
+                loa_hist[_loa] += 1
             seg_frames[seg_id].append(frame)
             seg_meta[seg_id] = {"loa": w["loa"], "functionname": str(frame.get("functionname", ""))}
 

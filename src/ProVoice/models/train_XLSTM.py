@@ -24,10 +24,31 @@ from ProVoice.models.xlstm_model import (
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.decision_engine import truncate_frames_by_seconds
-from coral_pytorch.losses import corn_loss
+from coral_pytorch.losses import coral_loss, corn_loss
 
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
+
+
+def levels_to_distribution(lvl: torch.Tensor) -> torch.Tensor:
+    """Multi-hot (B, K) -> PMF (B, K), uniform over the marked levels.
+
+    A single marked level yields the usual one-hot, so single-label data is
+    numerically unchanged.
+    """
+    return lvl / lvl.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def levels_to_cumulative(lvl: torch.Tensor) -> torch.Tensor:
+    """Multi-hot (B, K) -> CORAL target (B, K-1) with q_k = P(y > k).
+
+    This is what lets CORAL take more than one label: the driver's marked set
+    becomes a distribution, and its complementary CDF is a valid soft target for
+    coral_loss (which is a sum of BCEs, so targets need only lie in [0, 1]).
+    The mapping is invertible, so nothing about which levels were marked is lost.
+    """
+    p = levels_to_distribution(lvl)
+    return p.flip(-1).cumsum(-1).flip(-1)[..., 1:]
 SPLIT_VARIABLE = "participantid"
 
 
@@ -128,14 +149,18 @@ class SeqDataset(Dataset):
             if np.isnan(level_vec).any() or level_vec.sum() <= 0:
                 skipped.append(gid)
                 continue
-            y = int(np.argmax(level_vec))  # single-label 5-class target
+            # Keep BOTH representations: the multi-hot drives CORAL/CE (which
+            # accept soft targets), while the argmax int is what CORN and the
+            # legacy single-label metrics need.
+            lvl = (level_vec > 0).astype(np.float32)
+            y = int(np.argmax(level_vec))
             rows = [g.iloc[i].to_dict() for i in range(len(g))]
             # Keep only the LAST window_seconds of the segment (frames are
             # chronological within a segment). None/0 = use the full segment.
             rows = truncate_frames_by_seconds(rows, window_seconds)
             xs = [encode_frame(r.get('functionname') or "", r) for r in rows]
             X = np.stack(xs, axis=0).astype(np.float32)
-            self.groups.append((X, y))
+            self.groups.append((X, y, lvl))
             if log_fh is not None:
                 log_encoded_frames(log_fh, split, str(gid), X, label=y)
         if skipped:
@@ -152,9 +177,10 @@ def make_collate(context_length: int):
         if len(batch) == 0:
             return (torch.empty(0, context_length, D_IN),
                     torch.empty(0, dtype=torch.long),
-                    torch.empty(0, dtype=torch.long))
-        xs, ys, ls = [], [], []
-        for X, y in batch:
+                    torch.empty(0, dtype=torch.long),
+                    torch.empty(0, len(LEVELS)))
+        xs, ys, ls, lvls = [], [], [], []
+        for X, y, lvl in batch:
             T = X.shape[0]
             if T > context_length:
                 X = X[-context_length:]
@@ -167,9 +193,11 @@ def make_collate(context_length: int):
             xs.append(torch.from_numpy(X))
             ys.append(int(y))
             ls.append(min(T, context_length))
+            lvls.append(torch.from_numpy(np.asarray(lvl, dtype=np.float32)))
         return (torch.stack(xs, 0),
                 torch.tensor(ys, dtype=torch.long),
-                torch.tensor(ls, dtype=torch.long))
+                torch.tensor(ls, dtype=torch.long),
+                torch.stack(lvls, 0))
     return collate
 
 
@@ -193,6 +221,31 @@ def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Mean absolute error in LoA levels — ordinal metric: off-by-1 < off-by-4."""
     if len(y_true) == 0: return 0.0
     return float(np.abs(y_true.astype(float) - y_pred.astype(float)).mean())
+
+
+def set_accuracy(levels: np.ndarray, y_pred: np.ndarray) -> float:
+    """Fraction of predictions the driver marked as acceptable.
+
+    Identical to :func:`accuracy` when every row marks exactly one level.
+    """
+    if len(y_pred) == 0: return 0.0
+    return float(levels[np.arange(len(y_pred)), y_pred].astype(bool).mean())
+
+
+def set_mae(levels: np.ndarray, y_pred: np.ndarray) -> float:
+    """Distance to the NEAREST marked level; 0 when the prediction is accepted.
+
+    Generalises :func:`mae` to multi-label rows without punishing a model for
+    picking one acceptable level over another. Reduces exactly to ``mae`` when
+    every row marks a single level.
+    """
+    if len(y_pred) == 0: return 0.0
+    idx = np.arange(levels.shape[1])
+    dists = []
+    for row, p in zip(levels, y_pred):
+        marked = idx[row.astype(bool)]
+        dists.append(float(np.abs(marked - p).min()) if marked.size else 0.0)
+    return float(np.mean(dists))
 
 
 def qwk(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
@@ -234,13 +287,16 @@ def main():
                          "(by frame timestamps, so it is robust to the actual sampling "
                          "rate). Default 20 = the full label window. 0 disables. "
                          "Stored in the checkpoint so fine-tuning and inference inherit it.")
-    ap.add_argument("--loss", choices=["ce", "corn"], default="ce",
+    ap.add_argument("--loss", choices=["ce", "corn", "coral"], default="ce",
                     help="'ce': softmax head + cross-entropy (nominal). 'corn': rank-consistent "
                          "ordinal head (K-1 conditional logits) + CORN loss (Shi et al. 2023). "
+                         "'coral': ordinal head with ONE shared weight vector + K-1 biases + "
+                         "CORAL loss (Cao et al. 2020) — the only option that accepts more than "
+                         "one marked LoA per window, since its target is a cumulative vector. "
                          "The choice is baked into the checkpoint and picked up automatically "
                          "by fine_tune_XLSTM.py and the decision engine.")
     args = ap.parse_args()
-    head_type = "corn" if args.loss == "corn" else "softmax"
+    head_type = {"corn": "corn", "coral": "coral"}.get(args.loss, "softmax")
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -329,12 +385,35 @@ def main():
         head_type=head_type,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Reject multi-label data on the CORN path rather than training on a
+    # silently-thresholded label: corn_loss partitions samples into HARD
+    # conditional subsets, and it does not error on a soft target — it just
+    # rounds it, which would corrupt the run without any warning.
+    multi = int(sum(1 for _, _, lvl in train_ds.groups if float(np.sum(lvl)) > 1))
+    if multi and head_type == "corn":
+        raise SystemExit(
+            f"--loss corn cannot represent multiple marked LoAs, but {multi} training "
+            f"segment(s) mark more than one. Use --loss coral (ordinal, accepts a set) "
+            f"or --loss ce (nominal, treats the set as a uniform distribution)."
+        )
+    if multi:
+        print(f"[info] {multi}/{len(train_ds.groups)} training segment(s) mark several "
+              f"acceptable LoAs; targets become a distribution over them.")
+
     if head_type == "corn":
         # CORN trains each of the K-1 logits as P(y>k | y>k-1) on its
         # conditional subset; corn_loss builds those subsets internally.
-        loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=5)
+        loss_fn = lambda logits, yb, lvl: corn_loss(logits, yb, num_classes=5)
+    elif head_type == "coral":
+        # CORAL's target is the complementary CDF of the marked set, so a
+        # single mark gives the standard 0/1 extended label and several marks
+        # give intermediate values. No chain rule, no hard subsets.
+        loss_fn = lambda logits, yb, lvl: coral_loss(logits, levels_to_cumulative(lvl))
     else:
-        loss_fn = nn.CrossEntropyLoss()
+        _ce = nn.CrossEntropyLoss()
+        # Soft (B, K) targets — supported since torch 1.10 and numerically
+        # identical to the integer form when exactly one level is marked.
+        loss_fn = lambda logits, yb, lvl: _ce(logits, levels_to_distribution(lvl))
 
     best = float("inf")  # select on MAE (lower is better); +inf ensures the first epoch always saves
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
@@ -351,25 +430,31 @@ def main():
 
     for ep in range(args.epochs):
         model.train()
-        for xb, yb, lb in train_dl:
-            xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
+        for xb, yb, lb, vb in train_dl:
+            xb, yb, lb, vb = xb.to(device), yb.to(device), lb.to(device), vb.to(device)
             logits = model(xb, lengths=lb)
-            loss = loss_fn(logits, yb)
+            loss = loss_fn(logits, yb, vb)
             opt.zero_grad(); loss.backward(); opt.step()
 
-        model.eval(); y_true = []; y_pred = []
+        model.eval(); y_true = []; y_pred = []; y_lvl = []
         with torch.no_grad():
-            for xb, yb, lb in test_dl:
+            for xb, yb, lb, vb in test_dl:
                 xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
                 logits = model(xb, lengths=lb)
-                # logits_to_probs maps either head type to a 5-class PMF, so
-                # argmax decoding is identical for CE and CORN.
+                # logits_to_probs maps every head type to a 5-class PMF, so
+                # argmax decoding is identical for CE, CORN and CORAL.
                 pred = logits_to_probs(logits, head_type).argmax(dim=-1)
                 y_true.append(yb.cpu().numpy()); y_pred.append(pred.cpu().numpy())
+                y_lvl.append(vb.numpy())
         Yt = np.concatenate(y_true, 0); Yp = np.concatenate(y_pred, 0)
+        Yl = np.concatenate(y_lvl, 0)
         acc = accuracy(Yt, Yp); mf1 = macro_f1(Yt, Yp, 5)
-        err = mae(Yt, Yp); kappa = qwk(Yt, Yp, 5)
-        print(f"[epoch {ep:02d}] acc={acc:.3f} macro-F1={mf1:.3f} MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
+        kappa = qwk(Yt, Yp, 5)
+        # Set-aware: credit any level the driver marked acceptable. Both reduce
+        # to the plain single-label metrics when one level is marked per row.
+        err = set_mae(Yl, Yp); sacc = set_accuracy(Yl, Yp)
+        print(f"[epoch {ep:02d}] acc={acc:.3f} set-acc={sacc:.3f} macro-F1={mf1:.3f} "
+              f"MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
 
         # Select on MAE: LoA is ordinal, so off-by-1 << off-by-4, and accuracy
         # is blind to error distance (and to majority-class collapse under the

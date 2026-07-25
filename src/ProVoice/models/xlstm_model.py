@@ -192,6 +192,15 @@ class XLSTMSequenceClassifier(nn.Module):
         models the conditional P(y > k | y > k-1) (Shi, Cao & Raschka 2023).
         Class probabilities are recovered with :func:`logits_to_probs`; train
         with ``coral_pytorch.losses.corn_loss``.
+      - 'coral':   ONE shared weight vector plus ``n_classes - 1`` independent
+        biases (Cao, Mirjalili & Raschka 2020), so logit k is ``w·h + b_k`` and
+        ``sigmoid`` of it is the unconditional P(y > k). Sharing w is what makes
+        the thresholds rank-consistent — an independent Linear per threshold
+        (as 'corn' uses) would not be CORAL. Train with
+        ``coral_pytorch.losses.coral_loss``, which takes a cumulative target
+        vector and therefore accepts SOFT targets: a driver who marks several
+        acceptable LoAs becomes q_k = P(y > k) of the uniform distribution over
+        that set. Single-label data yields the usual 0/1 vector unchanged.
     """
 
     def __init__(
@@ -215,8 +224,9 @@ class XLSTMSequenceClassifier(nn.Module):
                 f"embedding_dim ({embedding_dim}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
-        if head_type not in ('softmax', 'corn'):
-            raise ValueError(f"head_type must be 'softmax' or 'corn', got {head_type!r}")
+        if head_type not in ('softmax', 'corn', 'coral'):
+            raise ValueError(
+                f"head_type must be 'softmax', 'corn' or 'coral', got {head_type!r}")
         self.d_in = d_in
         self.n_classes = n_classes
         self.embedding_dim = embedding_dim
@@ -230,8 +240,16 @@ class XLSTMSequenceClassifier(nn.Module):
         self.backbone = xLSTMBlockStack(
             _stack_cfg(embedding_dim, num_blocks, num_heads, context_length)
         )
-        n_out = n_classes - 1 if head_type == 'corn' else n_classes
-        self.head = nn.Linear(embedding_dim, n_out)
+        if head_type == 'coral':
+            # Shared weight vector, one bias per threshold. This is the whole
+            # point of CORAL: identical w across thresholds means their ordering
+            # is the same for every input, so the model cannot emit
+            # contradictory ranks.
+            self.head = nn.Linear(embedding_dim, 1, bias=False)
+            self.coral_bias = nn.Parameter(torch.zeros(n_classes - 1))
+        else:
+            n_out = n_classes - 1 if head_type == 'corn' else n_classes
+            self.head = nn.Linear(embedding_dim, n_out)
         self.backbone.reset_parameters()
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -251,7 +269,10 @@ class XLSTMSequenceClassifier(nn.Module):
         else:
             idx = (lengths.to(h.device).long() - 1).clamp(min=0)
             pooled = h[torch.arange(h.size(0), device=h.device), idx]
-        return self.head(pooled)
+        out = self.head(pooled)
+        if self.head_type == 'coral':
+            out = out + self.coral_bias   # (B, 1) + (K-1,) -> (B, K-1)
+        return out
 
 
 def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
@@ -268,8 +289,15 @@ def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.T
     """
     if head_type == 'softmax':
         return torch.softmax(logits, dim=-1)
-    if head_type == 'corn':
-        q = torch.cumprod(torch.sigmoid(logits), dim=-1)      # (B, K-1), q_k = P(y > k-1)
+    if head_type in ('corn', 'coral'):
+        if head_type == 'corn':
+            q = torch.cumprod(torch.sigmoid(logits), dim=-1)  # (B, K-1), q_k = P(y > k-1)
+        else:
+            # CORAL logits are UNCONDITIONAL P(y > k), so no chain rule. The
+            # shared weight vector makes the thresholds rank-consistent, but the
+            # learned biases are not constrained to be ordered; take a running
+            # minimum so differencing can never produce a negative probability.
+            q = torch.cummin(torch.sigmoid(logits), dim=-1).values
         ones = torch.ones_like(q[..., :1])
         upper = torch.cat([ones, q], dim=-1)                  # [1, q_1, ..., q_{K-1}]
         lower = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)  # [q_1, ..., q_{K-1}, 0]

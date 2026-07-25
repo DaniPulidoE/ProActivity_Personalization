@@ -14,7 +14,7 @@ from ProVoice.models.xlstm_model import (
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.models.laplace_head import LaplacePosterior, attach_laplace_to_checkpoint
-from coral_pytorch.losses import corn_loss
+from coral_pytorch.losses import coral_loss, corn_loss
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
@@ -26,6 +26,10 @@ from ProVoice.models.train_XLSTM import (
     macro_f1,
     mae,
     qwk,
+    set_accuracy,
+    set_mae,
+    levels_to_cumulative,
+    levels_to_distribution,
 )
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -34,15 +38,44 @@ LEVELS = [f"Level_{i}" for i in range(1, 6)]
 def embed_all(model, dl, device):
     # function that precomputes the embeddings for all sequences in a dataloader, using the frozen in_proj and backbone of the model. Returns pooled embeddings and labels.
     """Run the frozen in_proj+backbone once; return pooled embeddings and labels."""
-    zs, ys = [], []
-    for xb, yb, lb in dl:
+    zs, ys, vs = [], [], []
+    for xb, yb, lb, vb in dl:
         h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
         # Batches are RIGHT-padded: read the hidden state at the last REAL
         # frame (index length-1), same readout as model.forward.
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
         zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
         ys.append(yb)
-    return torch.cat(zs), torch.cat(ys)
+        vs.append(vb)   # multi-hot Level_* — CORAL/CE need it, CORN does not
+    return torch.cat(zs), torch.cat(ys), torch.cat(vs)
+
+
+def head_logits(model, Z):
+    """Apply the head the same way ``forward`` does.
+
+    Needed because the CORAL head keeps its per-threshold biases OUTSIDE
+    ``model.head`` (that separation is what makes the weight vector shared), so
+    calling ``model.head(Z)`` directly would silently drop them.
+    """
+    out = model.head(Z)
+    if getattr(model, "head_type", "softmax") == "coral":
+        out = out + model.coral_bias
+    return out
+
+
+def head_parameters(model):
+    """Trainable head parameters, including the CORAL biases."""
+    params = list(model.head.parameters())
+    if getattr(model, "head_type", "softmax") == "coral":
+        params.append(model.coral_bias)
+    return params
+
+
+def named_head_parameters(model):
+    named = list(model.head.named_parameters())
+    if getattr(model, "head_type", "softmax") == "coral":
+        named.append(("coral_bias", model.coral_bias))
+    return named
     
 def main():
     ap = argparse.ArgumentParser(description="Fine-tune official xLSTM (single-label 5-class).")
@@ -167,47 +200,68 @@ def main():
     model.to(device)
     model.requires_grad_(False) # freeze all parameters
     model.head.requires_grad_(True) # only fine-tune head
-    theta_pop = {n: p.detach().clone() for n, p in model.head.named_parameters()} # anchor weights (population model)
-    opt = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0.0) # no weight decay (penalty on distance to population model weights)
+    if head_type == "coral":
+        model.coral_bias.requires_grad_(True)  # lives outside model.head
+    # anchor weights (population model)
+    theta_pop = {n: p.detach().clone() for n, p in named_head_parameters(model)}
+    # no weight decay (penalty on distance to population model weights)
+    opt = torch.optim.AdamW(head_parameters(model), lr=args.lr, weight_decay=0.0)
     if head_type == "corn":
-        loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=5)
+        loss_fn = lambda logits, target, lvl: corn_loss(logits, target, num_classes=5)
+    elif head_type == "coral":
+        loss_fn = lambda logits, target, lvl: coral_loss(logits, levels_to_cumulative(lvl))
     else:
-        loss_fn = nn.CrossEntropyLoss()
+        _ce = nn.CrossEntropyLoss()
+        loss_fn = lambda logits, target, lvl: _ce(logits, levels_to_distribution(lvl))
 
     # model saving setup
     best = -1.0  # ensures the first epoch always saves, so a checkpoint always exists
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
     
     # precompute embeddings for all sequences in train and test datasets (more efficient - back-bone is frozen)
-    Ztr, ytr = embed_all(model, train_dl, device)   # (n_train, 64), (n_train,), Z represents the embedding
-    Zte, yte = embed_all(model, test_dl, device)
-    Ztr, ytr = Ztr.to(device), ytr.to(device)
-    Zte, yte = Zte.to(device), yte.to(device)
+    Ztr, ytr, Vtr = embed_all(model, train_dl, device)   # (n_train, 64), (n_train,), (n_train, 5)
+    Zte, yte, Vte = embed_all(model, test_dl, device)
+    Ztr, ytr, Vtr = Ztr.to(device), ytr.to(device), Vtr.to(device)
+    Zte, yte, Vte = Zte.to(device), yte.to(device), Vte.to(device)
 
-    
+    # Same reasoning as the population trainer: CORN partitions on a hard label
+    # and silently rounds a soft one, so refuse rather than mis-train.
+    multi = int((Vtr.sum(dim=-1) > 1).sum())
+    if multi and head_type == "corn":
+        raise SystemExit(
+            f"This checkpoint is CORN, which cannot represent multiple marked LoAs, "
+            f"but {multi} fine-tuning segment(s) mark more than one. Retrain the "
+            f"population model with --loss coral."
+        )
+    if multi:
+        print(f"[info] {multi}/{len(Vtr)} fine-tuning segment(s) mark several acceptable LoAs.")
+
     n = Ztr.shape[0] # number of training samples
     for ep in range(args.epochs):
         # train
         perm = torch.randperm(n, device=device) # replaces DataLoader shuffling
         for i in range(0, n, args.batch):
             idx = perm[i:i + args.batch]
-            logits = model.head(Ztr[idx])
+            logits = head_logits(model, Ztr[idx])
             l2sp = sum(((p - theta_pop[n2]) ** 2).sum()
-                    for n2, p in model.head.named_parameters())
-            loss = loss_fn(logits, ytr[idx]) + args.l2sp * l2sp
+                    for n2, p in named_head_parameters(model))
+            loss = loss_fn(logits, ytr[idx], Vtr[idx]) + args.l2sp * l2sp
             opt.zero_grad()
             loss.backward()
             opt.step()
 
         # evaluation: one matrix multiply, no batching needed
         with torch.no_grad():
-            Yp = logits_to_probs(model.head(Zte), head_type).argmax(dim=-1).cpu().numpy()
+            Yp = logits_to_probs(head_logits(model, Zte), head_type).argmax(dim=-1).cpu().numpy()
         Yt = yte.cpu().numpy()
+        Vl = Vte.cpu().numpy()
         acc = accuracy(Yt, Yp)
         mf1 = macro_f1(Yt, Yp, 5)
-        err = mae(Yt, Yp)
+        err = set_mae(Vl, Yp)
+        sacc = set_accuracy(Vl, Yp)
         kappa = qwk(Yt, Yp, 5)
-        print(f"[epoch {ep:02d}] acc={acc:.3f} macro-F1={mf1:.3f} MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
+        print(f"[epoch {ep:02d}] acc={acc:.3f} set-acc={sacc:.3f} macro-F1={mf1:.3f} "
+              f"MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
 
         # save model if best so far (or always, for now)
         if acc > best:
