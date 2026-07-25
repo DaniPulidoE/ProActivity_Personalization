@@ -493,7 +493,10 @@ class LoASelectionPopup(object):
         cursor, and submits when the cursor is parked on CONFIRM.
         """
         if self.selected is None:
-            self.selected = 0 if direction > 0 else CONFIRM_ROW
+            # Enter on an actual LoA row from either end. Landing on CONFIRM
+            # first would put the cursor on a row that does nothing until
+            # something is ticked, which reads as an unresponsive control.
+            self.selected = 0 if direction > 0 else len(LOA_LABELS) - 1
         else:
             self.selected = max(0, min(CONFIRM_ROW, self.selected + direction))
 

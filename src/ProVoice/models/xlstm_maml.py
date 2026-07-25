@@ -139,6 +139,16 @@ def build_driver_segments(
             if np.isnan(lv).any() or lv.sum() <= 0:
                 skipped.append(gid)
                 continue
+            if (lv > 0).sum() > 1:
+                # MAML adapts a functional head with corn_loss/CE on integer
+                # targets; argmax'ing a marked SET here would silently train on
+                # a label the driver never gave.
+                raise SystemExit(
+                    f"Segment {gid!r} marks several acceptable LoAs, which the MAML "
+                    f"path cannot represent. Train the population model with "
+                    f"`train_XLSTM.py --loss coral` instead, or restrict this run to "
+                    f"single-label sessions."
+                )
             y = int(np.argmax(lv))
             rows = [g.iloc[i].to_dict() for i in range(len(g))]
             rows = truncate_frames_by_seconds(rows, window_seconds)
@@ -366,11 +376,11 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
     fine_tune_XLSTM-style AdamW on the head over the driver's first K segments
     (true session prefix), then MAE/QWK on everything after — the same
     temporal protocol as the sweep script."""
-    xs, ys, ls = collate(segs[:K])
+    xs, ys, ls, _ = collate(segs[:K])
     Zs = embed(model, xs, ls, device)
     w, b = adapt_head_deployed(Zs, ys.to(device), model.head.weight, model.head.bias,
                                loss_fn, steps, lr, l2sp)
-    xq, yq, lq = collate(segs[K:])
+    xq, yq, lq, _ = collate(segs[K:])
     Zq = embed(model, xq, lq, device)
     with torch.no_grad():
         pred = logits_to_probs(F.linear(Zq, w, b), head_type).argmax(dim=-1)
@@ -500,6 +510,17 @@ def main():
           + (f" (first-order warm-up for {args.fo_warmup_epochs} epoch(s))"
              if args.fo_warmup_epochs > 0 and args.order != "first" else ""))
     # CORN or softmax loss
+    if head_type == "coral":
+        # The CORAL head keeps its per-threshold biases outside model.head, but
+        # the inner loop adapts a functional head via F.linear(Z, w, b) — the
+        # shared weight vector is (1, emb), so that would produce one logit
+        # instead of K-1. Refuse rather than train something incoherent.
+        raise SystemExit(
+            "xlstm_maml does not support CORAL checkpoints (its functional inner "
+            "loop assumes one weight vector per threshold). Use --loss ce or "
+            "--loss corn for the population model, or fine_tune_XLSTM.py, which "
+            "does support CORAL."
+        )
     if head_type == "corn":
         loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=model.n_classes)
     else:
@@ -605,9 +626,9 @@ def main():
                 # Embed support/query. Support keeps its graph whenever the
                 # support pathway into the backbone is used (second/imaml);
                 # first order drops it. Query always keeps its graph.
-                xs, ys, ls = collate(support)
+                xs, ys, ls, _ = collate(support)
                 Zs = embed(model, xs, ls, device, grad=second or imaml)
-                xq, yq, lq = collate(query)
+                xq, yq, lq, _ = collate(query)
                 Zq = embed(model, xq, lq, device, grad=True)
 
                 if imaml:

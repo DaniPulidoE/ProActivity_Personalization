@@ -86,7 +86,7 @@ def embed_segments(model, Xs, ys, context_length: int, device: str, chunk: int =
     collate = make_collate(context_length)
     zs = []
     for i in range(0, len(Xs), chunk):
-        xb, _, lb = collate(list(zip(Xs[i:i + chunk], ys[i:i + chunk])))
+        xb, _, lb, _ = collate(list(zip(Xs[i:i + chunk], ys[i:i + chunk])))
         h = model.backbone(model.in_proj(xb.to(device)))
         # RIGHT-padded batches: read the hidden state at the last REAL frame.
         idx = (lb.to(h.device).long() - 1).clamp(min=0)

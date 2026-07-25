@@ -180,7 +180,16 @@ def make_collate(context_length: int):
                     torch.empty(0, dtype=torch.long),
                     torch.empty(0, len(LEVELS)))
         xs, ys, ls, lvls = [], [], [], []
-        for X, y, lvl in batch:
+        for item in batch:
+            # Items are (X, y, multi-hot levels). Callers that predate
+            # multi-label labels (xlstm_maml, sweep_train_frac) still hand over
+            # plain (X, y) pairs, so derive the one-hot from y for those.
+            if len(item) == 2:
+                X, y = item
+                lvl = np.zeros(len(LEVELS), dtype=np.float32)
+                lvl[int(y)] = 1.0
+            else:
+                X, y, lvl = item
             T = X.shape[0]
             if T > context_length:
                 X = X[-context_length:]
