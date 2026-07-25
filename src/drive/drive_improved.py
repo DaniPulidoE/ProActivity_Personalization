@@ -347,6 +347,32 @@ def append_user_loa_selection(selection_row):
         writer.writerow(row)
 
 
+def _set_world_frozen(world, frozen):
+    """Freeze/unfreeze the whole scene while the LoA popup is open.
+
+    The experiment runs in CARLA async mode, where the server free-runs and a
+    brake control only makes the ego *coast* to a stop while NPC traffic keeps
+    driving. Disabling physics on every vehicle stops them all instantly and in
+    place; re-enabling resumes them. No-ops harmlessly if the world/actor query
+    fails.
+    """
+    if world is None or getattr(world, 'world', None) is None:
+        return
+    try:
+        vehicles = world.world.get_actors().filter('vehicle.*')
+    except Exception:
+        return
+    for actor in vehicles:
+        try:
+            if frozen:
+                # Kill residual motion so nothing lurches on resume.
+                actor.set_target_velocity(carla.Vector3D(0, 0, 0))
+                actor.set_target_angular_velocity(carla.Vector3D(0, 0, 0))
+            actor.set_simulate_physics(not frozen)
+        except Exception:
+            pass
+
+
 class LoASelectionPopup(object):
     def __init__(self, width, height, interval_seconds=20):
         self.interval_ms = int(interval_seconds * 1000)
@@ -1712,14 +1738,11 @@ def game_loop(args):
 
             if loa_popup.should_open(now_ms):
                 loa_popup.open(now_ms)
+                # Freeze the whole scene (ego + NPC traffic) so nothing moves
+                # while the driver deliberates over the LoA for the last 20 s.
+                _set_world_frozen(world, True)
 
             if loa_popup.active:
-                if isinstance(world.player, carla.Vehicle):
-                    pause_control = carla.VehicleControl()
-                    pause_control.throttle = 0.0
-                    pause_control.brake = 1.0
-                    pause_control.hand_brake = True
-                    world.player.apply_control(pause_control)
                 for event in events:
                     action, selected_loa = loa_popup.handle_event(event)
                     if action == 'quit':
@@ -1752,6 +1775,8 @@ def game_loop(args):
                             'system_fcd': system_snapshot.get('fcd', system_snapshot.get('FCD', '')),
                         })
                         loa_popup.close(now_ms)
+                        # Resume the simulation now that the label is captured.
+                        _set_world_frozen(world, False)
                 world.render(display)
                 loa_popup.render(display)
                 pygame.display.flip()
