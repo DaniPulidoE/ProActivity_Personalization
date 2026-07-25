@@ -415,25 +415,50 @@ compatibility vs native mode, and troubleshooting.
 
 ### Camera Options
 
-You can adjust the camera source by modifying the `camera_source` variable in `src/ProVoice/main.py`.
+The camera source is a **command-line argument** to `src/ProVoice/main.py`, not a
+variable to edit. Accepted values:
 
-##### Use the default camera (front-facing camera)
-```python
+| `camera_source` | Resolves to |
+|---|---|
+| `local` | local device index `0` |
+| a digit, e.g. `1` | that local device index |
+| `udp` | the stream at `camera_url` |
+| anything else (default `front`) | local device index `0` |
+
+```bash
+# local webcam (default)
 python src/ProVoice/main.py camera_source=local
-```
-##### Use UDP Streaming:
-```python
-python src/ProVoice/main.py camera_source=udp
-```
-You can specify the UDP streaming port (default port: 8554)
-```python
+
+# a second local camera
+python src/ProVoice/main.py camera_source=1
+
+# UDP stream (default port 8554)
 python src/ProVoice/main.py camera_source=udp camera_url=udp://127.0.0.1:8554
 ```
 
-To enable UDP streaming, run `ffmpeg` in a separate terminal on macOS or Linux:
+> **`start_experiment.py` does not forward these.** The launcher passes no camera
+> arguments, so ProVoice always falls back to local device index `0`. To use a
+> streamed camera you must start `src/ProVoice/main.py` yourself (see
+> [Manual Launch](#manual-launch-alternative)).
+
+To feed a UDP stream, run `ffmpeg` on the machine holding the camera. Note
+`udp://127.0.0.1:8554` only works when sender and receiver are the same machine;
+across machines, the receiver must listen on all interfaces (`udp://@:8554`)
+and the sender targets the receiver's LAN address.
+
 ```bash
+# Windows (DirectShow) — list devices with: ffmpeg -list_devices true -f dshow -i dummy
+ffmpeg -f dshow -i video="HD Pro Webcam C920" -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
+
+# macOS
 ffmpeg -f avfoundation -framerate 30 -i "0" -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
+
+# Linux
+ffmpeg -f v4l2 -framerate 30 -i /dev/video0 -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554
 ```
+
+Streaming adds encode/decode latency and jitter to a pipeline that samples driver
+state continuously, so prefer a directly-attached camera for data collection.
 
 
 
