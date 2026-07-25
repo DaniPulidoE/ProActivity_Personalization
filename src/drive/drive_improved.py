@@ -353,8 +353,14 @@ def _set_world_frozen(world, frozen):
     The experiment runs in CARLA async mode, where the server free-runs and a
     brake control only makes the ego *coast* to a stop while NPC traffic keeps
     driving. Disabling physics on every vehicle stops them all instantly and in
-    place; re-enabling resumes them. No-ops harmlessly if the world/actor query
-    fails.
+    place.
+
+    On resume we re-enable physics and *restore each vehicle's saved velocity*.
+    This does two things: (1) the ego keeps the speed it had before the popup,
+    as requested; (2) it wakes the rigid body — a vehicle whose physics was just
+    re-enabled comes back asleep and ignores throttle until it receives a
+    velocity/impulse, which is why the car "couldn't accelerate" after a plain
+    physics toggle. No-ops harmlessly if the world/actor query fails.
     """
     if world is None or getattr(world, 'world', None) is None:
         return
@@ -362,15 +368,30 @@ def _set_world_frozen(world, frozen):
         vehicles = world.world.get_actors().filter('vehicle.*')
     except Exception:
         return
-    for actor in vehicles:
-        try:
-            if frozen:
-                # Kill residual motion so nothing lurches on resume.
-                actor.set_target_velocity(carla.Vector3D(0, 0, 0))
-                actor.set_target_angular_velocity(carla.Vector3D(0, 0, 0))
-            actor.set_simulate_physics(not frozen)
-        except Exception:
-            pass
+
+    if frozen:
+        saved = {}
+        for actor in vehicles:
+            try:
+                saved[actor.id] = (actor.get_velocity(), actor.get_angular_velocity())
+                actor.set_simulate_physics(False)
+            except Exception:
+                pass
+        world._frozen_velocities = saved
+    else:
+        saved = getattr(world, '_frozen_velocities', {})
+        for actor in vehicles:
+            try:
+                actor.set_simulate_physics(True)
+                vel, ang = saved.get(actor.id, (None, None))
+                if vel is not None:
+                    # Order matters: physics must be back on before the target
+                    # velocity is applied, otherwise CARLA drops it.
+                    actor.set_target_velocity(vel)
+                    actor.set_target_angular_velocity(ang)
+            except Exception:
+                pass
+        world._frozen_velocities = {}
 
 
 class LoASelectionPopup(object):
