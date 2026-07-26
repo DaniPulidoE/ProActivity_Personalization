@@ -18,13 +18,33 @@ class OnlineRPPG(RemoteVitalSigns):
 
     See: https://physiologicailab.github.io/mmrphys-live/
     """
+    # frame_rate defaults to 30 to match the SCAMPS checkpoint loaded below
+    # (the SCAMPS configs specify FS: 30; BP4D would be 25). DataCollector
+    # overrides it with the rate the camera actually achieved.
     def __init__(self, frame_rate: int = 30, crop_size: int = 72):
         self.ingest_count_frame = 0
+        self.dropped_frames = 0     # frames lost to a full queue (see add_frame)
         sitepackage_paths = site.getsitepackages()
-        # Prefer a checkpoint trained on a REAL dataset (BP4D: real subjects with
-        # pulse + respiration ground truth) over the synthetic SCAMPS one — it
-        # generalizes far better to a real webcam. Fall back to SCAMPS if the
-        # BP4D checkpoint is not present in this install.
+        # SCAMPS is the default, NOT BP4D, despite being synthetic. Reasons:
+        #
+        #  1. Reproducible preprocessing. Every BP4D config in the upstream repo
+        #     sets DO_CROP_FACE: False against a pre-made "BP4D_72x72" dataset
+        #     that no script in the repo produces, so the crop convention behind
+        #     the BP4D checkpoints is unknown. The SCAMPS configs specify it in
+        #     full (Y5F detector, square box, LARGE_BOX_COEF 1.5, re-detect every
+        #     FS frames, INTER_AREA, FS 30) -- which is exactly what this
+        #     pipeline now reproduces.
+        #  2. Its reported number is measured under OUR deployment condition.
+        #     Paper Table 3: MMRPhys+TSFM trained on SCAMPS and tested
+        #     cross-dataset on iBVP + PURE + UBFC-rPPG gives HR MAE 1.54 bpm
+        #     (Corr 0.900). The BP4D figures are within-dataset (Fold1/2/3), so
+        #     they are optimistic and not comparable. The paper also validates
+        #     SCAMPS -> BP4D+ transfer directly (SS6).
+        #
+        # Caveat to validate in the pilot: SCAMPS is rendered, and RGB
+        # respiration comes from head motion / pulse-amplitude modulation, which
+        # synthetic data models less faithfully than pulse. Trust HR first; check
+        # RR against a reference before relying on rr_delta.
         #
         # The checkpoint MUST match ``crop_size``: infer_from_frames dispatches on
         # height (9 -> MMRPhysSEF, 36 -> MMRPhysMEF, 72 -> MMRPhysLEF), so a
@@ -35,8 +55,8 @@ class OnlineRPPG(RemoteVitalSigns):
         # The paper's own ablation (§5) reports 72x72 ~= 36x36 > 9x9 for BOTH rPPG
         # and rRSP, so the x180x72 LEF checkpoint is the one to use.
         rel_candidates = [
-            ("BP4D",   "BP4D_MMRPhysLEF_BVP_RSP_RGBx180x72_SFSAM_Label_Fold1_Epoch4.pth"),
             ("SCAMPS", "SCAMPS_MMRPhysLEF_BVP_RSP_RGBx180x72_SFSAM_Label_Epoch0.pth"),
+            ("BP4D",   "BP4D_MMRPhysLEF_BVP_RSP_RGBx180x72_SFSAM_Label_Fold1_Epoch4.pth"),
         ]
         model_path = None
         for path in sitepackage_paths:
@@ -135,7 +155,11 @@ class OnlineRPPG(RemoteVitalSigns):
             self.frame_queue.put((self.ingest_count_frame, face_frame, processed_frame, True),
                                  timeout=0.01)
         except queue.Full:
-            print("Frame queue full!")
+            # A dropped frame silently breaks the uniform-dt assumption the FFT
+            # rests on, so count it rather than only printing: the caller
+            # surfaces the total as a data-quality field.
+            self.dropped_frames += 1
+            print(f"Frame queue full! (dropped {self.dropped_frames} total)")
             return None, None
 
         self.ingest_count_frame += 1

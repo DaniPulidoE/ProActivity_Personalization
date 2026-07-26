@@ -37,6 +37,34 @@ except Exception as e:
     EmotiEffLibRecognizer = None  # type: ignore
     HAS_EMOTIEFFLIB = False
 
+class _Phase:
+    """Context manager that records how long a loop section took, in ms.
+
+    Overhead is two perf_counter() calls (~100 ns) against sections measured in
+    milliseconds, so it is safe to leave enabled during a live session.
+    """
+    __slots__ = ('store', 'name', 't0')
+
+    def __init__(self, store, name: str) -> None:
+        self.store = store
+        self.name = name
+        self.t0 = 0.0
+
+    def __enter__(self):
+        if self.store is not None:
+            self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if self.store is not None:
+            dt = (time.perf_counter() - self.t0) * 1000.0
+            buf = self.store.get(self.name)
+            if buf is None:
+                buf = self.store[self.name] = deque(maxlen=200)
+            buf.append(dt)
+        return False
+
+
 _emotion_recognizer = None
 _EMOTIEFFLIB_MODEL = "enet_b0_8_best_afew"
 # EmotiEffLib emits 8 AffectNet classes; map to the pipeline's 7-class
@@ -124,11 +152,12 @@ class DataCollector:
         vehicle_state_url: Optional[str] = None,
         calibration_dir: str = _CALIBRATION_DIR,
         rppg_fps: float = 30.0,
-        face_box_hz: float = 5.0,
+        face_box_hz: float = 1.0,
     ) -> None:
         # Everything stop()/__del__ touches is set FIRST, so a constructor
         # that fails part-way still leaves a safely destructible object.
         self._running = False
+        self._stopped = False
         self._thread: Optional[threading.Thread] = None
         self._state_poll_thread: Optional[threading.Thread] = None
         self._yolo_thread: Optional[threading.Thread] = None
@@ -211,11 +240,15 @@ class DataCollector:
                 self.cap = cv2.VideoCapture(self.cam_index)  # type: ignore
                 print(f"Connecting: {self.cam_index} ...")
                 print(f"Camera opened: {self.cap.isOpened()}")
-                # Request the capture format MMRPhys's own demos use. The driver
-                # may refuse any of these, so read back what it actually granted:
-                # the achieved rate becomes the rPPG sampling rate (it sets both
-                # the Butterworth cutoffs and the FFT frequency axis, so getting
-                # it wrong scales every HR/RR estimate).
+                # Request 640x480 (as MMRPhys's own demos do) at the rate the
+                # deployed checkpoint was trained on: the SCAMPS configs specify
+                # FS: 30, so the model's temporal filters were learned at 30 fps.
+                # (Switch this to 25 if the BP4D checkpoint is ever made the
+                # default -- BP4D is a 25 fps dataset.)
+                # The driver may refuse any of these, so read back what it
+                # actually granted: the achieved rate becomes the rPPG sampling
+                # rate (it sets both the Butterworth cutoffs and the FFT
+                # frequency axis, so getting it wrong scales every HR/RR value).
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)    # type: ignore
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # type: ignore
                 self.cap.set(cv2.CAP_PROP_FPS, self._rppg_fps_target)  # type: ignore
@@ -283,17 +316,54 @@ class DataCollector:
         # EMA rather than Kalman: the head moves slowly, so a velocity model buys
         # nothing and EMA mirrors the toolbox's own near-static box. Both tunable.
         self._rppg_box_coef: float = 1.5                        # = LARGE_BOX_COEF
-        self._rppg_box_alpha: float = 0.25                      # EMA weight (lower = smoother)
+        self._rppg_box_alpha: float = 1.0                       # 1.0 = no smoothing (reference)
         self._rppg_box_ema: Optional[np.ndarray] = None         # smoothed [cx, cy, w, h]
         # Shared square crop box, written by the face-box worker and read by the
         # capture worker at full frame rate (see _face_box_loop / _capture_loop).
         self._box_lock = threading.Lock()
         self._rppg_box: Optional[Tuple[int, int, int, int]] = None   # (x, y, w, h)
         self._rppg_box_t: float = 0.0                                # monotonic stamp
-        self._rppg_box_staleness_s: float = 2.0                      # drop the box after this
+        # Drop the box after this. 4 s, not 2: the box-refresh period is set by
+        # how long a detection takes, which inflates under load, and at 2 s it
+        # sat right on the threshold -- so the box intermittently expired and
+        # rPPG feeding stalled even though the detector never failed. This is a
+        # tolerance for a SLOW detector, not for an absent face: a real
+        # look-away is caught by the miss messages and the gap counter.
+        self._rppg_box_staleness_s: float = 4.0
         self._box_landmarker = None                                  # worker-owned detector
         # rPPG results, published by the capture worker, read by the main loop.
         self._rppg_lock = threading.Lock()
+        # Continuity tracking. Frames are fed only while a fresh face box exists,
+        # so a look-away punches a hole in the stream and the model window
+        # splices across it — the FFT then treats the join as continuous, giving
+        # a silently wrong HR.
+        #
+        # Suppression is OFF by default: in practice gaps fire often enough that
+        # discarding every affected reading leaves too little data. The counters
+        # below stay live, so `rppg_gaps` still marks which frames sit near a
+        # discontinuity and post-hoc analysis can filter on it. Set
+        # _rppg_gap_suppress = True to refuse contaminated readings outright.
+        self._rppg_gap_suppress: bool = False
+        # 30 frames (= 1 s at 30 fps), not 5. At 5 the counter fired on ordinary
+        # scheduler jitter: the main loop never sleeps (its per-tick decision +
+        # logging work exceeds sampling_interval, so `next_t < now` always), so
+        # the capture worker gets descheduled for a few hundred ms at a time and
+        # trips any threshold near one frame interval. Those stalls are real
+        # frame loss, but counting them tells you nothing you can act on --
+        # 1 s isolates actual look-aways, which is what the flag is for.
+        self._rppg_gap_frames: float = 30.0   # gap > this many frame intervals = discontinuity
+        self._rppg_last_fed_t: float = 0.0
+        self._rppg_contig: int = 0            # gap-free frames fed since the last hole
+        self._rppg_gap_count: int = 0         # discontinuities seen this session
+        self._rppg_suppressed: int = 0        # readings discarded as contaminated
+        # Face-detector misses. Every failed detection is reported: a miss stops
+        # the crop box being refreshed, and once it goes stale the capture worker
+        # stops feeding rPPG altogether — so this is the upstream cause of most
+        # rPPG dropouts, and the check that tells you whether YOLO5Face actually
+        # works on your camera and lighting.
+        self._face_box_misses: int = 0        # total failed detections
+        self._face_box_consec_misses: int = 0 # current unbroken run
+        self._face_box_last_ok_t: float = 0.0 # monotonic stamp of last success
         self.data_history: deque = deque(maxlen=window_size)
         self.window_size = window_size
         self.blink_count = 0
@@ -343,6 +413,44 @@ class DataCollector:
         self._dbg_last_tick_t: float = 0.0
         self._dbg_last_print_t: float = 0.0
         self._dbg_dt_hist: deque = deque(maxlen=100)
+        # Per-section timing. Set to None to disable all phase instrumentation;
+        # the _Phase context manager then short-circuits to two attribute reads.
+        self._prof: Optional[Dict[str, deque]] = {}
+        self._prof_period_s: float = 5.0     # how often the breakdown is printed
+        self._prof_last_print_t: float = 0.0
+
+    def _phase(self, name: str) -> _Phase:
+        """``with self._phase('decide'): ...`` — times one section of the loop."""
+        return _Phase(self._prof, name)
+
+    def _print_profile(self, dt_avg_ms: float) -> None:
+        """Print the per-section breakdown, slowest first.
+
+        ``dt`` is the whole tick; the sections below are the parts of it that
+        are instrumented, so ``dt - sum(sections)`` is time the loop spent
+        descheduled or in uninstrumented code.
+        """
+        if not self._prof:
+            return
+        rows = []
+        for name, buf in self._prof.items():
+            if not buf:
+                continue
+            vals = sorted(buf)
+            n = len(vals)
+            rows.append((sum(vals) / n, vals[min(n - 1, int(n * 0.95))], name))
+        if not rows:
+            return
+        rows.sort(reverse=True)
+        accounted = sum(r[0] for r in rows if '.' not in r[2])
+        print(f"[DataCollector][prof] tick={dt_avg_ms:7.1f}ms  "
+              f"accounted={accounted:7.1f}ms  "
+              f"unaccounted={dt_avg_ms - accounted:7.1f}ms  "
+              f"(mean/p95 over last {len(next(iter(self._prof.values())))} ticks)")
+        for mean, p95, name in rows:
+            share = (100.0 * mean / dt_avg_ms) if dt_avg_ms > 0 else 0.0
+            indent = "    " if '.' in name else "  "
+            print(f"{indent}{name:<22s} {mean:7.1f} ms  p95 {p95:7.1f} ms  {share:5.1f}%")
 
     def __del__(self):
         try:
@@ -455,27 +563,30 @@ class DataCollector:
         Y2 = min(h, int((y1 + my) * h))
         return X, Y, max(0, X2 - X), max(0, Y2 - Y)
 
-    def _rppg_crop_box(self, landmarks, w: int, h: int):
-        """SQUARE, enlarged + EMA-smoothed face box (x, y, bw, bh) for rPPG.
+    def _rppg_crop_box(self, x: float, y: float, bw: float, bh: float,
+                       w: int, h: int):
+        """SQUARE, enlarged face box (x, y, bw, bh) for rPPG.
 
-        Reproduces the training-time crop geometry of MMRPhys exactly
-        (BaseLoader.face_detection + crop_face_resize):
+        Reproduces the training-time crop geometry of MMRPhys
+        (BaseLoader.face_detection + crop_face_resize) given a raw detector box:
 
-          1. take the face box,
-          2. SQUARE it: ``side = max(w, h)``, re-centred on the box centre,
-          3. enlarge by ``_rppg_box_coef`` (= LARGE_BOX_COEF = 1.5) about that
-             same centre, so the crop takes in forehead and cheeks.
+          1. SQUARE it: ``side = max(w, h)``, re-centred on the box centre,
+          2. enlarge by ``_rppg_box_coef`` (= LARGE_BOX_COEF = 1.5) about that
+             same centre, so the crop takes in forehead and cheeks,
+          3. clamp to the frame.
 
         Squaring matters: the crop is later resized to 72x72, so a non-square box
         anisotropically stretches the face relative to every frame the model was
-        trained on. The source box here is the MediaPipe landmark hull rather than
-        YOLO5Face/WiderFace, which is the one remaining approximation.
+        trained on.
 
-        The EMA then low-pass filters centre and size to damp the per-frame
-        min/max jitter that would otherwise smear the pulse spectrum (rPPG is a
-        spectral estimate, so crop jitter is noise). Clamped to the frame.
+        ``_rppg_box_alpha`` = 1.0 reproduces the reference exactly: no temporal
+        smoothing, so the box is piecewise constant between detections (the
+        upstream loader uses the box from detection ``i // detection_freq``
+        verbatim, with USE_MEDIAN_FACE_BOX False). Lower it to re-enable EMA
+        smoothing of centre and size -- worthwhile only if the detection rate is
+        raised well above the reference 1 Hz, since the EMA time constant is
+        ~1/alpha detections.
         """
-        x, y, bw, bh = self._bbox_from_landmarks(landmarks, w, h, margin=0.0)
         cx, cy = x + bw / 2.0, y + bh / 2.0
         side = max(bw, bh) * self._rppg_box_coef
         box = np.array([cx, cy, side, side], dtype=np.float32)
@@ -777,7 +888,8 @@ class DataCollector:
         # loop takes whatever is newest. It may occasionally see the same frame
         # twice when it out-runs the camera — harmless, since blink/yawn/PERCLOS
         # are all gated on wall-clock time rather than frame counts.
-        frame = self._get_capture_frame()
+        with self._phase('visual.frame'):
+            frame = self._get_capture_frame()
         if frame is None:
             self.latest_frame = None
             return False
@@ -787,7 +899,8 @@ class DataCollector:
         # landmarks. Replaces both the legacy solutions FaceMesh and the separate
         # Haar cascade, so there is no longer a second detector to disagree with.
         h_img, w_img = frame.shape[:2]
-        landmarks = self.compute_face_landmarks(frame)
+        with self._phase('visual.landmarks'):
+            landmarks = self.compute_face_landmarks(frame)
         face_present = bool(landmarks)
         data['face_present'] = face_present
 
@@ -798,7 +911,8 @@ class DataCollector:
 
         # gaze score — get_gaze_score returns the per-driver baseline when no face
         # is present, so the standardized value below is neutral (0.0 deviation).
-        gaze_score = self.get_gaze_score(frame, landmarks)
+        with self._phase('visual.gaze'):
+            gaze_score = self.get_gaze_score(frame, landmarks)
         normalized_gaze_score = (gaze_score - self.calibrate['gaze_score']['mean']) / self.calibrate['gaze_score']['std'] if self.calibrate['gaze_score']['std'] != 0 else 0.0
         data['gaze_score'] = round(normalized_gaze_score, 3)
         data['gaze_distracted'] = bool(gaze_score > self.calibrate['gaze_score']['threshold'])
@@ -836,16 +950,30 @@ class DataCollector:
                 data['rr_history'] = rr_hist
                 data['rr_delta'] = self._standardized_delta(last_rr, 'rr', rr_hist)
 
+            # rPPG data quality (dashboard/post-hoc only; not model inputs).
+            # rppg_gaps counts look-aways that broke the model's input window;
+            # rppg_dropped counts frames lost to a full queue. Both silently
+            # invalidate the FFT's uniform-sampling assumption, so a session
+            # with a high count should be treated with suspicion.
+            data['rppg_gaps'] = int(self._rppg_gap_count)
+            data['rppg_dropped'] = int(getattr(self.rppg_estimator, 'dropped_frames', 0))
+            data['rppg_suppressed'] = int(self._rppg_suppressed)
+            # Detector misses are the upstream cause of most rPPG dropouts.
+            data['facebox_misses'] = int(self._face_box_misses)
+            data['facebox_consec_misses'] = int(self._face_box_consec_misses)
+
         # Emotion — EmotiEffLib on the RGB tight face crop.
         if emotion_crop_bgr is not None:
-            emo = self.detect_emotion(cv2.cvtColor(emotion_crop_bgr, cv2.COLOR_BGR2RGB))
+            with self._phase('visual.emotion'):
+                emo = self.detect_emotion(cv2.cvtColor(emotion_crop_bgr, cv2.COLOR_BGR2RGB))
             if emo:
                 data.update(emo)  # emotion, emotion_prob
 
         # EAR/MAR from the landmarks (sentinels when no face, as before).
         if face_present:
             try:
-                eye, mouth = _perception.eye_mouth_aspect_ratios(landmarks, w_img, h_img)
+                with self._phase('visual.earmar'):
+                    eye, mouth = _perception.eye_mouth_aspect_ratios(landmarks, w_img, h_img)
             except Exception as e:  # noqa: BLE001
                 print(e, "Error computing EAR/MAR")
                 eye, mouth = 0.3, 0.2
@@ -861,7 +989,8 @@ class DataCollector:
 
         # Dashboard overlay: eye/mouth boxes (landmarks) + object boxes (YOLO).
         # Drawn on a copy — the raw frame published to the YOLO worker is untouched.
-        frame_annot = _perception.draw_overlays(frame, landmarks, yolo_dets)
+        with self._phase('visual.overlay'):
+            frame_annot = _perception.draw_overlays(frame, landmarks, yolo_dets)
 
         MOUTH_AR_CONSEC_FRAMES = 3
         BLINK_MIN_MS = 100   # below this is EAR noise, not a blink (this is equivalent to 2 frames at 20Hz)
@@ -1121,11 +1250,14 @@ class DataCollector:
             data['rr_delta'] = None
 
         if self.visual_enabled:
-            if not self._visual_process(data):
+            with self._phase('visual'):
+                ok = self._visual_process(data)
+            if not ok:
                 return data, False
 
         if self.context_enabled:
-            self._carla_process(data)
+            with self._phase('carla'):
+                self._carla_process(data)
 
         data['timestamp'] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
@@ -1180,6 +1312,10 @@ class DataCollector:
                                   f"collect={_dbg_collect_ms:6.1f}ms "
                                   f"fps_inst={data['fps_inst']:5.2f} fps_avg={data['fps_avg']:5.2f} "
                                   f"face={data.get('face_present')}")
+                        if (self._prof is not None
+                                and _dbg_t0 - self._prof_last_print_t >= self._prof_period_s):
+                            self._prof_last_print_t = _dbg_t0
+                            self._print_profile(_dbg_avg)
                     self._dbg_last_tick_t = _dbg_t0
                     # --- end DEBUG ---
 
@@ -1201,28 +1337,35 @@ class DataCollector:
                         self._read_fail_since = 0.0  # good read — reset the timer
 
                         # Add sequence for LSTM models.
-                        seq_entry = dict(data)
-                        seq_entry.pop('bpm_history', None)
-                        seq_entry.pop('rr_history', None)
-                        with self._lock:
-                            self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
+                        with self._phase('history'):
+                            seq_entry = dict(data)
+                            seq_entry.pop('bpm_history', None)
+                            seq_entry.pop('rr_history', None)
+                            with self._lock:
+                                self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
 
                         action = None
                         if self.decision_engine:
 
                             data['functionname'] = data.get('functionname', self.functionname)
                             # separate dict to avoid adding the whole history to each sequence entry
-                            data_for_decision = dict(data)
-                            data_for_decision['sequence'] = list(self.data_history)
+                            # decide.copy isolates the per-tick cost of duplicating the
+                            # whole window; decide.run is the engine itself.
+                            with self._phase('decide.copy'):
+                                data_for_decision = dict(data)
+                                data_for_decision['sequence'] = list(self.data_history)
+                                _decision_input = dict(data_for_decision)
 
-                            action = self.decision_engine.decide(dict(data_for_decision))
+                            with self._phase('decide.run'):
+                                action = self.decision_engine.decide(_decision_input)
                             if self.logger and isinstance(action, dict):
-                                action_for_log = dict(action)
-                                for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
-                                    value = data.get(key)
-                                    if value not in (None, ''):
-                                        action_for_log.setdefault(key, value)
-                                self.logger.log_processed(action_for_log)
+                                with self._phase('log_processed'):
+                                    action_for_log = dict(action)
+                                    for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
+                                        value = data.get(key)
+                                        if value not in (None, ''):
+                                            action_for_log.setdefault(key, value)
+                                    self.logger.log_processed(action_for_log)
                             data['last_action'] = action
                             # collect_data() snapshotted latest_data BEFORE the
                             # decision existed; re-publish so the dashboard/get_latest
@@ -1232,19 +1375,21 @@ class DataCollector:
 
 
                         if self.logger:
-                            raw_with_decision = dict(data)
-                            if isinstance(action, dict):
-                                raw_with_decision['LoA'] = action.get('LoA')
-                                fcd = action.get('fcd') or action.get('fcd_scores')
-                                if isinstance(fcd, dict):
-                                    raw_with_decision['FCD'] = fcd
-                            raw_with_decision.pop('bpm_history', None)
-                            raw_with_decision.pop('rr_history', None)
-                            self.logger.log_raw(raw_with_decision)
+                            with self._phase('log_raw'):
+                                raw_with_decision = dict(data)
+                                if isinstance(action, dict):
+                                    raw_with_decision['LoA'] = action.get('LoA')
+                                    fcd = action.get('fcd') or action.get('fcd_scores')
+                                    if isinstance(fcd, dict):
+                                        raw_with_decision['FCD'] = fcd
+                                raw_with_decision.pop('bpm_history', None)
+                                raw_with_decision.pop('rr_history', None)
+                                self.logger.log_raw(raw_with_decision)
 
 
                         if self.actuator and action is not None:
-                            self.actuator.execute(action)
+                            with self._phase('actuate'):
+                                self.actuator.execute(action)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -1254,7 +1399,11 @@ class DataCollector:
             now = time.monotonic()
             if next_t < now: # fell behind — skip missed ticks
                 next_t = now
-            time.sleep(max(0.0, next_t - now))
+            # 'sleep' near zero means the loop never idles: it is running flat
+            # out and every other thread (capture, face-box, YOLO) is competing
+            # with it for slices.
+            with self._phase('sleep'):
+                time.sleep(max(0.0, next_t - now))
 
         print("data collector stopped!")
 
@@ -1316,27 +1465,52 @@ class DataCollector:
                 with self._box_lock:
                     box = self._rppg_box
                     box_t = self._rppg_box_t
+                crop = None
                 if box is not None and (now - box_t) <= self._rppg_box_staleness_s:
                     x, y, bw, bh = box
                     crop = frame[y:y + bh, x:x + bw]
-                    if crop.size > 0:
-                        try:
-                            hr, rr = self.rppg_estimator.add_frame(crop)
-                        except Exception as e:  # noqa: BLE001
-                            print(e, "Error feeding rPPG estimator")
-                            hr = rr = None
-                        # A reading surfaces only every inference_interval frames;
-                        # None in between. Publish for the main loop to read.
-                        if hr is not None and not (hr != hr):   # excludes NaN
-                            with self._rppg_lock:
-                                self._last_hr = round(float(hr), 1)
-                                self._last_hr_t = now
-                                self.bpm_history.append(self._last_hr)
-                        if rr is not None and not (rr != rr):
-                            with self._rppg_lock:
-                                self._last_rr = round(float(rr), 1)
-                                self._last_rr_t = now
-                                self.rr_history.append(self._last_rr)
+                    if crop.size == 0:
+                        crop = None
+                if crop is not None:
+                    # --- continuity check (before feeding) ---------------
+                    gap_limit = self._rppg_gap_frames / max(1e-6, self._rppg_fps)
+                    if self._rppg_last_fed_t and (now - self._rppg_last_fed_t) > gap_limit:
+                        self._rppg_gap_count += 1
+                        self._rppg_contig = 0
+                        if self._rppg_gap_count <= 5 or self._rppg_gap_count % 50 == 0:
+                            print(f"[DataCollector][rppg] frame gap "
+                                  f"{now - self._rppg_last_fed_t:.2f}s "
+                                  f"(> {gap_limit:.2f}s) — window spans a "
+                                  f"discontinuity (gap #{self._rppg_gap_count}"
+                                  f"{'; suppressing' if self._rppg_gap_suppress else ''})")
+                    else:
+                        self._rppg_contig += 1
+                    self._rppg_last_fed_t = now
+
+                    try:
+                        hr, rr = self.rppg_estimator.add_frame(crop)
+                    except Exception as e:  # noqa: BLE001
+                        print(e, "Error feeding rPPG estimator")
+                        hr = rr = None
+                    # A reading surfaces only every inference_interval frames;
+                    # None in between. Publish for the main loop to read —
+                    # but only once the model's whole input window is free of
+                    # pre-gap frames.
+                    window = int(getattr(self.rppg_estimator, 'num_frames', 181))
+                    contaminated = self._rppg_contig < window
+                    if (hr is not None or rr is not None) and contaminated:
+                        self._rppg_suppressed += 1   # counted whether or not we act on it
+                    clean = (not contaminated) or (not self._rppg_gap_suppress)
+                    if clean and hr is not None and not (hr != hr):   # excludes NaN
+                        with self._rppg_lock:
+                            self._last_hr = round(float(hr), 1)
+                            self._last_hr_t = now
+                            self.bpm_history.append(self._last_hr)
+                    if clean and rr is not None and not (rr != rr):
+                        with self._rppg_lock:
+                            self._last_rr = round(float(rr), 1)
+                            self._last_rr_t = now
+                            self.rr_history.append(self._last_rr)
 
             # Achieved-rate telemetry: the configured filters/FFT assume
             # self._rppg_fps, so a large drift here invalidates HR/RR.
@@ -1351,38 +1525,115 @@ class DataCollector:
                           f"scaled by {measured / self._rppg_fps:.2f}x")
         print("[DataCollector] Capture worker stopped.")
 
+    @staticmethod
+    def _make_yolo5face():
+        """The YOLO5Face detector MMRPhys was trained with, or None.
+
+        Weights (Y5sF_WFRGB.pth, WiderFace) ship inside the installed mmrphys
+        package. Importing it normally would execute
+        ``mmrphys.dataset.data_loader.__init__``, which pulls in every dataset
+        loader and therefore mat73 / skimage — heavy deps this project does not
+        need. Pre-registering a stand-in package module with the right __path__
+        makes Python skip that __init__ while still resolving the submodules.
+        """
+        import importlib
+        import sys as _sys
+        import types as _types
+        pkg = "mmrphys.dataset.data_loader"
+        if pkg not in _sys.modules:
+            _ds = importlib.import_module("mmrphys.dataset")
+            shim = _types.ModuleType(pkg)
+            shim.__path__ = [os.path.join(os.path.dirname(_ds.__file__), "data_loader")]
+            shim.__package__ = pkg
+            _sys.modules[pkg] = shim
+        mod = importlib.import_module(pkg + ".face_detector.YOLO5Face")
+        y5f = mod.YOLO5Face("Y5F", None)   # None -> CUDA when available, else CPU
+        # Detect at 320 rather than the default 640. detect_face() scales the
+        # frame by img_size/max(h, w) and letterboxes to a square, then maps the
+        # result back with scale_coords -- so the returned box is still in
+        # full-frame coordinates and the box DISTRIBUTION is unchanged; only the
+        # compute drops (measured 79.7 ms -> 33.0 ms per call, 2.4x).
+        #
+        # This matters because the worker refreshes the crop box: under load a
+        # detection inflates ~10x, pushing the refresh period past
+        # _rppg_box_staleness_s, which stalls rPPG feeding entirely. Halving the
+        # cost keeps the period clear of that threshold. A driver's face fills a
+        # large part of a 640x480 frame, so it stays far above the detector's
+        # small-face limit. Raise back to 640 if detections start to be missed.
+        y5f.img_size = 320
+        return y5f
+
     def _face_box_loop(self) -> None:
         """Background thread: maintain the square rPPG crop box.
 
-        Runs its own FaceLandmarker at ``face_box_hz`` (MediaPipe task objects
-        are not safe to share across threads, so this is a second instance — the
-        main loop keeps its own for gaze/EAR/MAR). Publishing the box from here
-        rather than from the main loop means the capture worker never crops with
-        a box that went stale because the decision engine blocked.
+        Uses YOLO5Face — the same WiderFace detector MMRPhys was trained with —
+        so the crop box comes from the same distribution as the training data
+        instead of being approximated from a MediaPipe landmark hull. Falls back
+        to a private FaceLandmarker instance if YOLO5Face cannot be loaded
+        (MediaPipe task objects are not safe to share across threads, hence a
+        second instance; the main loop keeps its own for gaze/EAR/MAR).
 
-        Cadence mirrors the reference implementations: MMRPhys re-detects every
-        DYNAMIC_DETECTION_FREQUENCY frames (~1 s) and the browser demo every 3-6
-        frames, reusing a cached box in between.
+        Cadence matches the reference exactly: the upstream loader re-detects
+        every DYNAMIC_DETECTION_FREQUENCY frames, which equals FS for every
+        dataset -> 1 Hz, holding the box constant in between. That also keeps
+        the cost sane: YOLO5Face is ~106 ms/call on CPU (~11% of one core at
+        1 Hz, but ~53% at 5 Hz).
+
+        Publishing the box from here rather than from the main loop means the
+        capture worker never crops with a box that went stale because the
+        decision engine blocked.
         """
-        if not HAS_MP:
-            print("[DataCollector] MediaPipe unavailable; face-box worker exiting.")
-            return
+        detect = None       # frame(BGR) -> (x, y, w, h) or None
+        detector_name = "?"
         try:
-            _model = _resolve_face_landmarker_model()
-            if not _model:
-                print("[DataCollector] No landmarker model; face-box worker exiting.")
-                return
-            _opts = mp_vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=_model),
-                running_mode=mp_vision.RunningMode.IMAGE,
-                num_faces=1,
-                output_face_blendshapes=False,
-                output_facial_transformation_matrixes=False,
-            )
-            self._box_landmarker = mp_vision.FaceLandmarker.create_from_options(_opts)
+            y5f = self._make_yolo5face()
+
+            def detect(frame):                                   # noqa: F811
+                # Upstream feeds RGB to the detector (its loaders convert on read).
+                res = y5f.detect_face(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if not res:
+                    return None
+                x1, y1, x2, y2 = res
+                return x1, y1, x2 - x1, y2 - y1
+
+            detector_name = "YOLO5Face"
+            print("[DataCollector] Face-box worker: YOLO5Face (matches MMRPhys training).")
         except Exception as e:  # noqa: BLE001
-            print(e, "Error initializing face-box landmarker; worker exiting")
-            return
+            print(e, "YOLO5Face unavailable; face-box worker falling back to MediaPipe")
+
+        if detect is None:
+            if not HAS_MP:
+                print("[DataCollector] No face detector available; face-box worker exiting.")
+                return
+            try:
+                _model = _resolve_face_landmarker_model()
+                if not _model:
+                    print("[DataCollector] No landmarker model; face-box worker exiting.")
+                    return
+                _opts = mp_vision.FaceLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=_model),
+                    running_mode=mp_vision.RunningMode.IMAGE,
+                    num_faces=1,
+                    output_face_blendshapes=False,
+                    output_facial_transformation_matrixes=False,
+                )
+                self._box_landmarker = mp_vision.FaceLandmarker.create_from_options(_opts)
+            except Exception as e:  # noqa: BLE001
+                print(e, "Error initializing face-box landmarker; worker exiting")
+                return
+
+            def detect(frame):                                   # noqa: F811
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,   # type: ignore
+                                  data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                res = self._box_landmarker.detect(mp_img)
+                if not res.face_landmarks:
+                    return None
+                h_i, w_i = frame.shape[:2]
+                # margin=0: the 1.5x enlargement below supplies the padding.
+                return self._bbox_from_landmarks(res.face_landmarks[0], w_i, h_i, margin=0.0)
+
+            detector_name = "MediaPipe"
+
         print(f"[DataCollector] Face-box worker started "
               f"({1.0 / self._face_box_interval:.1f} Hz).")
         last_id = -1
@@ -1395,22 +1646,49 @@ class DataCollector:
                 last_id = fid
                 h_img, w_img = frame.shape[:2]
                 try:
-                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,       # type: ignore
-                                      data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    res = self._box_landmarker.detect(mp_img)
-                    landmarks = res.face_landmarks[0] if res.face_landmarks else None
+                    raw = detect(frame)
                 except Exception as e:  # noqa: BLE001
                     print(e, "Error detecting face box")
-                    landmarks = None
-                if landmarks:
-                    # Square + 1.5x + EMA, exactly as at training time.
-                    box = self._rppg_crop_box(landmarks, w_img, h_img)
+                    raw = None
+                now_d = time.monotonic()
+                if raw is not None:
+                    # Square + 1.5x, exactly as at training time.
+                    box = self._rppg_crop_box(raw[0], raw[1], raw[2], raw[3],
+                                              w_img, h_img)
                     if box[2] > 0 and box[3] > 0:
+                        if self._face_box_consec_misses:
+                            print(f"[DataCollector][facebox] {detector_name} "
+                                  f"re-acquired the face after "
+                                  f"{self._face_box_consec_misses} miss(es) "
+                                  f"({now_d - self._face_box_last_ok_t:.1f}s blind)")
+                        self._face_box_consec_misses = 0
+                        self._face_box_last_ok_t = now_d
                         with self._box_lock:
                             self._rppg_box = box
-                            self._rppg_box_t = time.monotonic()
-                # No face -> leave the last box in place; the capture worker
-                # drops it once _rppg_box_staleness_s elapses.
+                            self._rppg_box_t = now_d
+                else:
+                    # No face: the box is NOT refreshed, so it ages. Once it
+                    # passes _rppg_box_staleness_s the capture worker stops
+                    # feeding rPPG entirely — report every miss, with enough
+                    # context to tell "driver looked away" from "detector cannot
+                    # see this face at all".
+                    self._face_box_misses += 1
+                    self._face_box_consec_misses += 1
+                    blind = (f"{now_d - self._face_box_last_ok_t:.1f}s since last detection"
+                             if self._face_box_last_ok_t
+                             else "NEVER detected a face this session")
+                    with self._box_lock:
+                        box_age = now_d - self._rppg_box_t if self._rppg_box_t else None
+                    stale = (box_age is None
+                             or box_age > self._rppg_box_staleness_s)
+                    print(f"[DataCollector][facebox] {detector_name} found NO face "
+                          f"(consecutive {self._face_box_consec_misses}, "
+                          f"total {self._face_box_misses}, "
+                          f"{blind}) — "
+                          + ("crop box STALE: rPPG is no longer being fed"
+                             if stale else
+                             f"reusing box, {self._rppg_box_staleness_s - (box_age or 0.0):.1f}s "
+                             f"before rPPG stops"))
             next_t += self._face_box_interval
             now = time.monotonic()
             if next_t < now:
@@ -1520,6 +1798,13 @@ class DataCollector:
             print(f"[DataCollector] Vehicle state polling started → {self.vehicle_state_url}")
 
     def stop(self) -> None:
+        # main.py calls stop() from the SIGINT handler and again from its
+        # finally block, so make it idempotent — the second pass would
+        # otherwise re-join dead threads and re-stop the rPPG worker, which is
+        # where some of the Ctrl+C noise came from.
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
         # Halt the loop BEFORE stopping the rPPG estimator / releasing the
         # camera, so no tick can touch an already-stopped resource.
         self._running = False
@@ -1530,10 +1815,15 @@ class DataCollector:
                 self._yolo_thread.join(timeout=2.0)
             if self._face_box_thread and self._face_box_thread.is_alive():
                 self._face_box_thread.join(timeout=2.0)
-            # Capture worker last among the visual threads: it must have exited
-            # before release() frees the VideoCapture it is reading from.
+            # Capture worker last among the visual threads: it MUST have exited
+            # before release() frees the VideoCapture it is reading from, or
+            # cv2 tears the device down under an in-flight cap.read() and the
+            # backend raises on the way out (this is what made Ctrl+C noisy).
+            # It only ever needs to finish one read, so allow a generous wait —
+            # and if it somehow does not exit, skip release() entirely and let
+            # process teardown reclaim the device.
             if self._capture_thread and self._capture_thread.is_alive():
-                self._capture_thread.join(timeout=2.0)
+                self._capture_thread.join(timeout=5.0)
             if self._state_poll_thread and self._state_poll_thread.is_alive():
                 self._state_poll_thread.join(timeout=2.0)
         except Exception:
@@ -1546,6 +1836,16 @@ class DataCollector:
         self.release()
 
     def release(self) -> None:
+        # Never release the device while the capture worker could still be
+        # inside cap.read() — that races the backend and surfaces as an error
+        # during Ctrl+C. If the worker is still alive, drop our reference and
+        # let process teardown reclaim the camera instead.
+        cap_thread = self._capture_thread
+        if cap_thread is not None and cap_thread.is_alive():
+            print("[DataCollector] Capture worker still running — skipping "
+                  "cap.release() to avoid racing an in-flight read.")
+            self.cap = None
+            return
         try:
             if self.cap is not None:
                 self.cap.release()
