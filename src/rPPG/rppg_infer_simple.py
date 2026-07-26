@@ -18,23 +18,60 @@ class OnlineRPPG(RemoteVitalSigns):
 
     See: https://physiologicailab.github.io/mmrphys-live/
     """
-    def __init__(self, frame_rate: int = 10, crop_size: int = 72):
+    def __init__(self, frame_rate: int = 30, crop_size: int = 72):
         self.ingest_count_frame = 0
         sitepackage_paths = site.getsitepackages()
+        # Prefer a checkpoint trained on a REAL dataset (BP4D: real subjects with
+        # pulse + respiration ground truth) over the synthetic SCAMPS one — it
+        # generalizes far better to a real webcam. Fall back to SCAMPS if the
+        # BP4D checkpoint is not present in this install.
+        #
+        # The checkpoint MUST match ``crop_size``: infer_from_frames dispatches on
+        # height (9 -> MMRPhysSEF, 36 -> MMRPhysMEF, 72 -> MMRPhysLEF), so a
+        # "...x180x9" (SEF) file with crop_size=72 instantiates LEF instead. That
+        # does NOT raise — all three variants share identical state_dict key names
+        # and tensor shapes (87,600 params; they differ only in conv strides and
+        # head geometry) — so 9x9-trained filters silently run on a 72x72 pyramid.
+        # The paper's own ablation (§5) reports 72x72 ~= 36x36 > 9x9 for BOTH rPPG
+        # and rRSP, so the x180x72 LEF checkpoint is the one to use.
+        rel_candidates = [
+            ("BP4D",   "BP4D_MMRPhysLEF_BVP_RSP_RGBx180x72_SFSAM_Label_Fold1_Epoch4.pth"),
+            ("SCAMPS", "SCAMPS_MMRPhysLEF_BVP_RSP_RGBx180x72_SFSAM_Label_Epoch0.pth"),
+        ]
         model_path = None
         for path in sitepackage_paths:
-            model_path = Path(path) / "mmrphys" / "final_model_release" / "SCAMPS" / \
-                         "SCAMPS_MMRPhysSEF_BVP_RSP_RGBx180x9_SFSAM_Label_Epoch0.pth"
-            if model_path.exists():
+            for sub, fname in rel_candidates:
+                cand = Path(path) / "mmrphys" / "final_model_release" / sub / fname
+                if cand.exists():
+                    model_path = cand
+                    break
+            if model_path is not None:
                 break
+        print(f"[OnlineRPPG] using checkpoint: {model_path}")
         config = {
             'model': {'path': model_path,
                       'type': 'torch', 'input_shape': {'num_frames': 181, 'channels': 3, 'height': crop_size, 'width': crop_size}},
             'video': {'sampling_rate': frame_rate},
             'processing': {
-                'plot_duration': 20,  # seconds
-                # Old: 'inference_interval': 180  # ~18s at 10fps, too infrequent
-                'inference_interval': 45   # ~6s at 7fps / ~4.5s at 10fps
+                'plot_duration': 20,  # seconds -> signal buffer = 20 s * fs
+                # Frames between forward passes. MUST stay at num_frames - 1:
+                # RemoteVitalSigns.inference_thread appends ALL (num_frames - 1)
+                # output samples to the signal buffer, so any smaller interval
+                # re-appends signal that is already there. Consecutive windows
+                # would then overlap while the buffer is still read as uniformly
+                # sampled at fs, corrupting the FFT's time axis -- the buffer
+                # advances faster than real time and the HR peak is pulled off
+                # (measured: 68.6 bpm for a true 72.0 at interval=45, and the
+                # bias swings +-3.6 bpm with the interval value). Every upstream
+                # demo config ships 181/180 for exactly this reason, and the
+                # paper's protocol (SS4.3) likewise amalgamates NON-overlapping
+                # segments before the FFT.
+                #
+                # Was 45 -- chosen when capture ran at ~10 fps, where 180 frames
+                # meant an 18 s wait between readings. At 30 fps it is 6 s, so
+                # the reason for shortening it no longer applies. One 181-frame
+                # LEF pass costs ~96 ms on CPU => ~1.6% of one core.
+                'inference_interval': 180
             }}
 
         super().__init__(config)
@@ -67,6 +104,12 @@ class OnlineRPPG(RemoteVitalSigns):
     def add_frame(self, face_frame: np.ndarray) -> tuple[float, float] | tuple[None, None]:
         """
         Add a single input frame and compute BPM when window is full.
+
+        ``face_frame`` is a BGR face crop. To match the training pipeline the
+        caller must supply a SQUARE crop enlarged 1.5x around the detector box
+        (see DataCollector._rppg_crop_box); this method only handles the colour
+        conversion, the downscale and the layout.
+
         Returns:
             bpm (float) or None
         """
@@ -75,9 +118,16 @@ class OnlineRPPG(RemoteVitalSigns):
             print("interrupt add_frame")
             return None, None
 
-        # Resize to expected network input size
+        # Resize to expected network input size.
+        # INTER_AREA (not the cv2 default INTER_LINEAR) — this is what
+        # BaseLoader.crop_face_resize uses during training, and it is the correct
+        # choice for a large downscale: without area averaging, skin texture
+        # aliases and head motion injects broadband noise into what is ultimately
+        # a spectral estimate. Pixel SCALE is irrelevant (the model applies
+        # torch.diff then InstanceNorm3d, so 0-255 vs 0-1 is cancelled).
         processed_frame = cv2.cvtColor(face_frame, cv2.COLOR_BGR2RGB)
-        processed_frame = cv2.resize(processed_frame, (self.width, self.height))
+        processed_frame = cv2.resize(processed_frame, (self.width, self.height),
+                                     interpolation=cv2.INTER_AREA)
         processed_frame = processed_frame[np.newaxis, :, :, :]
         processed_frame = processed_frame.transpose(0, 3, 1, 2)
 

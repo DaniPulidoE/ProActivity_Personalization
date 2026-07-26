@@ -116,6 +116,55 @@ def _landmarks_to_pixels(lms, w: int, h: int) -> np.ndarray:
     return arr
 
 
+def eye_mouth_aspect_ratios(landmarks, w: int, h: int) -> Tuple[float, float]:
+    """EAR, MAR from a list of normalised face landmarks (objects with ``.x``/``.y``).
+
+    API-agnostic: works with both the legacy ``mediapipe.solutions`` landmark
+    list and the maintained ``mediapipe.tasks`` FaceLandmarker landmark list,
+    since both expose the same per-point ``.x``/``.y`` interface and the same
+    canonical 468/478-point indexing. Returned as ``(ear, mar)``.
+    """
+    px = _landmarks_to_pixels(landmarks, w, h)
+    ear = (_ear_from_landmarks(px, _LEFT_EYE_IDX) + _ear_from_landmarks(px, _RIGHT_EYE_IDX)) / 2.0
+    mar = _mar_from_landmarks(px)
+    return round(float(ear), 3), round(float(mar), 3)
+
+
+# Mouth landmark indices used for the EAR/MAR overlay box.
+_MOUTH_IDX = (_MOUTH_LEFT_CORNER, _MOUTH_RIGHT_CORNER, _MOUTH_TOP_INNER,
+              _MOUTH_BOTTOM_INNER, _MOUTH_TOP_OUTER, _MOUTH_BOTTOM_OUTER)
+
+
+def _group_bbox(px: np.ndarray, idxs, pad: int = 5) -> Tuple[int, int, int, int]:
+    pts = px[list(idxs)]
+    x0, y0 = pts.min(axis=0)
+    x1, y1 = pts.max(axis=0)
+    return int(x0) - pad, int(y0) - pad, int(x1) + pad, int(y1) + pad
+
+
+def draw_overlays(frame_bgr: np.ndarray, landmarks=None,
+                  detections: Optional[List[Tuple[str, float, Tuple[int, int, int, int]]]] = None) -> np.ndarray:
+    """Return an annotated COPY of the frame for the dashboard.
+
+    Draws green boxes around each eye and the mouth (from the face landmarks)
+    and boxes+labels for YOLO-detected objects (phone / drink). Restores the
+    overlay the old ``frametest()`` produced, now driven by the Tasks landmarks
+    and the decoupled YOLO worker's detections. Never mutates the input frame.
+    """
+    annotated = frame_bgr.copy()
+    h, w = annotated.shape[:2]
+    if landmarks:
+        px = _landmarks_to_pixels(landmarks, w, h)
+        for idxs in (_LEFT_EYE_IDX, _RIGHT_EYE_IDX, _MOUTH_IDX):
+            x0, y0, x1, y1 = _group_bbox(px, idxs)
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 255, 0), 1)
+    for lab, conf, (x1, y1, x2, y2) in (detections or []):
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        cv2.putText(annotated, f"{lab} {conf:.2f}", (x1, max(0, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    return annotated
+
+
 class EARMARDetector:
     """EAR/MAR + facial landmark overlay on top of MediaPipe FaceMesh."""
 

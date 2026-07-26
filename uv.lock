@@ -275,6 +275,22 @@ wheels = [
 ]
 
 [[package]]
+name = "emotiefflib"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "onnx", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "onnxruntime", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "opencv-python", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "pillow", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fe/7a/f50f2e22cd82a49a09bb178ba12482a849c362265f0e3aa63330bd4dfba6/emotiefflib-1.1.1.tar.gz", hash = "sha256:c775c1bde17108042855fa914a2e5e2d5aaa7f61520fd3c1b757fc39e0bde027", size = 34888, upload-time = "2025-09-10T22:06:20.673Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/17/b8e3cd65ed401418e242138be69a6440e2ecce6ea5a5c9e3880dda2b3db5/emotiefflib-1.1.1-py3-none-any.whl", hash = "sha256:ba44da2b3d6120375d76a1e7571f8b2234f4eab5109f05c1f34ad5d5aa8e6242", size = 35102, upload-time = "2025-09-10T22:07:12.842Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -918,6 +934,22 @@ wheels = [
 ]
 
 [[package]]
+name = "onnx"
+version = "1.22.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "numpy", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "protobuf", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/04/19/8ea73a64b368b75fe339771a20a02bc61ea1f551484c9e3d9d0bfbd0450f/onnx-1.22.0.tar.gz", hash = "sha256:ef40c0aaf0b643857ea9306fc7eddce17eaf9fb0407e4801f1fc5758443a38e0", size = 12024721, upload-time = "2026-06-15T12:50:05.354Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5a/9d/3af461ac6c714b8b369cb71499659932f4f12cfb066250b62f7567c3d530/onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl", hash = "sha256:82e9f27fc1223cb06d68a56bed6f9d3caf3d0dad1b61bce45006d529b15bd94c", size = 16966387, upload-time = "2026-06-15T12:49:40.918Z" },
+    { url = "https://files.pythonhosted.org/packages/13/a8/734725bb703c5fabb687f79c79e51249475212b3eb37771ac4a4ac9b487f/onnx-1.22.0-cp312-abi3-win_amd64.whl", hash = "sha256:72ccebab3bac07215c204ce8848d42e78eaaa666badbf72d25cd359b9f269e3a", size = 17213290, upload-time = "2026-06-15T12:49:45.933Z" },
+]
+
+[[package]]
 name = "onnxruntime"
 version = "1.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1105,6 +1137,7 @@ dependencies = [
     { name = "dash", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "dash-bootstrap-components", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "einops", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "emotiefflib", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "fastapi", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "flask", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "huggingface-hub", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -1143,6 +1176,7 @@ requires-dist = [
     { name = "dash", specifier = ">=3.3.0" },
     { name = "dash-bootstrap-components", specifier = ">=2.0.4" },
     { name = "einops" },
+    { name = "emotiefflib", specifier = ">=1.1.1" },
     { name = "fastapi", specifier = ">=0.124.4" },
     { name = "flask", specifier = ">=3.1.2" },
     { name = "huggingface-hub", specifier = ">=0.25.0" },
