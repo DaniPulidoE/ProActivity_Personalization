@@ -138,6 +138,37 @@ _CALIBRATION_SCHEMA: Dict[str, Tuple[str, ...]] = {
 # not center). See the yawn-rate block there for the full rationale.
 _YAWN_ANSCOMBE_ZERO = 2.0 * math.sqrt(3.0 / 8.0)
 
+# ── Robust baseline statistics for the rPPG signals ───────────────────────────
+# HR/RR readings contain occasional harmonic-lock outliers (see _hr_is_harmonic),
+# so the baseline uses median + MAD rather than mean + std. 1.4826*MAD is the
+# consistency constant that makes MAD estimate sigma for Gaussian data.
+_MAD_TO_SIGMA = 1.4826
+# Floors on the robust scale, same lesson as PERCLOS_MIN_SCALE: the dispersion of
+# a CALM baseline measures moment-to-moment noise (MAD ~1-3 bpm), not the driver's
+# dynamic range, so dividing by it turns hr_delta into a signal-to-noise ratio.
+# With a 2 bpm floor a perfectly ordinary 75 -> 95 bpm response normalized to
+# z = +10. These floors are instead the scale of change that MATTERS: ~10 bpm and
+# ~3 breaths/min, so a meaningful arousal response lands near z = 1-3.
+# In practice the floor almost always wins, which is the honest conclusion — the
+# per-driver LOCATION (median) is worth personalizing, the per-driver DISPERSION
+# is not estimable from a calm baseline. Switching _standardized_delta to
+# proportional change (HR - ref)/ref would drop the scale question entirely.
+# Units: bpm and breaths/min.
+_ROBUST_SCALE_FLOOR = {'bpm': 10.0, 'rr': 3.0}
+
+# ── HR harmonic rejection ─────────────────────────────────────────────────────
+# Band, as a multiple of the running reference, in which a reading is treated as
+# the 2nd harmonic rather than the pulse. +-15% around 2x: the toolbox's FFT
+# resolution is 30/600 Hz = 3 bpm, so a true 2f peak always lands well inside.
+_HR_HARMONIC_LO = 1.7
+_HR_HARMONIC_HI = 2.3
+# Accepted readings needed before the band is trusted enough to reject anything.
+_HR_REF_MIN = 3
+# Consecutive rejections after which the REFERENCE is presumed wrong rather than
+# the readings, and is re-seeded. Bounds the worst case: without it a bad
+# reference could suppress every reading for the rest of the session.
+_HR_REJECT_RUN_MAX = 5
+
 
 class DataCollector:
     def __init__(
@@ -336,6 +367,12 @@ class DataCollector:
         self._last_rr: Optional[float] = None
         self._last_hr_t: float = 0.0
         self._last_rr_t: float = 0.0
+        # Harmonic-rejection state. Touched only by the rPPG worker thread, so no
+        # lock; the counters are ints, read atomically by the main loop for the
+        # logged diagnostic.
+        self._hr_accepted: deque = deque(maxlen=5)  # recent ACCEPTED readings -> reference
+        self._hr_reject_run: int = 0                # consecutive rejections
+        self._hr_harmonic_rejects: int = 0          # session total, logged
         self._rppg_staleness_s: float = 15.0
         # rPPG face crop: MMRPhys is trained on a SQUARED face-detector box
         # enlarged by LARGE_BOX_COEF=1.5 (see _rppg_crop_box for the exact
@@ -663,6 +700,36 @@ class DataCollector:
         Y2 = min(h, int(round(scy + sh / 2.0)))
         return X, Y, max(0, X2 - X), max(0, Y2 - Y)
 
+    def _hr_is_harmonic(self, hr: float) -> bool:
+        """True when ``hr`` looks like the 2nd harmonic of the current pulse rate.
+
+        The toolbox picks the largest FFT peak in 0.6-3.3 Hz (36-198 bpm) with no
+        harmonic disambiguation. A real BVP waveform carries genuine energy at 2f
+        (sharp systolic upstroke, dicrotic notch), and for any true rate below
+        99 bpm that 2f peak is still inside the band — so every seated
+        participant is exposed. The symptom is a reading that jumps to ~2x the
+        established rate and back (measured: ~150 against a true ~75).
+
+        Compared against a running median of recent ACCEPTED readings. The
+        reference decides ONLY accept/reject; the published value is the raw
+        reading, so genuine excursions keep their full amplitude — unlike a
+        rolling median, which would flatten any excursion shorter than its own
+        half-width.
+
+        A GRADUAL rise never triggers this: intermediate readings are accepted,
+        the reference tracks upward, and the band moves with it. Only an
+        effectively instantaneous near-doubling matches, which is not reachable
+        while seated. That is why persistence is not the discriminator here —
+        a sustained harmonic and a sustained real change look identical in
+        duration, and only the *transition* distinguishes them.
+        """
+        if len(self._hr_accepted) < _HR_REF_MIN:
+            return False                       # reference not established yet
+        ref = float(np.median(self._hr_accepted))
+        if ref <= 0.0:
+            return False
+        return _HR_HARMONIC_LO * ref <= hr <= _HR_HARMONIC_HI * ref
+
     def calibrate_step(self) -> None:
         if not self.visual_enabled or self.cap is None:
             # No camera at all — no baseline is obtainable; finish immediately
@@ -760,12 +827,24 @@ class DataCollector:
                     # sits ~0.35 sigma high, silently turning 0.75 into ~0.78.
                     # NOTE: for 'ear' this field holds the MEDIAN, not the mean.
                     mean = float(np.median(values))
+                    std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
+                elif key in ('bpm', 'rr'):
+                    # Fully robust: median for location, MAD for scale. The rPPG
+                    # readings entering here still contain the occasional 2f
+                    # harmonic that slipped past _hr_is_harmonic (and, for 'rr',
+                    # no harmonic filter at all — see the note in that method).
+                    # The MEAN would be pulled by them, but the STD far more so:
+                    # a handful of ~150s among ~75s inflates it enormously, and
+                    # _standardized_delta divides hr_delta by it.
+                    mean = float(np.median(values))
+                    mad = float(np.median([abs(x - mean) for x in values]))
+                    std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
                 else:
                     mean = sum(values) / len(values)
-                # Dispersion about the location estimate above. Not read at serving
-                # for 'ear'/'mar' (only 'threshold' is); kept for the record and
-                # for the gaze_score normalization, which does use it.
-                std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
+                    # Dispersion about the location estimate above. Not read at
+                    # serving for 'mar' (only 'threshold' is); kept for the record
+                    # and for the gaze_score normalization, which does use it.
+                    std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
                 # MAR: fixed 0.55 rather than a fraction of the baseline. A driving
                 # baseline contains speech, which inflates a calibrated mouth
                 # baseline and would make yawns be missed for the whole session;
@@ -1056,6 +1135,10 @@ class DataCollector:
             data['rppg_gaps'] = int(self._rppg_gap_count)
             data['rppg_dropped'] = int(getattr(self.rppg_estimator, 'dropped_frames', 0))
             data['rppg_suppressed'] = int(self._rppg_suppressed)
+            # Readings dropped as probable 2f harmonics. A high count means the
+            # BVP fundamental is weak (crop, lighting or motion) — worth checking
+            # before trusting the session's HR at all.
+            data['rppg_harmonic_rejects'] = int(self._hr_harmonic_rejects)
             # Detector misses are the upstream cause of most rPPG dropouts.
             data['facebox_misses'] = int(self._face_box_misses)
             data['facebox_consec_misses'] = int(self._face_box_consec_misses)
@@ -1692,10 +1775,32 @@ class DataCollector:
                         self._rppg_suppressed += 1   # counted whether or not we act on it
                     clean = (not contaminated) or (not self._rppg_gap_suppress)
                     if clean and hr is not None and not (hr != hr):   # excludes NaN
-                        with self._rppg_lock:
-                            self._last_hr = round(float(hr), 1)
-                            self._last_hr_t = now
-                            self.bpm_history.append(self._last_hr)
+                        hr_val = round(float(hr), 1)
+                        # Drop probable 2f locks, but never more than
+                        # _HR_REJECT_RUN_MAX in a row — past that the reference
+                        # is likelier to be wrong than the readings.
+                        if (self._hr_is_harmonic(hr_val)
+                                and self._hr_reject_run < _HR_REJECT_RUN_MAX):
+                            self._hr_reject_run += 1
+                            self._hr_harmonic_rejects += 1
+                            if (self._hr_harmonic_rejects <= 5
+                                    or self._hr_harmonic_rejects % 25 == 0):
+                                print(f"[DataCollector][rppg] dropped {hr_val} bpm as a "
+                                      f"probable 2f harmonic of "
+                                      f"~{float(np.median(self._hr_accepted)):.0f} bpm "
+                                      f"(reject #{self._hr_harmonic_rejects})")
+                        else:
+                            if self._hr_reject_run >= _HR_REJECT_RUN_MAX:
+                                print(f"[DataCollector][rppg] {self._hr_reject_run} "
+                                      f"consecutive rejections — re-seeding the HR "
+                                      f"reference from {hr_val} bpm")
+                                self._hr_accepted.clear()
+                            self._hr_reject_run = 0
+                            self._hr_accepted.append(hr_val)
+                            with self._rppg_lock:
+                                self._last_hr = hr_val
+                                self._last_hr_t = now
+                                self.bpm_history.append(hr_val)
                     if clean and rr is not None and not (rr != rr):
                         with self._rppg_lock:
                             self._last_rr = round(float(rr), 1)
