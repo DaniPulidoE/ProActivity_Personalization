@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, csv, os
+import json, csv, os, threading
 from typing import Any, Dict, List
 
 # Fixed schema for decisions.csv. New keys from any strategy or data_collector
@@ -22,7 +22,14 @@ class Logger:
                  processed_data_file: str = "./data/decisions.csv") -> None:
         self.raw_data_file = raw_data_file
         self.processed_data_file = processed_data_file
-        
+
+        # The two streams are written from DIFFERENT threads: log_raw from the
+        # DataCollector's collection loop, log_processed from its decision loop.
+        # They use separate handles, so today one writer per file makes this
+        # lock redundant — it is here so that invariant failing later degrades
+        # into contention rather than an interleaved, unparseable log.
+        self._write_lock = threading.Lock()
+
         os.makedirs(os.path.dirname(self.raw_data_file) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(self.processed_data_file) or ".", exist_ok=True)
         
@@ -43,8 +50,10 @@ class Logger:
 
     def log_raw(self, data: Dict[str, Any]) -> None:
         try:
-            self._raw_fh.write(json.dumps(data or {}, ensure_ascii=False) + "\n")
-            self._raw_fh.flush()
+            line = json.dumps(data or {}, ensure_ascii=False) + "\n"
+            with self._write_lock:
+                self._raw_fh.write(line)
+                self._raw_fh.flush()
         except Exception as e:
             print(f"[Logger] failed: {e}")
 
@@ -62,22 +71,24 @@ class Logger:
     
     def log_processed(self, result: Dict[str, Any] | Any) -> None:
         try:
-            if isinstance(result, dict):
-                row = self._flatten_for_csv(result)
-                self._csv_writer.writerow(row)
-            else:
-                csv.writer(self._processed_fh).writerow([str(result)])
-            self._processed_fh.flush()
+            row = self._flatten_for_csv(result) if isinstance(result, dict) else None
+            with self._write_lock:
+                if row is not None:
+                    self._csv_writer.writerow(row)
+                else:
+                    csv.writer(self._processed_fh).writerow([str(result)])
+                self._processed_fh.flush()
         except Exception as e:
             print(f"[Logger] Failed to write processed data: {e}")
 
     def close(self) -> None:
-        for fh in (self._raw_fh, self._processed_fh):
-            try:
-                fh.flush()
-                fh.close()
-            except Exception:
-                pass
+        with self._write_lock:
+            for fh in (self._raw_fh, self._processed_fh):
+                try:
+                    fh.flush()
+                    fh.close()
+                except Exception:
+                    pass
 
     def __enter__(self): return self
     def __exit__(self, *_): self.close()

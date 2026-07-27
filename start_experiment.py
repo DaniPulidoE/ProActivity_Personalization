@@ -73,6 +73,7 @@ def build_provoice_cmd(session, args, vehicle_id):
         f"state_model={args.state_model}",
         f"w_fcd={args.w_fcd}",
         *([f"window_seconds={args.window_seconds}"] if args.window_seconds is not None else []),
+        f"decision_hz={args.decision_hz}",
         f"host={args.host}",
         f"port={args.port}"
     ]
@@ -204,6 +205,10 @@ def main():
                         help="Time span (s) of the driver-state window fed to the xLSTM. "
                              "Unset = inherit the window the checkpoint was trained with. "
                              "0 disables the time cap.")
+    parser.add_argument("--decision-hz", type=float, default=4.0,
+                        help="Rate of the decision thread, decoupled from data collection. "
+                             "Sets the decisions.csv row rate; capped by the achieved "
+                             "collection rate (one decision per distinct frame).")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--fullscreen", action="store_true",

@@ -153,6 +153,7 @@ class DataCollector:
         calibration_dir: str = _CALIBRATION_DIR,
         rppg_fps: float = 30.0,
         face_box_hz: float = 1.0,
+        decision_hz: float = 4.0,
     ) -> None:
         # Everything stop()/__del__ touches is set FIRST, so a constructor
         # that fails part-way still leaves a safely destructible object.
@@ -163,6 +164,7 @@ class DataCollector:
         self._yolo_thread: Optional[threading.Thread] = None
         self._capture_thread: Optional[threading.Thread] = None
         self._face_box_thread: Optional[threading.Thread] = None
+        self._decision_thread: Optional[threading.Thread] = None
         self.rppg_estimator = None
         self.cap = None
 
@@ -199,6 +201,26 @@ class DataCollector:
         self.logger = logger
         self.decision_engine = decision_engine
         self.actuator = actuator
+
+        # ── Decision cadence ──────────────────────────────────────────────────
+        # The decision engine runs on its OWN thread (see _decision_loop): it
+        # snapshots the shared state the collection loop publishes and never
+        # blocks it. Two reasons this is not just a speed-up:
+        #   * the decision rate becomes an explicit, reportable parameter rather
+        #     than an emergent property of perception latency and CPU load — so
+        #     decisions.csv row density is no longer confounded with machine load
+        #     across participants;
+        #   * an xLSTM forward over the whole window is the single largest
+        #     remaining cost on the collection path.
+        self.decision_interval = 1.0 / max(1e-3, float(decision_hz))
+        # Last decision, published for the dashboard and for the raw log's LoA /
+        # FCD fields. Written by the decision thread, read by the collection
+        # thread and the web UI — always under _lock.
+        self._last_action: Optional[Dict[str, Any]] = None
+        # Frame timestamp the last decision was computed from. Guarantees at most
+        # one decisions.csv row per distinct collected frame, so every row still
+        # joins exactly onto one raw_data.jsonl line.
+        self._last_decided_ts: Optional[str] = None
 
         self.functionname = function_name or "fatigue_alert"
 
@@ -426,31 +448,52 @@ class DataCollector:
     def _print_profile(self, dt_avg_ms: float) -> None:
         """Print the per-section breakdown, slowest first.
 
-        ``dt`` is the whole tick; the sections below are the parts of it that
-        are instrumented, so ``dt - sum(sections)`` is time the loop spent
-        descheduled or in uninstrumented code.
+        ``dt`` is the whole COLLECTION tick; the sections below are the parts of
+        it that are instrumented, so ``dt - sum(sections)`` is time the loop
+        spent descheduled or in uninstrumented code.
+
+        Phases named ``decide.*`` run on the decision thread, not this one, so
+        they are reported separately and excluded from the tick's accounting —
+        folding them in would inflate `accounted` past the tick itself and make
+        `unaccounted` go negative.
         """
         if not self._prof:
             return
-        rows = []
-        for name, buf in self._prof.items():
-            if not buf:
-                continue
+        # Snapshot: the decision thread creates new keys in this dict as its own
+        # phases fire for the first time, and iterating it live raises
+        # "dictionary changed size during iteration".
+        snapshot = list(self._prof.items())
+        loop_rows, dec_rows = [], []
+        for name, buf in snapshot:
             vals = sorted(buf)
             n = len(vals)
-            rows.append((sum(vals) / n, vals[min(n - 1, int(n * 0.95))], name))
-        if not rows:
+            if n == 0:
+                continue
+            row = (sum(vals) / n, vals[min(n - 1, int(n * 0.95))], name)
+            (dec_rows if name.startswith('decide') else loop_rows).append(row)
+        if not loop_rows and not dec_rows:
             return
-        rows.sort(reverse=True)
-        accounted = sum(r[0] for r in rows if '.' not in r[2])
+        loop_rows.sort(reverse=True)
+        dec_rows.sort(reverse=True)
+        n_samples = max((len(b) for _, b in snapshot), default=0)
+        accounted = sum(r[0] for r in loop_rows if '.' not in r[2])
         print(f"[DataCollector][prof] tick={dt_avg_ms:7.1f}ms  "
               f"accounted={accounted:7.1f}ms  "
               f"unaccounted={dt_avg_ms - accounted:7.1f}ms  "
-              f"(mean/p95 over last {len(next(iter(self._prof.values())))} ticks)")
-        for mean, p95, name in rows:
+              f"(mean/p95 over last {n_samples} ticks)")
+        for mean, p95, name in loop_rows:
             share = (100.0 * mean / dt_avg_ms) if dt_avg_ms > 0 else 0.0
             indent = "    " if '.' in name else "  "
             print(f"{indent}{name:<22s} {mean:7.1f} ms  p95 {p95:7.1f} ms  {share:5.1f}%")
+        if dec_rows:
+            budget_ms = self.decision_interval * 1000.0
+            spent = sum(r[0] for r in dec_rows)
+            print(f"  [decision thread]      budget {budget_ms:7.1f} ms  "
+                  f"spent {spent:7.1f} ms  "
+                  f"({'OVER — decisions are pacing themselves' if spent > budget_ms else 'within budget'})")
+            for mean, p95, name in dec_rows:
+                share = (100.0 * mean / budget_ms) if budget_ms > 0 else 0.0
+                print(f"    {name:<22s} {mean:7.1f} ms  p95 {p95:7.1f} ms  {share:5.1f}%")
 
     def __del__(self):
         try:
@@ -1344,52 +1387,37 @@ class DataCollector:
                             with self._lock:
                                 self.data_history.append(seq_entry) # no need to pop as we use deque with maxlen now
 
-                        action = None
-                        if self.decision_engine:
-
-                            data['functionname'] = data.get('functionname', self.functionname)
-                            # separate dict to avoid adding the whole history to each sequence entry
-                            # decide.copy isolates the per-tick cost of duplicating the
-                            # whole window; decide.run is the engine itself.
-                            with self._phase('decide.copy'):
-                                data_for_decision = dict(data)
-                                data_for_decision['sequence'] = list(self.data_history)
-                                _decision_input = dict(data_for_decision)
-
-                            with self._phase('decide.run'):
-                                action = self.decision_engine.decide(_decision_input)
-                            if self.logger and isinstance(action, dict):
-                                with self._phase('log_processed'):
-                                    action_for_log = dict(action)
-                                    for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
-                                        value = data.get(key)
-                                        if value not in (None, ''):
-                                            action_for_log.setdefault(key, value)
-                                    self.logger.log_processed(action_for_log)
-                            data['last_action'] = action
-                            # collect_data() snapshotted latest_data BEFORE the
-                            # decision existed; re-publish so the dashboard/get_latest
-                            # actually shows the LoA/action.
-                            with self._lock:
-                                self.latest_data = dict(data)
-
-
+                        # Deciding, logging the decision and actuating all happen
+                        # on the decision thread (_decision_loop), which reads the
+                        # snapshot published above. This loop only records the
+                        # frame.
                         if self.logger:
                             with self._phase('log_raw'):
                                 raw_with_decision = dict(data)
-                                if isinstance(action, dict):
-                                    raw_with_decision['LoA'] = action.get('LoA')
-                                    fcd = action.get('fcd') or action.get('fcd_scores')
-                                    if isinstance(fcd, dict):
-                                        raw_with_decision['FCD'] = fcd
+                                # LoA/FCD now mean "the decision in force as this
+                                # frame was recorded" rather than "computed from
+                                # this frame" — stale by at most one decision
+                                # period. Nothing in training reads them
+                                # (build_loa_dataset.py labels from
+                                # user_selected_loa, and FCD is static per task),
+                                # so this costs the pipeline nothing.
+                                #
+                                # Both keys are written UNCONDITIONALLY, even
+                                # before the first decision exists: omitting them
+                                # would shift every following field's position in
+                                # frames logged at session start, the same
+                                # ordering problem the phys keys are pre-declared
+                                # to avoid in collect_data().
+                                with self._lock:
+                                    action = self._last_action
+                                raw_with_decision['LoA'] = (
+                                    action.get('LoA') if isinstance(action, dict) else None)
+                                fcd = (action.get('fcd') or action.get('fcd_scores')
+                                       if isinstance(action, dict) else None)
+                                raw_with_decision['FCD'] = fcd if isinstance(fcd, dict) else None
                                 raw_with_decision.pop('bpm_history', None)
                                 raw_with_decision.pop('rr_history', None)
                                 self.logger.log_raw(raw_with_decision)
-
-
-                        if self.actuator and action is not None:
-                            with self._phase('actuate'):
-                                self.actuator.execute(action)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -1406,6 +1434,95 @@ class DataCollector:
                 time.sleep(max(0.0, next_t - now))
 
         print("data collector stopped!")
+
+    def _decision_loop(self) -> None:
+        """Background thread: run the decision engine off the collection loop.
+
+        Snapshots the state the collection loop publishes (``latest_data`` plus
+        the ``data_history`` window), runs the engine on it, then logs the
+        decision and actuates. The collection loop never waits on any of this,
+        so perception cadence is decoupled from inference cost.
+
+        Ownership of the two log streams is split so each file keeps a SINGLE
+        writer thread: ``log_raw`` stays on the collection loop, ``log_processed``
+        lives here. Logger takes a lock regardless, but the split is what makes
+        the invariant easy to keep.
+        """
+        if not self.decision_engine:
+            print("[DataCollector] No decision engine; decision worker not started.")
+            return
+        print(f"[DataCollector] Decision worker started "
+              f"({1.0 / self.decision_interval:.1f} Hz).")
+        next_t = time.monotonic()
+        while self._running:
+            try:
+                if self.calibrated:
+                    # The lock is not optional here: list() iterates the deque and
+                    # the collection loop appends to it from another thread — an
+                    # unguarded copy raises "deque mutated during iteration".
+                    with self._phase('decide.copy'):
+                        with self._lock:
+                            seq = list(self.data_history)
+                            last_ts = self._last_decided_ts
+
+                    # Both the per-frame context and the window come from the
+                    # SAME source — the newest entry of the window itself, not
+                    # latest_data. latest_data is published a moment before that
+                    # frame reaches data_history, so reading it here could pair a
+                    # frame-N timestamp with a window ending at frame N-1 and put
+                    # a decisions.csv row on the wrong side of a 20 s label-window
+                    # boundary. seq[-1] carries every field the engine and the CSV
+                    # schema need (static context is merged in collect_data), so
+                    # nothing is lost by preferring it.
+                    snap = dict(seq[-1]) if seq else {}
+                    ts = snap.get('timestamp')
+                    # Skip when the collector has produced no new frame since the
+                    # last decision (decision_hz above the achieved capture rate,
+                    # or a stalled camera). Keeps decisions.csv at one row per
+                    # distinct frame, so each row still joins exactly onto one
+                    # raw_data.jsonl line.
+                    if seq and (ts is None or ts != last_ts):
+                        snap['functionname'] = snap.get('functionname') or self.functionname
+                        snap['sequence'] = seq
+
+                        with self._phase('decide.run'):
+                            action = self.decision_engine.decide(snap)
+
+                        with self._lock:
+                            self._last_action = action if isinstance(action, dict) else None
+                            self._last_decided_ts = ts
+
+                        if self.logger and isinstance(action, dict):
+                            with self._phase('decide.log'):
+                                action_for_log = dict(action)
+                                # Context comes from the SAME snapshot the
+                                # decision was computed on, so the row's context
+                                # can never disagree with the model's input.
+                                # 'timestamp' stays the frame's, not the decision
+                                # wall-clock: that is what keeps the join to
+                                # raw_data.jsonl and to the 20 s label windows in
+                                # build_loa_dataset.py exact.
+                                for key in ('timestamp', 'session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd', 'hr_delta', 'rr_delta'):
+                                    value = snap.get(key)
+                                    if value not in (None, ''):
+                                        action_for_log.setdefault(key, value)
+                                self.logger.log_processed(action_for_log)
+
+                        if self.actuator and action is not None:
+                            with self._phase('decide.actuate'):
+                                self.actuator.execute(action)
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print('[DataCollector] decision loop error:', e)
+
+            next_t += self.decision_interval
+            now = time.monotonic()
+            if next_t < now:      # fell behind — skip missed ticks
+                next_t = now
+            time.sleep(max(0.0, next_t - now))
+
+        print("[DataCollector] Decision worker stopped.")
 
     def _get_capture_frame(self):
         """Latest frame published by the capture worker, or None before the first
@@ -1789,6 +1906,9 @@ class DataCollector:
             self._face_box_thread.start()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        if self.decision_engine:
+            self._decision_thread = threading.Thread(target=self._decision_loop, daemon=True)
+            self._decision_thread.start()
         if self.visual_enabled:
             self._yolo_thread = threading.Thread(target=self._yolo_loop, daemon=True)
             self._yolo_thread.start()
@@ -1811,6 +1931,10 @@ class DataCollector:
         try:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=2.0)
+            # Generous: a decision already in flight must finish before main.py's
+            # finally block closes the Logger and the strategies' own handles.
+            if self._decision_thread and self._decision_thread.is_alive():
+                self._decision_thread.join(timeout=5.0)
             if self._yolo_thread and self._yolo_thread.is_alive():
                 self._yolo_thread.join(timeout=2.0)
             if self._face_box_thread and self._face_box_thread.is_alive():
@@ -1855,8 +1979,18 @@ class DataCollector:
         self.cap = None
 
     def get_latest_data(self) -> Dict[str, Any]:
+        # last_action is merged in here rather than stored inside latest_data:
+        # the collection loop replaces latest_data wholesale every tick, which
+        # would wipe the action between decisions. Merging on read also removes
+        # the old race where the emitter (which dedupes on 'timestamp', see
+        # webui/app.py) could pick up the pre-decision copy of a tick and show a
+        # frame with no LoA at all.
         with self._lock:
-            return dict(self.latest_data)
+            data = dict(self.latest_data)
+            action = self._last_action
+        if action is not None:
+            data['last_action'] = action
+        return data
 
     def get_latest_frame(self) -> Optional[str]:
         frame = None
@@ -1874,7 +2008,10 @@ class DataCollector:
     def get_latest(self) -> Dict[str, Any]:
         with self._lock:
             data = dict(self.latest_data)
+            action = self._last_action
             frame = self.latest_frame
+        if action is not None:
+            data['last_action'] = action
         img_b64 = None
         if frame is not None and HAS_CV2:
             try:

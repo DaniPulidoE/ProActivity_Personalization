@@ -95,6 +95,10 @@ def _build_parser() -> ap.ArgumentParser:
                    help="Frame-count cap on the model input window (safety bound).")
     p.add_argument("--window-seconds", dest="window_seconds", type=float, default=None,
                    help="Time span (s) of the xLSTM window; unset inherits the checkpoint's.")
+    p.add_argument("--decision-hz", dest="decision_hz", type=float, default=4.0,
+                   help="Rate of the decision thread, decoupled from data collection. "
+                        "Sets the decisions.csv row rate; capped by the achieved "
+                        "collection rate (one decision per distinct frame).")
     p.add_argument("--camera-source", dest="camera_source", default="front")
     p.add_argument("--camera-url", dest="camera_url", default="udp://127.0.0.1:8554")
     p.add_argument("--vehicle-id", dest="vehicle_id", default=None,
@@ -395,6 +399,7 @@ def main():
         carla_vehicle=vehicle_actor,  # might be None
         vehicle_state_url=vehicle_state_url,
         window_size=window_sz,
+        decision_hz=args.decision_hz,
     )
 
     dashboard.data_collector = data_collector
