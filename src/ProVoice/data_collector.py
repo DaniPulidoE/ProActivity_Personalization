@@ -132,6 +132,12 @@ _CALIBRATION_SCHEMA: Dict[str, Tuple[str, ...]] = {
     'perclos':    ('mean', 'std'),
 }
 
+# Anscombe transform of a zero count: 2*sqrt(0 + 3/8) = 1.224745. Subtracted in
+# _visual_process so the normalized yawn rate is 0.0 when no yawns have occurred
+# instead of resting at a constant 1.22 (Anscombe stabilizes variance, it does
+# not center). See the yawn-rate block there for the full rationale.
+_YAWN_ANSCOMBE_ZERO = 2.0 * math.sqrt(3.0 / 8.0)
+
 
 class DataCollector:
     def __init__(
@@ -810,10 +816,23 @@ class DataCollector:
                 mouth_frac = sum(1 for _, _, m in buf if m) / nb
                 perclos_series.append(eye_frac + mouth_frac * 0.2)
         mean_perclos = float(np.mean(perclos_series)) if perclos_series else 0.0
+        # Floor the scale at a PHYSIOLOGICAL value, not at epsilon. During an alert
+        # baseline PERCLOS barely moves, so its std measures measurement noise
+        # rather than the driver's dynamic range; dividing by it turns the served
+        # feature into a signal-to-noise ratio and it explodes. With a measured
+        # baseline (mean 0.043, std 0.016) the old 1e-3 floor let PERCLOS 0.38 --
+        # the drowsiness_alert threshold -- normalize to z = 21.
+        # This is the same failure that killed the EAR "mean - 2.5*std" rule; the
+        # per-driver MEAN is worth keeping (baseline PERCLOS varies with eye shape
+        # and blink rate) but the per-driver STD is not a meaningful scale.
+        # 0.1 is chosen so the alert->drowsy span (~0.04 -> 0.38) maps to ~3.4
+        # units. A driver whose baseline PERCLOS genuinely varies more than this
+        # still gets their own std, so it degrades gracefully.
+        PERCLOS_MIN_SCALE = 0.1
         if len(perclos_series) > 1:
-            std_perclos = max(float(np.std(perclos_series)), 1e-3)
-        else:  # no full-window samples collected -> std=1.0 (not 1e-6)
-            std_perclos = 1.0
+            std_perclos = max(float(np.std(perclos_series)), PERCLOS_MIN_SCALE)
+        else:  # no full-window samples collected -> fall back to the same scale
+            std_perclos = PERCLOS_MIN_SCALE
         self.calibrate['perclos'] = {'mean': mean_perclos, 'std': std_perclos}
 
         self.calibrated = True
@@ -1146,8 +1165,18 @@ class DataCollector:
         # normalize blink rate (it is a Poisson divided by a specific value - Variance=X/n)
         normalized_blink_rate = (self.blink_rate - self.calibrate.get('blink_rate', {}).get('mean', 0.0)) / math.sqrt((self.calibrate.get('blink_rate', {}).get('mean', 1.0)/(elapsed_s / 60))) if (self.calibrate.get('blink_rate', {}).get('mean', 0.0) > 0 and elapsed_s > 0) else 0.0
         data['blink_rate'] = round(float(normalized_blink_rate), 3)
-        # Anscombe transform to normalize yawn rate
-        normalized_yawn_rate = 2*math.sqrt((self.yawn_rate*(yawn_window / 60)) + 3/8) 
+        # Anscombe transform to normalize yawn rate. Anscombe stabilizes the
+        # VARIANCE of a Poisson count (Var ~ 1) but does not CENTER it, so the
+        # raw transform bottoms out at 2*sqrt(3/8) = 1.2247 when no yawns have
+        # occurred and only ever rises from there — a large constant offset on a
+        # feature that sits next to z-scored ones. Subtracting the transform of
+        # the baseline count re-centers it: 0 yawns -> 0.0, 1 -> 1.12, 2 -> 1.86.
+        # No division: Var[A(X)] ~ 1 already, which is the point of Anscombe.
+        # Baseline count is fixed at 0 rather than calibrated — an alert driver
+        # yawns ~0 times in the 3 min baseline, so a measured lambda_0 would carry
+        # ~100% relative error and add noise instead of removing it.
+        yawn_count_in_window = self.yawn_rate * (yawn_window / 60)
+        normalized_yawn_rate = 2*math.sqrt(yawn_count_in_window + 3/8) - _YAWN_ANSCOMBE_ZERO
         # normalize perclos
         normalized_perclos = (self.perclos - self.calibrate.get('perclos', {}).get('mean', 0.0)) / self.calibrate.get('perclos', {}).get('std', 1.0) if self.calibrate.get('perclos', {}).get('std', 1.0) > 0 else 0.0
         data['perclos'] = round(float(normalized_perclos), 3)
