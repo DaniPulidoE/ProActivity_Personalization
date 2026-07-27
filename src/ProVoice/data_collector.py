@@ -392,11 +392,17 @@ class DataCollector:
         self.yawn_count = 0
         self.perclos = 0.0
         self.drowsiness_alert = False
-        self.mCOUNTER = 0
-        # PERCLOS over a fixed TIME window (rate-independent)
+        # PERCLOS over a fixed TIME window (rate-independent). 30 s follows the
+        # literature (Wierwille / Dinges & Mallis define PERCLOS over 60 s; 30 s
+        # is the common shorter variant). The previous 10 s was below anything
+        # published and, at ~10 fps, quantized the fraction to ~1% per frame.
+        # One attribute, read by BOTH compute_calibration() and the serving loop,
+        # so the baseline and the served statistic can never describe different
+        # window lengths.
         self._perclos_buf: deque = deque()
-        self._perclos_window_s: float = 10.0
+        self._perclos_window_s: float = 30.0
         self._eye_closed_since: float = 0.0  # monotonic time when EAR first dropped
+        self._mouth_open_since: float = 0.0  # monotonic time when MAR first rose
         # yawn and blink rates (instead of raw counts) should act as better predictors
         self.blink_times = []
         self.blink_rate = 0.0
@@ -418,8 +424,14 @@ class DataCollector:
         self._calibration_ear_ts = [] # timestamps of EAR values to callibrate blink rate/perclos
         self._calibration_mar_ts = [] # timestamps of MAR values to callibrate perclos
 
-        # Calibration: 60 s time-based, collects gaze/EAR/MAR/HR/RR
-        self._calibration_duration_s: float = 60.0
+        # Calibration: 180 s time-based, collects gaze/EAR/MAR/HR/RR.
+        # 3 minutes is set by the BLINK-RATE baseline, not by rPPG: a blink count
+        # is Poisson, so 60 s at ~15 blinks/min gives SE = sqrt(15)/15 ≈ 26% on
+        # the baseline rate, versus ~15% at 3 min. (rPPG is no longer the binding
+        # constraint — at 30 fps it emits a reading every ~1.5 s, i.e. ~120 per
+        # 3 min.) 3 min also averages over road/traffic variability, which matters
+        # now that the baseline is collected while driving.
+        self._calibration_duration_s: float = 180.0
         self._calibration_start_t: float = 0.0
         # Persisted per-driver baselines: the loop tries the stored file ONCE
         # before starting the live routine (see _run_loop).
@@ -728,9 +740,33 @@ class DataCollector:
         self.calibrate = dict()
         for key, values in self._calibration_data.items():
             if values:
-                mean = sum(values) / len(values)
+                if key == 'ear':
+                    # The quantity we actually want is the OPEN-eye level, but the
+                    # baseline is now collected while driving, so ~6% of frames are
+                    # mid-blink (~15 blinks/min x ~250 ms). Those sit at the bottom
+                    # of the distribution and drag a plain mean down, which would
+                    # lower the threshold and make eye closures fire LESS often.
+                    # The MEDIAN is unaffected: 6% low-side contamination shifts it
+                    # by only ~-0.08 sigma (<1%), far inside its 50% breakdown
+                    # point, so the 0.75 multiplier below means what the literature
+                    # intends by it (Ersoy et al. 2026 use 0.75 of a static
+                    # eyes-open calibration). A trimmed mean would also work but
+                    # sits ~0.35 sigma high, silently turning 0.75 into ~0.78.
+                    # NOTE: for 'ear' this field holds the MEDIAN, not the mean.
+                    mean = float(np.median(values))
+                else:
+                    mean = sum(values) / len(values)
+                # Dispersion about the location estimate above. Not read at serving
+                # for 'ear'/'mar' (only 'threshold' is); kept for the record and
+                # for the gaze_score normalization, which does use it.
                 std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
-                # 0.65 threshold for MAR based on literature (doesn't make sense to calibrate based on a closed mouth)
+                # MAR: fixed 0.55 rather than a fraction of the baseline. A driving
+                # baseline contains speech, which inflates a calibrated mouth
+                # baseline and would make yawns be missed for the whole session;
+                # a fixed threshold plus the 2 s duration gate in _visual_process
+                # fails more safely. NOTE: 0.55 comes from dlib-derived studies
+                # while perception.py computes MAR on MediaPipe landmarks — verify
+                # it separates yawns from speech on recorded footage.
                 # EAR "eyes-closed" threshold: a fraction of the open-eye baseline
                 # (with an absolute floor), which is robust to a tiny calibration
                 # std. mean - 2.5*std sat right inside the normal operating range
@@ -738,7 +774,7 @@ class DataCollector:
                 self.calibrate[key] = {'mean': mean, 'std': std, 'threshold': mean + std * 2.5 if key in ['gaze_score'] else max(0.15, mean * 0.75) if key in ['ear'] else 0.55}
             else:
                 # default values originally in the script
-                thres = 0.2 if key in ['gaze_score', 'ear'] else 0.65
+                thres = 0.2 if key in ['gaze_score', 'ear'] else 0.55
                 self.calibrate[key] = {'mean': 0.0, 'std': 0.0, 'threshold': thres}
                 
         # blink rate
@@ -1035,7 +1071,13 @@ class DataCollector:
         with self._phase('visual.overlay'):
             frame_annot = _perception.draw_overlays(frame, landmarks, yolo_dets)
 
-        MOUTH_AR_CONSEC_FRAMES = 3
+        # Yawn gate in MILLISECONDS, not frames. The old `MOUTH_AR_CONSEC_FRAMES = 3`
+        # meant 750 ms at the pipeline's former ~4 fps but only 300 ms once the loop
+        # was parallelized to ~10 fps — i.e. the gate silently became 2.5x more
+        # permissive, and 300 ms of mouth opening is ordinary speech. A yawn runs
+        # 4-7 s, so 2 s of sustained opening separates it from talking and is
+        # immune to any future change in frame rate.
+        MOUTH_OPEN_MIN_MS = 2000
         BLINK_MIN_MS = 100   # below this is EAR noise, not a blink (this is equivalent to 2 frames at 20Hz)
         BLINK_MAX_MS = 500  # above this is eye closure / drowsiness, not a blink
         blink_window = 30.0  # 30 second window for blinks
@@ -1061,14 +1103,16 @@ class DataCollector:
                         self.blink_times.append(now)
                 self._eye_closed_since = 0.0
 
-            # yawn detection (consecutive-frame gated)
+            # yawn detection (duration-gated, mirrors the blink detector above)
             if mouth_open:
-                self.mCOUNTER += 1
+                if self._mouth_open_since == 0.0:
+                    self._mouth_open_since = now
             else:
-                if self.mCOUNTER >= MOUTH_AR_CONSEC_FRAMES:
-                    self.yawn_count += 1
-                    self.yawn_times.append(now)
-                self.mCOUNTER = 0
+                if self._mouth_open_since > 0.0:
+                    if (now - self._mouth_open_since) * 1000 >= MOUTH_OPEN_MIN_MS:
+                        self.yawn_count += 1
+                        self.yawn_times.append(now)
+                self._mouth_open_since = 0.0
 
             # PERCLOS over a fixed TIME window
             self._perclos_buf.append((now, eye_closed, mouth_open))
@@ -1093,7 +1137,7 @@ class DataCollector:
             # forward). Reset the in-progress blink/yawn timers so a detection
             # cannot span the face-absence gap and fire as a false event.
             self._eye_closed_since = 0.0
-            self.mCOUNTER = 0
+            self._mouth_open_since = 0.0
 
 
         self.latest_frame = frame_annot
