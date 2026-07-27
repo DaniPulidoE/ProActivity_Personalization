@@ -191,6 +191,8 @@ class DataCollector:
         rppg_fps: float = 30.0,
         face_box_hz: float = 1.0,
         decision_hz: float = 4.0,
+        calibration_only: bool = False,
+        data_collection: bool = False,
     ) -> None:
         # Everything stop()/__del__ touches is set FIRST, so a constructor
         # that fails part-way still leaves a safely destructible object.
@@ -494,6 +496,20 @@ class DataCollector:
         # before starting the live routine (see _run_loop).
         self.calibration_dir = calibration_dir or _CALIBRATION_DIR
         self._calibration_load_attempted = False
+        # Run modes. Mutually exclusive; rejected in main.py before reaching here.
+        #   calibration_only: measure a fresh baseline, store it, then exit.
+        #   data_collection:  record raw data and nothing else — no live
+        #                     calibration (reuse the stored baseline or fall back
+        #                     to neutral defaults, see _run_loop) and no
+        #                     inference. main.py also passes decision_engine=None
+        #                     so no model is even loaded; the guard in start() is
+        #                     what makes the mode hold regardless of the caller.
+        self.calibration_only = calibration_only
+        self.data_collection = data_collection
+        # Invoked once the baseline is stored under calibration_only. This class
+        # cannot shut the process down itself (main.py owns the uvicorn server),
+        # so the owner installs a callback that does.
+        self.on_calibration_complete: Optional[Any] = None
         # Transient camera-read failures (warm-up frames, momentary USB glitches)
         # must NOT abort calibration; only give up after this many seconds of
         # UNBROKEN failures. Resets on any successful read.
@@ -826,8 +842,11 @@ class DataCollector:
         if (now - self._calibration_start_t) >= self._calibration_duration_s:
             self.compute_calibration()
 
-    def compute_calibration(self):
+    def compute_calibration(self, save: bool = True):
         # compute mean and std for each metric, set calibrated flag
+        # ``save=False`` is used by the --data-collection fallback below: with no
+        # samples this writes the neutral defaults, and persisting those would
+        # leave a zeroed file masquerading as this driver's stored baseline.
         self.calibrate = dict()
         for key, values in self._calibration_data.items():
             if values:
@@ -965,7 +984,8 @@ class DataCollector:
               f"over {_sr['n_ticks']:.0f} ticks / {_sr['duration_s']:.0f} s. "
               f"Compare against the [fps] line once collection starts.")
 
-        self.save_calibration()
+        if save:
+            self.save_calibration()
 
     def _calibration_rate_stats(self) -> Dict[str, float]:
         """Loop-rate statistics over the calibration ticks.
@@ -1597,11 +1617,34 @@ class DataCollector:
                     # if a valid file exists, otherwise fall through to the live
                     # routine below.
                     self._calibration_load_attempted = True
-                    self.load_calibration()
+                    # calibration_only always measures fresh — adopting the
+                    # stored file would exit before recording anything.
+                    loaded = False if self.calibration_only else self.load_calibration()
+                    if not loaded and self.data_collection:
+                        # Live routine waived and no baseline to reuse. Take the
+                        # neutral defaults compute_calibration() already falls
+                        # back to when no samples exist, unsaved, so the driver's
+                        # real calibration is never overwritten by zeros.
+                        print("[Calibration] --data-collection: no stored baseline to "
+                              "reuse, starting with neutral defaults. Features that "
+                              "are normalized per driver will be uncalibrated.")
+                        self.compute_calibration(save=False)
 
                 if self.calibrated is False:
                     # Two-phase time-based calibration — completion handled inside calibrate_step()
                     self.calibrate_step()
+                    if self.calibrated and self.calibration_only:
+                        # calibrate_step() just finished and save_calibration()
+                        # has run. Nothing else in this process is wanted.
+                        print("[Calibration] --calibration-only: baseline stored, "
+                              "shutting down.")
+                        self._running = False
+                        if self.on_calibration_complete is not None:
+                            try:
+                                self.on_calibration_complete()
+                            except Exception as e:
+                                print(f"[Calibration] completion callback failed: {e}")
+                        break
                 else:
                     _dbg_t0 = time.monotonic()  # DEBUG fps (safe to delete)
                     data, read_ok = self.collect_data()
@@ -2202,9 +2245,12 @@ class DataCollector:
             self._face_box_thread.start()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        if self.decision_engine:
+        if self.decision_engine and not self.data_collection:
             self._decision_thread = threading.Thread(target=self._decision_loop, daemon=True)
             self._decision_thread.start()
+        elif self.data_collection:
+            print("[DataCollector] --data-collection: inference disabled, "
+                  "recording raw data only.")
         if self.visual_enabled:
             self._yolo_thread = threading.Thread(target=self._yolo_loop, daemon=True)
             self._yolo_thread.start()

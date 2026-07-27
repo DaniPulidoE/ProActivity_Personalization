@@ -4,6 +4,23 @@ Experiment launcher (CARLA + Drive + ProVoice)
 Improved version: process-controlled instead of terminal-based
 """
 
+"""
+MAIN OPTIONS:
+--no-popup: no LoA selection popup
+--fixed: fixed starting position
+--calibration-only: provoice only on calibration mode, no inference afterwards
+--data-collection: don't perform calibration, jump directly to data collection, no inference
+--test-drive: don't launch provoice
+--test-popup: teaching mode, simulator UI + immediate LoA popups, nothing logged
+
+
+EXPERIMENT SETUP:
+0. Teaching the LoA control: --test-popup --fullscreen
+1. Driver adaptation phase: --test-drive --no-popup --fullscreen
+2. Calibration: --fixed --no-popup --calibration-only --fullscreen --participantid 
+3. Inference: --data-collection --participantid --functionname --fullscreen
+"""
+
 import os
 import sys
 import uuid
@@ -56,6 +73,9 @@ def build_drive_cmd(session, args):
         "--host", args.host,
         "--port", str(args.port),
         *(["--fullscreen"] if args.fullscreen else ["--res", args.res]),
+        *(["--no-popup"] if args.no_popup else []),
+        *(["--test-popup"] if args.test_popup else []),
+        *(["--fixed"] if args.fixed else []),
     ]
 
 
@@ -75,7 +95,12 @@ def build_provoice_cmd(session, args, vehicle_id):
         *([f"window_seconds={args.window_seconds}"] if args.window_seconds is not None else []),
         f"decision_hz={args.decision_hz}",
         f"host={args.host}",
-        f"port={args.port}"
+        f"port={args.port}",
+        # Bare flags, not key=value: ProVoice parses these with store_true, which
+        # rejects an explicit "=value". _normalize_argv passes "-"-prefixed
+        # tokens through untouched.
+        *(["--calibration-only"] if args.calibration_only else []),
+        *(["--data-collection"] if args.data_collection else []),
     ]
 
 
@@ -230,11 +255,59 @@ def main():
                         help="Run the drive window fullscreen at the desktop resolution.")
     parser.add_argument("--res", default="1280x720",
                         help="Drive window resolution, e.g. 2560x1440. Ignored with --fullscreen.")
+    parser.add_argument("--calibration-only", dest="calibration_only", action="store_true",
+                        help="Run ProVoice's 180 s calibration, store the baseline for "
+                             "this participant, then shut the whole experiment down. "
+                             "Always measures fresh, ignoring any stored calibration.")
+    parser.add_argument("--data-collection", dest="data_collection", action="store_true",
+                        help="Data-collection run: ProVoice records raw data only, with "
+                             "no decision engine and no interventions. The live "
+                             "calibration is skipped (the participant's stored baseline "
+                             "is reused, or neutral defaults if there is none).")
+    parser.add_argument("--test-drive", dest="test_drive", action="store_true",
+                        help="Test drive: launch NPC traffic and Drive only, without "
+                             "the ProVoice proactive-assistance process. No "
+                             "interventions, no decisions.csv, no driver-state model.")
+    parser.add_argument("--fixed", action="store_true",
+                        help="Always spawn the ego at the same map spawn point instead "
+                             "of a random one. For calibration runs, which have to start "
+                             "from an identical position.")
+    parser.add_argument("--test-popup", dest="test_popup", action="store_true",
+                        help="Teaching mode: open the simulator UI and show LoA "
+                             "selection popups straight away, so the participant can "
+                             "practise the control. No traffic, no ProVoice, and the "
+                             "practice selections are not logged.")
+    parser.add_argument("--no-popup", dest="no_popup", action="store_true",
+                        help="Suppress Drive's LoA selection popups for the whole "
+                             "session: no scene freezes and no user labels. ProVoice "
+                             "still runs and logs its own decisions.")
     parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
 
     args = parser.parse_args()
+
+    if args.calibration_only and args.data_collection:
+        parser.error("--calibration-only and --data-collection are mutually exclusive.")
+    if args.calibration_only and args.test_drive:
+        parser.error("--calibration-only needs ProVoice, which --test-drive disables.")
+    if args.test_popup and args.no_popup:
+        parser.error("--test-popup and --no-popup contradict each other: one is "
+                     "nothing but popups, the other suppresses them.")
+    if args.test_popup and args.calibration_only:
+        parser.error("--test-popup and --calibration-only are separate modes: the "
+                     "first teaches the control, the second records a baseline.")
+    if args.no_popup and not (args.calibration_only or args.test_drive):
+        # A normal session exists to collect the labels, so suppressing the
+        # popups there would produce a run with nothing to show for it.
+        parser.error("--no-popup requires --calibration-only or --test-drive: a normal "
+                     "session has to collect the LoA labels.")
+    if args.calibration_only and not args.no_popup:
+        # The popup freezes the scene for as long as the driver deliberates, and
+        # a baseline recorded while they stare at a menu is not a driving
+        # baseline. Worth saying out loud rather than silently forcing.
+        print("[WARN] --calibration-only without --no-popup: the LoA popups will "
+              "interrupt the 180 s baseline. Add --no-popup unless that is intended.")
 
     root = Path.cwd()
 
@@ -254,12 +327,17 @@ def main():
         # =========================
         # START NPC / TRAFFIC
         # =========================
-        pm.start(
-            [sys.executable, "-m", "src.drive.fixed_npc_traffic", "--host", args.host, "--port", str(args.port)],
-            "NPC_TRAFFIC"
-        )
+        if args.test_popup:
+            # Teaching the popup control needs the simulator window and nothing
+            # else; the scene is frozen whenever a popup is open anyway.
+            print("[SKIP] NPC_TRAFFIC not started (--test-popup)")
+        else:
+            pm.start(
+                [sys.executable, "-m", "src.drive.fixed_npc_traffic", "--host", args.host, "--port", str(args.port)],
+                "NPC_TRAFFIC"
+            )
 
-        time.sleep(6)
+            time.sleep(6)
 
         # =========================
         # START DRIVE
@@ -277,10 +355,18 @@ def main():
         # =========================
         # START PROVOICE
         # =========================
-        # Pass the id explicitly so ProVoice skips its own file discovery
-        # (read_vehicle_id) — the file has already been read and validated here.
-        provoice_cmd = build_provoice_cmd(session, args, vehicle_id)
-        pm.start(provoice_cmd, "PROVOICE", below_normal=True)
+        if args.test_drive or args.test_popup:
+            # Drive (+ traffic) only. The vehicle id was still waited for above:
+            # it is the signal that Drive finished initialising, and nothing else
+            # would catch a Drive that dies during startup.
+            _why = "--test-popup" if args.test_popup else "--test-drive"
+            print(f"[SKIP] PROVOICE not started ({_why}); "
+                  f"vehicle id {vehicle_id} published anyway")
+        else:
+            # Pass the id explicitly so ProVoice skips its own file discovery
+            # (read_vehicle_id) — the file has already been read and validated here.
+            provoice_cmd = build_provoice_cmd(session, args, vehicle_id)
+            pm.start(provoice_cmd, "PROVOICE", below_normal=True)
 
         # =========================
         # MAIN LOOP (keep alive)
@@ -290,9 +376,15 @@ def main():
         while True:
             time.sleep(1)
             for name, p in pm.processes:
-                if p.poll() is not None:
-                    print(f"[CRASH] {name} exited with code {p.poll()}")
-                    raise SystemExit(1)  # or break, or restart it
+                code = p.poll()
+                if code is None:
+                    continue
+                if name == "PROVOICE" and args.calibration_only and code == 0:
+                    # Expected: ProVoice exits itself once the baseline is stored.
+                    print("[DONE] calibration stored; stopping the experiment")
+                    raise SystemExit(0)
+                print(f"[CRASH] {name} exited with code {code}")
+                raise SystemExit(1)  # or break, or restart it
 
     except KeyboardInterrupt:
         print("\n[EXIT] stopping experiment...")

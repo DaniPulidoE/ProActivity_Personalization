@@ -168,15 +168,29 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--vehicle-state-url", dest="vehicle_state_url", default=None)
     p.add_argument("--log-path", dest="log_path", default=None,
                    help="JSONL log of features fed to the xLSTM; unset disables.")
+    p.add_argument("--calibration-only", dest="calibration_only", action="store_true",
+                   help="Run the 180 s calibration, store the baseline for this "
+                        "participant, then exit. Always measures fresh, ignoring any "
+                        "stored calibration.")
+    p.add_argument("--data-collection", dest="data_collection", action="store_true",
+                   help="Data-collection run: record raw data only. No decision engine "
+                        "is loaded or run, and the live calibration is skipped (this "
+                        "participant's stored baseline is reused, or neutral defaults "
+                        "if there is none). Mutually exclusive with --calibration-only.")
     return p
 
 
 def _parse_args(argv):
-    args, unknown = _build_parser().parse_known_args(_normalize_argv(argv))
+    parser = _build_parser()
+    args, unknown = parser.parse_known_args(_normalize_argv(argv))
     if unknown:
         # Surface stray tokens instead of silently dropping them (the old
         # key=value parser ignored anything without an '=').
         print(f"[main] ignoring unrecognized argument(s): {unknown}")
+    if args.calibration_only and args.data_collection:
+        parser.error("--calibration-only and --data-collection are mutually "
+                     "exclusive: one runs the calibration and nothing else, the "
+                     "other skips it and only records data.")
     return args
 
 def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int | None:
@@ -282,8 +296,16 @@ def main():
     fcd_engine = None
     state_engine = None
 
+    # --- Data collection: no inference, so no model is loaded at all ---
+    # DataCollector only starts its decision worker when it has an engine, so
+    # leaving `strategy` None is what actually disables inference; skipping the
+    # load also keeps the XGBoost/xLSTM weights and their threads out of a run
+    # that would never use them.
+    if args.data_collection:
+        print("[main] --data-collection: no decision engine, recording data only.")
+
     # --- FCD only ---
-    if modeltype == "fcd":
+    elif modeltype == "fcd":
         try:
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
@@ -459,15 +481,28 @@ def main():
         vehicle_state_url=vehicle_state_url,
         window_size=window_sz,
         decision_hz=args.decision_hz,
+        calibration_only=args.calibration_only,
+        data_collection=args.data_collection,
     )
 
     dashboard.data_collector = data_collector
     dashboard.actuator = actuator
 
-    data_collector.start()
-
     config = uvicorn.Config(dashboard.app, host="127.0.0.1", port=8001, reload=False)
     server = uvicorn.Server(config)
+
+    if args.calibration_only:
+        # The collector runs on its own thread and cannot stop the server; give
+        # it the hook. Installed BEFORE start() so a calibration that finishes
+        # unusually early (e.g. no camera → default baselines immediately) still
+        # finds the callback in place.
+        def _calibration_finished():
+            print("[main] calibration stored — exiting (--calibration-only).")
+            data_collector.stop()
+            server.should_exit = True
+        data_collector.on_calibration_complete = _calibration_finished
+
+    data_collector.start()
 
     def handle_exit(_, __):
         print("KeyboardInterrupt received")

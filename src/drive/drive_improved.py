@@ -5,6 +5,14 @@ Control Modes:
     --control test (default) : Only basic driving controls available
     --control full          : All controls available
 
+LoA Popups:
+    (default)    : Periodic LoA selection popups; labels are written to
+                   data/user_loa_labels.csv
+    --no-popup   : Plain drive, no popups and no labels
+    --test-popup : Practice mode. The first popup opens immediately and they
+                   repeat quickly, so the driver can learn the control. Nothing
+                   is written to data/user_loa_labels.csv
+
 Basic Controls (available in both modes):
     W            : throttle
     S            : brake
@@ -427,8 +435,18 @@ LOA_LABELS = (
 CONFIRM_ROW = len(LOA_LABELS)
 
 
+# --- Practice popups (--test-popup) -------------------------------------------
+# Teaching the control is repetition, not a driving window: the first prompt
+# opens the moment the session starts and the rest follow this much later, so a
+# participant can run through several attempts in under a minute.
+TEST_POPUP_INTERVAL_S = 8
+
+
 class LoASelectionPopup(object):
-    def __init__(self, width, height, interval_seconds=20):
+    def __init__(self, width, height, interval_seconds=20, enabled=True,
+                 open_immediately=False):
+        self.enabled = enabled
+        self.open_immediately = open_immediately
         self.interval_ms = int(interval_seconds * 1000)
         self.next_prompt_ms = 0
         self.active = False
@@ -457,10 +475,18 @@ class LoASelectionPopup(object):
         self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
 
     def start(self):
+        # With data collection off there is nothing to label. Leaving
+        # next_prompt_ms at 0 keeps should_open() False for the rest of the
+        # session, so the scene is never frozen and no rows are ever written.
+        if not self.enabled:
+            return
         self.session_started_ms = pygame.time.get_ticks()
         self.session_started_walltime = datetime.datetime.now()
         self.window_idx = 0
-        self.next_prompt_ms = self.session_started_ms + self.interval_ms
+        # max(1, ...) because should_open() treats 0 as "never scheduled", which
+        # open_immediately would otherwise hit if start() landed on tick 0.
+        delay = 0 if self.open_immediately else self.interval_ms
+        self.next_prompt_ms = max(1, self.session_started_ms + delay)
 
     def should_open(self, now_ms):
         return (not self.active) and self.next_prompt_ms and now_ms >= self.next_prompt_ms
@@ -720,6 +746,15 @@ def get_actor_blueprints(world, filter, generation):
 # ==============================================================================
 
 
+# --- Ego spawn point ----------------------------------------------------------
+# Spawning stays random by default. --fixed pins the ego to this index instead,
+# so calibration runs all start from an identical position. 152 is deliberately
+# ~80 m from every index fixed_npc_traffic.py uses (0, 5, 10 ... 50), which
+# matters because those NPCs are spawned before Drive starts and would otherwise
+# be able to block the point.
+FIXED_SPAWN_POINT_INDEX = 152
+
+
 class World(object):
     def __init__(self, carla_world, hud, traffic_manager, args):
         self.world = carla_world
@@ -747,6 +782,7 @@ class World(object):
         self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
+        self._fixed_spawn = args.fixed
         self.restart()
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -768,6 +804,24 @@ class World(object):
             carla.MapLayer.Walls,
             carla.MapLayer.All
         ]
+
+    def _spawn_candidates(self, spawn_points):
+        """Spawn points to try, in order.
+
+        Randomly ordered, unless --fixed starts the walk at
+        FIXED_SPAWN_POINT_INDEX so calibration runs always begin in the same
+        place. Either way this returns an *order* rather than one point:
+        try_spawn_actor returns None when a point is occupied, and the original
+        code re-rolled a random point on each failure, which could retry the same
+        blocked point forever. A full permutation bounds the retries — and under
+        --fixed it keeps the fallback deterministic too, so a blocked point
+        yields the same second choice on every run.
+        """
+        count = len(spawn_points)
+        if not self._fixed_spawn:
+            return random.sample(spawn_points, count)
+        start = FIXED_SPAWN_POINT_INDEX % count
+        return [spawn_points[(start + i) % count] for i in range(count)]
 
     def restart(self):
         self.player_max_speed = 1.589
@@ -812,14 +866,19 @@ class World(object):
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
-        while self.player is None:
-            if not self.map.get_spawn_points():
+        if self.player is None:
+            spawn_points = self.map.get_spawn_points()
+            if not spawn_points:
                 print('There are no spawn points available in your map/town.')
                 print('Please add some Vehicle Spawn Point to your UE5 scene.')
                 sys.exit(1)
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            for spawn_point in self._spawn_candidates(spawn_points):
+                self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+                if self.player is not None:
+                    break
+            if self.player is None:
+                raise RuntimeError('Could not spawn the ego vehicle at any of the '
+                                   '%d spawn points' % len(spawn_points))
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
 
@@ -1799,8 +1858,18 @@ class CameraManager(object):
         Attachment = carla.AttachmentType
 
         if not self._parent.type_id.startswith("walker.pedestrian"):
+            # The drive-seat eye point sits just FORWARD of the rim (x=0.35
+            # rather than the natural 0.25) so the car's own steering wheel is
+            # out of frame. CARLA models the interior but never animates the
+            # wheel — it stays dead straight through full lock, verified on
+            # 0.10.0 — and the API cannot hide one part of a vehicle mesh, so
+            # moving the camera past it is the only way to drop it. A rim that
+            # ignores the driver's hands reads as more broken than no rim at
+            # all, and on this rig the real one is in their hands anyway.
+            # Raising z instead does not work: by 1.35 the camera is inside the
+            # headliner and the roof lining eats the top of the frame.
             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=0.25, y=-0.33, z=1.21), carla.Rotation(pitch=-2.0)), Attachment.Rigid),  # drive-seat view
+                (carla.Transform(carla.Location(x=0.35, y=-0.33, z=1.21), carla.Rotation(pitch=-2.0)), Attachment.Rigid),  # drive-seat view
                 (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
                 (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
@@ -1992,7 +2061,11 @@ def game_loop(args):
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
-        loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
+        loa_popup = LoASelectionPopup(
+            args.width, args.height,
+            interval_seconds=TEST_POPUP_INTERVAL_S if args.test_popup else 20,
+            enabled=not args.no_popup,
+            open_immediately=args.test_popup)
         # Only advertise wheel controls in the popup if a wheel is actually bound.
         loa_popup.wheel_enabled = controller.has_wheel
         start_overlay = StartScreenOverlay(args.width, args.height)
@@ -2010,7 +2083,13 @@ def game_loop(args):
             'w_fcd': getattr(args, 'w_fcd', ''),
         }
         print(f"[INFO] Drive session_id={session_id}")
-        print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
+        if args.no_popup:
+            print("[INFO] Popups off: no LoA popups, no user labels written")
+        elif args.test_popup:
+            print(f"[INFO] Practice mode: popups every {TEST_POPUP_INTERVAL_S:.0f} s, "
+                  f"selections are NOT logged")
+        else:
+            print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
 
         if args.sync:
             sim_world.tick()
@@ -2055,6 +2134,14 @@ def game_loop(args):
                     if action == 'quit':
                         return
                     if action == 'select':
+                        if args.test_popup:
+                            # Practice answers teach the control, they are not
+                            # data — nothing is computed or appended for them.
+                            print("[INFO] practice selection %s (not logged)"
+                                  % (sorted(selected_loa),))
+                            loa_popup.close(now_ms)
+                            _set_world_frozen(world, False)
+                            continue
                         player_velocity = world.player.get_velocity() if world and world.player else carla.Vector3D()
                         speed_kmh = 3.6 * math.sqrt(
                             player_velocity.x ** 2 + player_velocity.y ** 2 + player_velocity.z ** 2)
@@ -2190,7 +2277,28 @@ def main():
         '--no-wheel',
         action='store_true',
         help='Ignore any attached steering wheel and force keyboard control')
+    argparser.add_argument(
+        '--fixed', dest='fixed', action='store_true',
+        help='Always spawn the ego at the same map spawn point (index %d) instead of '
+             'a random one. Intended for calibration runs, which have to start from '
+             'an identical position. If that point is occupied the next free index is '
+             'used, deterministically.' % FIXED_SPAWN_POINT_INDEX)
+    argparser.add_argument(
+        '--test-popup', dest='test_popup', action='store_true',
+        help='Practice mode for teaching the LoA control: the first popup opens as '
+             'soon as the session starts and they repeat every %d s. Selections are '
+             'NOT written to data/user_loa_labels.csv.' % TEST_POPUP_INTERVAL_S)
+    argparser.add_argument(
+        '--no-popup', dest='no_popup', action='store_true',
+        help='Suppress the LoA selection popups for the whole session. By default '
+             'the scene freezes every 20 s and a popup asks for the acceptable LoAs; '
+             'with this flag there are no popups, no freezes, and nothing is appended '
+             'to data/user_loa_labels.csv')
     args = argparser.parse_args()
+
+    if args.test_popup and args.no_popup:
+        argparser.error('--test-popup and --no-popup contradict each other: one is '
+                        'nothing but popups, the other suppresses them.')
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
 

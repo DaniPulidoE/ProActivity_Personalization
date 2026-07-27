@@ -170,6 +170,11 @@ Launcher options:
 |---|---|---|
 | `--fullscreen` | off | Run the drive window fullscreen at the desktop resolution |
 | `--res WIDTHxHEIGHT` | `1280x720` | Drive window size; ignored with `--fullscreen` |
+| `--no-popup` | off | Suppress the LoA selection popups for the whole session (see below) |
+| `--fixed` | off | Always spawn the ego at the same map spawn point (calibration runs) |
+| `--test-drive` | off | Launch NPC traffic and Drive only, without ProVoice |
+| `--calibration-only` | off | Run ProVoice's 180 s calibration, store the baseline, then stop everything |
+| `--data-collection` | off | ProVoice records raw data only: no decision engine, no live calibration |
 | `--vehicle-id-timeout` | `120` | Seconds to wait for Drive to publish the vehicle id |
 
 > **Note**: Please do activate the correct Python environment before running this script.
@@ -383,6 +388,13 @@ Common options:
 - `--res WIDTHxHEIGHT` - Window resolution (default: 1280x720)
 - `--fullscreen` - Run fullscreen at the desktop resolution (overrides `--res`)
 - `--no-wheel` - Ignore an attached steering wheel and force keyboard control
+- `--fixed` - Spawn the ego at a fixed map spawn point instead of a random one, so
+  every run starts from an identical position. Intended for calibration; leave it off
+  for normal test drives, which keep the usual random spawn.
+- `--no-popup` - Skip the LoA selection popups for the whole session. The scene is
+  never frozen and nothing is appended to `data/user_loa_labels.csv`; use it for free
+  driving, familiarisation runs and debugging. Popups are on by default, so omitting
+  the flag keeps the normal 20 s prompt cadence.
 - `--sync` - Enable synchronous mode
 - `--autopilot` - Enable autopilot
 
