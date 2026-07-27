@@ -373,6 +373,15 @@ class DataCollector:
         self._hr_accepted: deque = deque(maxlen=5)  # recent ACCEPTED readings -> reference
         self._hr_reject_run: int = 0                # consecutive rejections
         self._hr_harmonic_rejects: int = 0          # session total, logged
+        # UNFILTERED reading as the toolbox produced it, kept whether or not the
+        # harmonic filter accepted it, and logged as heart_rate_raw. The live
+        # filter is a guard on the actuator, NOT the source of truth: dropping a
+        # reading from the log would make the filter irreversible and unauditable,
+        # and the offline pipeline needs the raw series to re-derive HR with a
+        # two-sided (Hampel-style) filter that the causal live one cannot match.
+        self._last_hr_raw: Optional[float] = None
+        self._last_hr_raw_t: float = 0.0
+        self._last_hr_rejected: bool = False
         self._rppg_staleness_s: float = 15.0
         # rPPG face crop: MMRPhys is trained on a SQUARED face-detector box
         # enlarged by LARGE_BOX_COEF=1.5 (see _rppg_crop_box for the exact
@@ -1202,8 +1211,18 @@ class DataCollector:
             with self._rppg_lock:
                 last_hr, last_hr_t = self._last_hr, self._last_hr_t
                 last_rr, last_rr_t = self._last_rr, self._last_rr_t
+                last_hr_raw, last_hr_raw_t = self._last_hr_raw, self._last_hr_raw_t
+                last_hr_rejected = self._last_hr_rejected
                 bpm_hist = list(self.bpm_history)
                 rr_hist = list(self.rr_history)
+            # Unfiltered HR + whether the live filter rejected it. Post-hoc only —
+            # NOT model inputs (encode_frame ignores them, and they are dropped
+            # from the decisions.csv schema). These are what the offline pipeline
+            # re-derives hr_delta from, so they are logged even on frames where
+            # the filtered heart_rate is absent.
+            if last_hr_raw is not None and (now - last_hr_raw_t) <= self._rppg_staleness_s:
+                data['heart_rate_raw'] = last_hr_raw
+                data['hr_rejected'] = bool(last_hr_rejected)
             if last_hr is not None and (now - last_hr_t) <= self._rppg_staleness_s:
                 data['heart_rate'] = last_hr
                 # snapshot as list: deque is not JSON-serializable (dashboard
@@ -1270,7 +1289,7 @@ class DataCollector:
         MOUTH_OPEN_MIN_MS = 2000
         BLINK_MIN_MS = 100   # below this is EAR noise, not a blink (this is equivalent to 2 frames at 20Hz)
         BLINK_MAX_MS = 500  # above this is eye closure / drowsiness, not a blink
-        blink_window = 30.0  # 30 second window for blinks
+        blink_window = 60.0  # 60 second window for blinks
         yawn_window = 180    # 3 minute window for yawns
 
         now = time.monotonic()
@@ -1535,6 +1554,9 @@ class DataCollector:
             data['hr_delta'] = None
             data['respiratory_rate'] = None
             data['rr_delta'] = None
+            # Unfiltered HR + live-filter verdict, for post-hoc re-derivation.
+            data['heart_rate_raw'] = None
+            data['hr_rejected'] = None
 
         if self.visual_enabled:
             with self._phase('visual'):
@@ -1864,11 +1886,19 @@ class DataCollector:
                     clean = (not contaminated) or (not self._rppg_gap_suppress)
                     if clean and hr is not None and not (hr != hr):   # excludes NaN
                         hr_val = round(float(hr), 1)
+                        rejected = (self._hr_is_harmonic(hr_val)
+                                    and self._hr_reject_run < _HR_REJECT_RUN_MAX)
+                        # Record the raw reading FIRST, unconditionally, so the
+                        # live filter can never destroy data the offline pipeline
+                        # needs (see _last_hr_raw).
+                        with self._rppg_lock:
+                            self._last_hr_raw = hr_val
+                            self._last_hr_raw_t = now
+                            self._last_hr_rejected = rejected
                         # Drop probable 2f locks, but never more than
                         # _HR_REJECT_RUN_MAX in a row — past that the reference
                         # is likelier to be wrong than the readings.
-                        if (self._hr_is_harmonic(hr_val)
-                                and self._hr_reject_run < _HR_REJECT_RUN_MAX):
+                        if rejected:
                             self._hr_reject_run += 1
                             self._hr_harmonic_rejects += 1
                             if (self._hr_harmonic_rejects <= 5
