@@ -87,13 +87,28 @@ class ProcessManager:
     def __init__(self):
         self.processes = []
 
-    def start(self, cmd, name):
-        print(f"[START] {name}")
+    def start(self, cmd, name, below_normal=False):
+        """Spawn a child process.
+
+        ``below_normal`` drops it to BELOW_NORMAL priority on Windows. Used for
+        PROVOICE: CARLA runs in synchronous mode, so the simulation advances only
+        when Drive calls world.tick() — whenever the Windows scheduler picks a
+        ProVoice worker over Drive's or CARLA's threads, that shows up as sim lag.
+        Priority does NOT reduce ProVoice's work, it only settles who yields when
+        both want the same core, so it complements the thread caps in
+        src/ProVoice/main.py rather than replacing them. No-op off Windows.
+        """
+        print(f"[START] {name}{' (below-normal priority)' if below_normal else ''}")
         print("        ", " ".join(cmd))
+
+        kwargs = {}
+        if below_normal and os.name == "nt":
+            kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
 
         p = subprocess.Popen(
             cmd,
-            text=True
+            text=True,
+            **kwargs,
         )
 
         self.processes.append((name, p))
@@ -265,7 +280,7 @@ def main():
         # Pass the id explicitly so ProVoice skips its own file discovery
         # (read_vehicle_id) — the file has already been read and validated here.
         provoice_cmd = build_provoice_cmd(session, args, vehicle_id)
-        pm.start(provoice_cmd, "PROVOICE")
+        pm.start(provoice_cmd, "PROVOICE", below_normal=True)
 
         # =========================
         # MAIN LOOP (keep alive)

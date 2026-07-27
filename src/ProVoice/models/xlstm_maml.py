@@ -63,7 +63,7 @@
 # Gaussian jitter on the numerical feature dims).
 #
 # The saved checkpoint keeps the population checkpoint's arch contract
-# (head_type, context_length, window_seconds) unchanged, so it is a drop-in
+# (head_type, context_length, window_seconds, resample_hz) unchanged, so it is a drop-in
 # replacement for state_xlstm.pt in fine_tune_XLSTM.py, sweep_train_frac.py,
 # and the decision engine: the study comparison is L2-SP fine-tuning from the
 # joint-trained init vs. the SAME fine-tuning from this meta-trained init.
@@ -89,7 +89,7 @@ from ProVoice.models.xlstm_model import (
     save_checkpoint,
     load_checkpoint,
     logits_to_probs,
-    encode_frame,
+    encode_and_resample,
     STATE_NUM,
     STATE_CARLA,
     STATE_CAT,
@@ -119,6 +119,7 @@ Segment = Tuple[np.ndarray, int]  # (frames (T, D_IN) float32, LoA class 0-4)
 def build_driver_segments(
     df: pd.DataFrame,
     window_seconds: float | None,
+    resample_hz: float | None = None,
 ) -> Dict[str, List[Segment]]:
     """Encode one (X, y) pair per segment, grouped per driver, in chronological order.
 
@@ -152,10 +153,9 @@ def build_driver_segments(
             y = int(np.argmax(lv))
             rows = [g.iloc[i].to_dict() for i in range(len(g))]
             rows = truncate_frames_by_seconds(rows, window_seconds)
-            X = np.stack(
-                [encode_frame(r.get("functionname") or "", r) for r in rows],
-                axis=0,
-            ).astype(np.float32)
+            # Same fixed grid as train_XLSTM.SeqDataset — the meta-learner must
+            # see the segments exactly as the population model did.
+            X = encode_and_resample(rows, resample_hz, window_seconds)
             segs.append((X, y))
         if segs:
             drivers[str(pid)] = segs
@@ -171,7 +171,10 @@ def augment_segment(X: np.ndarray, rng: np.random.Generator,
 
     Cropping drops frames from the FRONT (the readout is the last real frame,
     so this shortens the history window — same effect as a smaller
-    window_seconds). Jitter perturbs only the continuous feature dims.
+    window_seconds). With resampling on, the grid is uniform, so dropping k
+    leading rows is exactly k/resample_hz seconds of history — the augmentation
+    became time-calibrated rather than rate-dependent. Jitter perturbs only the
+    continuous feature dims.
     """
     if crop_frac > 0.0 and X.shape[0] > 4:
         max_drop = int(crop_frac * X.shape[0])
@@ -498,15 +501,16 @@ def main():
     # The effective order is per-epoch (derivative-order annealing); see the
     # top of the meta-epoch loop.
 
-    # checkpoint properties: context_length, head_type, window_seconds
+    # checkpoint properties: context_length, head_type, window_seconds, resample_hz
     model, arch = load_checkpoint(args.init_pt)
     model.to(device).train()
     context_length = arch["context_length"]
     head_type = arch.get("head_type", "softmax")
     window_seconds = arch.get("window_seconds")
+    resample_hz = arch.get("resample_hz")
     print(f"[model] warm start from {args.init_pt}: head_type={head_type} "
           f"context_length={context_length} window_seconds={window_seconds} "
-          f"order={args.order}"
+          f"resample_hz={resample_hz} order={args.order}"
           + (f" (first-order warm-up for {args.fo_warmup_epochs} epoch(s))"
              if args.fo_warmup_epochs > 0 and args.order != "first" else ""))
     # CORN or softmax loss
@@ -550,7 +554,7 @@ def main():
         df[k] = df[k].fillna(default)
 
     # build dataset
-    drivers = build_driver_segments(df, window_seconds)
+    drivers = build_driver_segments(df, window_seconds, resample_hz)
     min_segs = args.k_min + 1  # at least one query segment after the smallest support
     small = [p for p, s in drivers.items() if len(s) < min_segs]
     if small: # drop drivers with not enough segments

@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 from coral_pytorch.losses import corn_loss
 
 from ProVoice.decision_engine import truncate_frames_by_seconds
-from ProVoice.models.xlstm_model import encode_frame, load_checkpoint, logits_to_probs
+from ProVoice.models.xlstm_model import encode_and_resample, load_checkpoint, logits_to_probs
 from ProVoice.models.train_XLSTM import (
     set_seed,
     read_jsonl,
@@ -48,14 +48,18 @@ LEVELS = [f"Level_{i}" for i in range(1, 6)]
 SEGMENT_SECONDS = 20.0  # driver labels arrive every 20 s -> one segment per label
 
 
-def build_segments(df: pd.DataFrame, window_seconds: float | None = None):
+def build_segments(df: pd.DataFrame, window_seconds: float | None = None,
+                   resample_hz: float | None = None):
     """Encode one (X, y) pair per segment, in chronological order.
 
     Chronology = first appearance in the JSONL (groupby(sort=False)), NOT the
     lexicographic order of segment_id strings. Segments with missing or
     all-zero Level_* labels are skipped and reported, never argmax'd into a
     bogus class-0 label. ``window_seconds`` truncates each segment to its
-    last k seconds — must match the checkpoint's training window.
+    last k seconds and ``resample_hz`` puts it on a fixed time grid — both must
+    match the checkpoint's training contract, or the frozen backbone is fed
+    sequences whose step count means something different than it did at
+    training.
     """
     if not all(k in df.columns for k in LEVELS):
         raise ValueError(f"Input data has no {LEVELS} columns; labels are required.")
@@ -69,10 +73,7 @@ def build_segments(df: pd.DataFrame, window_seconds: float | None = None):
         y = int(np.argmax(lv))
         rows = [g.iloc[i].to_dict() for i in range(len(g))]
         rows = truncate_frames_by_seconds(rows, window_seconds)
-        X = np.stack(
-            [encode_frame(r.get("functionname") or "", r) for r in rows],
-            axis=0,
-        ).astype(np.float32)
+        X = encode_and_resample(rows, resample_hz, window_seconds)
         gids.append(gid); Xs.append(X); ys.append(y)
     if skipped:
         print(f"[warn] skipped {len(skipped)} segment(s) with missing/empty Level_* labels: "
@@ -219,9 +220,11 @@ def main():
     context_length = arch["context_length"]
     head_type = arch.get("head_type", "softmax")
     window_seconds = arch.get("window_seconds")
-    print(f"[model] head_type={head_type} window_seconds={window_seconds} (from checkpoint)")
+    resample_hz = arch.get("resample_hz")
+    print(f"[model] head_type={head_type} window_seconds={window_seconds} "
+          f"resample_hz={resample_hz} (from checkpoint)")
 
-    gids, Xs, ys = build_segments(df, window_seconds=window_seconds)
+    gids, Xs, ys = build_segments(df, window_seconds=window_seconds, resample_hz=resample_hz)
     n_seg = len(gids)
     if n_seg < 3:
         raise ValueError(f"Need at least 3 labeled segments to sweep, got {n_seg}.")

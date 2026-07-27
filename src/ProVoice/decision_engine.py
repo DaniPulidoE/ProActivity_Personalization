@@ -5,11 +5,12 @@ import math, os
 import numpy as np
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function, resolve_function_key, adjust_fcd_by_state
 from ProVoice.models.xlstm_model import (
-    encode_frame,
+    encode_and_resample,
     DEFAULT_CONTEXT_LENGTH,
     load_checkpoint,
     log_encoded_frames,
     logits_to_probs,
+    secs_of_day as _secs_of_day,
 )
 import torch
 
@@ -47,25 +48,9 @@ def _decide_from_probs(probs: List[float], method: str = "argmax", expected_shif
         return 4
     return int(max(range(len(probs)), key=lambda i: probs[i]))
 
-def _secs_of_day(ts: Any) -> Optional[float]:
-    """Parse a frame timestamp ('HH:MM:SS.fff' or full ISO) to seconds-of-day."""
-    if not ts:
-        return None
-    s = str(ts).strip()
-    from datetime import datetime
-    t = None
-    try:
-        t = datetime.fromisoformat(s).time()
-    except Exception:
-        for fmt in ("%H:%M:%S.%f", "%H:%M:%S"):
-            try:
-                t = datetime.strptime(s, fmt).time()
-                break
-            except Exception:
-                continue
-    if t is None:
-        return None
-    return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+# _secs_of_day now lives in xlstm_model (imported above as _secs_of_day): the
+# resampler needs the same parser, and xlstm_model is the lower module — this
+# one imports it, not the other way round.
 
 
 def truncate_frames_by_seconds(seq: List[Dict[str, Any]], window_seconds: float) -> List[Dict[str, Any]]:
@@ -281,6 +266,13 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         else:
             ws = 20.0
         self.window_seconds = float(ws) if ws and float(ws) > 0 else None
+        # Fixed-grid resampling rate. Taken ONLY from the checkpoint — unlike
+        # window_seconds there is no sane operator override, because serving on a
+        # different grid than the model was trained on is precisely the failure
+        # this is here to prevent. Legacy checkpoints lack the key -> None -> the
+        # raw frames are used, which is the behaviour they were trained with.
+        _rs = arch.get("resample_hz")
+        self.resample_hz = float(_rs) if _rs and float(_rs) > 0 else None
         self.default_key = resolve_function_key(default_function)
         self.conservative = conservative
         self.fcd_fallback = fcd_fallback
@@ -317,23 +309,31 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             if not seq:
                 return self._try_fcd_fallback(state, fn)
             # Truncate by TIME first (match the 20 s label-window semantics the
-            # model was trained on), then cap by frame count as a safety bound.
+            # model was trained on), then resample onto the checkpoint's fixed
+            # grid so the step count matches training regardless of the rate this
+            # session achieved, then cap by frame count as a safety bound.
             # No padding at inference: batch size is 1, the model is causal, and
-            # forward() without `lengths` reads the last timestep — which here is
-            # the most recent real frame. Short early-session windows are fine.
+            # forward() without `lengths` reads the last timestep — which the
+            # resampler anchors on the most recent real frame. Short
+            # early-session windows are fine, they just yield fewer steps.
             if self.window_seconds:
                 seq = truncate_frames_by_seconds(seq, self.window_seconds)
-            Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
+            X = encode_and_resample(
+                seq,
+                resample_hz=self.resample_hz,
+                window_seconds=self.window_seconds,
+                functionname=fn,
+            )[-self.context_length:]
             if self._log_fh is not None:
                 # Log only the last frame (most recent driver state) to keep
                 # the file manageable at 20 Hz.
                 log_encoded_frames(
                     self._log_fh, "infer",
                     state.get("timestamp", ""),
-                    np.stack(Xs[-1:], axis=0),
+                    X[-1:],
                 )
             with torch.no_grad():
-                xb = torch.from_numpy(np.stack(Xs, 0))[None, ...]
+                xb = torch.from_numpy(X)[None, ...]
                 logits = self.model(xb)
                 probs = logits_to_probs(logits, self.head_type).cpu().numpy()[0].tolist()
             loa = _decide_from_probs(probs, "argmax")

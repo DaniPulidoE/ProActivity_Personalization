@@ -171,7 +171,12 @@ def main():
     # Same principle as head_type: the time window segments were cut to at
     # population training is a checkpoint property, not a CLI choice here.
     window_seconds = arch.get("window_seconds")
-    print(f"[model] head_type={head_type} window_seconds={window_seconds} (from checkpoint)")
+    # Same again for the resampling grid: serving or fine-tuning on a different
+    # grid than the population model was trained on is exactly the mismatch the
+    # contract exists to prevent. Pre-resampling checkpoints lack the key -> None.
+    resample_hz = arch.get("resample_hz")
+    print(f"[model] head_type={head_type} window_seconds={window_seconds} "
+          f"resample_hz={resample_hz} (from checkpoint)")
     if args.laplace and head_type != "corn":
         raise ValueError(
             f"--laplace requires a CORN population checkpoint, got head_type={head_type!r}."
@@ -180,9 +185,9 @@ def main():
     # create dataset
     try:
       train_ds = SeqDataset(tr_df, context_length=context_length, split="train", log_fh=log_fh,
-                            window_seconds=window_seconds)
+                            window_seconds=window_seconds, resample_hz=resample_hz)
       test_ds  = SeqDataset(te_df, context_length=context_length, split="val",   log_fh=log_fh,
-                            window_seconds=window_seconds)
+                            window_seconds=window_seconds, resample_hz=resample_hz)
     finally:
         # if error, close log
         if log_fh:

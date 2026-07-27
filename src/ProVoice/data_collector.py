@@ -116,7 +116,7 @@ def _resolve_face_landmarker_model() -> Optional[str]:
 
 # ── Per-driver calibration persistence ───────────────────────────────────────
 # Baselines are stable across sessions for the same driver, so a stored file
-# lets a returning participant skip the 60 s routine. Loading is only allowed
+# lets a returning participant skip the live routine. Loading is only allowed
 # when the file carries EVERY field the serving path reads — see
 # _validate_calibration(); anything missing/degenerate falls back to a live
 # calibration rather than silently serving zeros.
@@ -466,6 +466,11 @@ class DataCollector:
         self._cal_last_rr_t: float = 0.0
         self._calibration_ear_ts = [] # timestamps of EAR values to callibrate blink rate/perclos
         self._calibration_mar_ts = [] # timestamps of MAR values to callibrate perclos
+        # Timestamp of EVERY calibration tick, face present or not — the two
+        # lists above only grow when a face is visible, so they measure face
+        # detection, not loop cadence. See compute_calibration() for why the
+        # achieved rate is worth recording.
+        self._calibration_tick_ts: List[float] = []
 
         # Calibration: 180 s time-based, collects gaze/EAR/MAR/HR/RR.
         # 3 minutes is set by the BLINK-RATE baseline, not by rPPG: a blink count
@@ -764,9 +769,13 @@ class DataCollector:
 
         if self._calibration_start_t == 0.0:
             self._calibration_start_t = now
-            print("[Calibration] Starting 60 s calibration.")
+            print(f"[Calibration] Starting {self._calibration_duration_s:.0f} s calibration.")
+        # One entry per tick that actually sampled a frame. Failed reads return
+        # above without appending, which matches how a session's rate is
+        # measured from raw_data.jsonl (only logged frames count).
+        self._calibration_tick_ts.append(now)
 
-        # ── 60-second calibration ─────────────────────────────────────────────
+        # ── time-based calibration (see _calibration_duration_s) ──────────────
         h_img, w_img = frame.shape[:2]
         landmarks = self.compute_face_landmarks(frame)
         face_present = bool(landmarks)
@@ -914,12 +923,70 @@ class DataCollector:
             std_perclos = PERCLOS_MIN_SCALE
         self.calibrate['perclos'] = {'mean': mean_perclos, 'std': std_perclos}
 
+        # Achieved loop rate during calibration. Recorded because the baselines
+        # above are NOT all rate-invariant: 'blink_rate.mean' comes from the same
+        # duration-gated detector the session uses (see _visual_process), whose
+        # yield depends on the sample interval relative to the 100/500 ms gate.
+        # When calibration and session run at the same rate that dependence
+        # cancels in the z-score; when they differ it does not, and shows up as a
+        # constant offset on a feature the model reads.
+        #
+        # The two rates differ SYSTEMATICALLY, not incidentally: calibration runs
+        # a much lighter tick than collect_data() — no emotion inference, no YOLO
+        # (the worker idles until _visual_process publishes a frame), no decision
+        # engine (its loop gates on self.calibrated), no CARLA queries and no
+        # logging. So calibration sits nearer the nominal cap and the session
+        # falls below it. Storing the rate makes that gap measurable instead of
+        # invisible: nothing else records it, since the [fps] print and the
+        # profiler both live in the post-calibration branch of _run_loop.
+        #
+        # This is diagnostic METADATA and deliberately NOT in _CALIBRATION_SCHEMA:
+        # that schema is the contract for fields the SERVING path indexes, and
+        # nothing reads these. Adding it there would invalidate every existing
+        # calibration file for a value no consumer needs.
+        self.calibrate['sample_rate'] = self._calibration_rate_stats()
+
         self.calibrated = True
         self._session_start_t = time.monotonic()
 
         print("Calibration completed:", self.calibrate)
+        _sr = self.calibrate['sample_rate']
+        print(f"[Calibration] achieved rate: median {_sr['median_hz']:.1f} Hz, "
+              f"mean {_sr['mean_hz']:.1f} Hz, slow tail (p05) {_sr['p05_hz']:.1f} Hz "
+              f"over {_sr['n_ticks']:.0f} ticks / {_sr['duration_s']:.0f} s. "
+              f"Compare against the [fps] line once collection starts.")
 
         self.save_calibration()
+
+    def _calibration_rate_stats(self) -> Dict[str, float]:
+        """Loop-rate statistics over the calibration ticks.
+
+        Median rather than mean for the headline figure: a handful of long
+        stalls drag the mean well below the rate the loop actually held (18.5 vs
+        15.0 Hz on a measured session). ``p05_hz`` is the slow tail, which is
+        what matters for the blink gate — a blink is lost once the sample
+        interval approaches its 100-500 ms duration window. All-zero when fewer
+        than two ticks were recorded, so the field is always present and finite.
+        """
+        ts = self._calibration_tick_ts
+        if len(ts) < 2:
+            return {'median_hz': 0.0, 'mean_hz': 0.0, 'p05_hz': 0.0,
+                    'n_ticks': float(len(ts)), 'duration_s': 0.0}
+        span = float(ts[-1] - ts[0])
+        d = np.diff(np.asarray(ts, dtype=np.float64))
+        # Drop non-positive intervals (clock jitter) and multi-second pauses,
+        # which are stalls rather than a sampling cadence.
+        d = d[(d > 0.0) & (d < 5.0)]
+        if d.size == 0:
+            return {'median_hz': 0.0, 'mean_hz': 0.0, 'p05_hz': 0.0,
+                    'n_ticks': float(len(ts)), 'duration_s': round(span, 2)}
+        return {
+            'median_hz': round(float(1.0 / np.median(d)), 2),
+            'mean_hz': round(float((len(ts) - 1) / span), 2) if span > 0 else 0.0,
+            'p05_hz': round(float(1.0 / np.percentile(d, 95)), 2),
+            'n_ticks': float(len(ts)),
+            'duration_s': round(span, 2),
+        }
 
     # ── Calibration persistence ──────────────────────────────────────────────
     def calibration_file(self) -> Optional[str]:
@@ -971,7 +1038,7 @@ class DataCollector:
         return None
 
     def load_calibration(self) -> bool:
-        """Adopt this participant's stored baselines, skipping the 60 s routine.
+        """Adopt this participant's stored baselines, skipping the live routine.
 
         Returns True only when a well-formed file was found and applied; on any
         other outcome the caller runs the live calibration instead.
@@ -979,22 +1046,23 @@ class DataCollector:
         path = self.calibration_file()
         if path is None:
             print("[Calibration] No participantid in context — cannot reuse a "
-                  "stored calibration; running the 60 s calibration.")
+                  f"stored calibration; running the {self._calibration_duration_s:.0f} s calibration.")
             return False
         if not os.path.exists(path):
             print(f"[Calibration] No stored calibration at {path} — "
-                  f"running the 60 s calibration.")
+                  f"running the {self._calibration_duration_s:.0f} s calibration.")
             return False
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 cal = json.load(f)
         except Exception as e:  # unreadable / invalid JSON
-            print(e, f"Error reading {path}; running the 60 s calibration")
+            print(e, f"Error reading {path}; running the "
+                     f"{self._calibration_duration_s:.0f} s calibration")
             return False
         reason = self._validate_calibration(cal)
         if reason is not None:
             print(f"[Calibration] Ignoring {path} ({reason}) — "
-                  f"running the 60 s calibration.")
+                  f"running the {self._calibration_duration_s:.0f} s calibration.")
             return False
 
         # Copy field-by-field as floats: keeps `calibrate` exactly the shape the
@@ -1003,11 +1071,31 @@ class DataCollector:
             key: {field: float(cal[key][field]) for field in fields}
             for key, fields in _CALIBRATION_SCHEMA.items()
         }
+        # Diagnostic metadata, outside the schema (see compute_calibration), so
+        # the comprehension above would drop it. Carried through and echoed
+        # because the rate this file was recorded at is exactly what a later
+        # session has to be compared against — and files written before this
+        # existed simply have no entry.
+        _sr = cal.get('sample_rate')
+        if isinstance(_sr, dict):
+            self.calibrate['sample_rate'] = {
+                k: float(v) for k, v in _sr.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
         self.calibrated = True
         self._session_start_t = time.monotonic()
         print(f"[Calibration] Loaded calibration from {path} — "
-              f"skipping the 60 s calibration.")
+              f"skipping the live calibration.")
         print("Calibration loaded:", self.calibrate)
+        _sr = self.calibrate.get('sample_rate')
+        if _sr and _sr.get('median_hz'):
+            print(f"[Calibration] this baseline was recorded at "
+                  f"{_sr['median_hz']:.1f} Hz (median) — compare against the "
+                  f"[fps] line once collection starts; a large gap biases the "
+                  f"normalized blink_rate.")
+        else:
+            print("[Calibration] this baseline predates sample-rate recording, "
+                  "so the rate it was measured at is unknown.")
         return True
 
     def save_calibration(self) -> Optional[str]:
@@ -1030,7 +1118,7 @@ class DataCollector:
     def _standardized_delta(self, value: float, cal_key: str, history) -> float:
         """(value - baseline) / std as a z-score.
 
-        Baseline and std come from the 60 s calibration for ``cal_key`` when it
+        Baseline and std come from the live calibration for ``cal_key`` when it
         produced samples; otherwise they fall back to the rolling ``history``
         stats. Every degenerate case (no calibration, short history, zero std)
         collapses to a unit std, so the result is the raw deviation — never a

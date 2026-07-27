@@ -7,6 +7,39 @@ import os
 import uuid
 import argparse as ap
 
+# ── CPU thread budget ────────────────────────────────────────────────────────
+# Must run BEFORE numpy/torch/cv2 are imported: the OpenMP/MKL runtimes size
+# their thread pools once, at load time, and ignore these variables afterwards.
+#
+# Why cap them at all: this process shares the machine with the CARLA server and
+# the Drive client, and CARLA runs in SYNCHRONOUS mode (drive_improved.py sets
+# fixed_delta_seconds=0.05 and drives the world with sim_world.tick()), so the
+# simulation only advances as fast as Drive's loop does. Anything that stalls
+# Drive is a visible sim hitch.
+#
+# Left at its default, torch sizes its intra-op pool to the core count (20 on
+# the lab machine) and every xLSTM forward becomes an all-core stampede.
+# Measured on a full 320-frame window:
+#
+#   threads   forward wall   cores busy
+#      20         5.6 ms        19.2      <- default
+#       4         3.6 ms         4.6
+#       2         5.1 ms         2.0      <- default here
+#       1         8.1 ms         1.0
+#
+# 20 threads buys NOTHING in wall-clock over 2 (the ops are tiny; fork/join
+# across 20 cores costs more than it saves) while consuming ~10x the CPU. At
+# decision_hz=4 that is four all-core bursts per second, which is exactly the
+# lag that appears once calibration ends and the decision thread starts running
+# full windows. KMP_BLOCKTIME/OMP_WAIT_POLICY stop the idle OpenMP workers
+# spin-waiting between bursts, which otherwise keeps the cores hot in between.
+PV_NUM_THREADS = os.getenv("PV_NUM_THREADS", "2")
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, PV_NUM_THREADS)
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import uvicorn
@@ -28,6 +61,32 @@ from ProVoice.decision_engine import (
 )
 from ProVoice.provoice_actuator import ProVoiceActuator
 import ProVoice.webui.app as dashboard
+
+# The env vars above configure the OpenMP/MKL runtimes; these are torch's own
+# knobs and are authoritative for intra-op (per-operator) and inter-op parallelism.
+# Set here, after the imports that pull torch in, because torch is not imported
+# directly by this module. set_num_interop_threads() throws once any inter-op
+# work has started, so a failure is non-fatal and simply leaves the default.
+try:
+    import torch as _torch
+    _torch.set_num_threads(int(PV_NUM_THREADS))
+    try:
+        _torch.set_num_interop_threads(int(PV_NUM_THREADS))
+    except Exception:
+        pass
+    print(f"[main] torch CPU threads capped at {_torch.get_num_threads()} "
+          f"(PV_NUM_THREADS={PV_NUM_THREADS}) to leave cores for CARLA.")
+except Exception as _e:
+    print(f"[main] could not cap torch threads: {_e}")
+
+try:
+    import cv2 as _cv2
+    # OpenCV runs its own thread pool, independent of OpenMP's. At 640x480 the
+    # colour conversions and resizes on the capture path are single-thread work
+    # anyway, so this costs nothing and removes another all-core consumer.
+    _cv2.setNumThreads(int(PV_NUM_THREADS))
+except Exception as _e:
+    print(f"[main] could not cap OpenCV threads: {_e}")
 
 # import ProVoice.logo as logo
 
@@ -87,7 +146,7 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--emotion", "--affect", dest="emotion", default="")
     p.add_argument("--modeltype", default="combined",
                    help="fcd | state | combined | collection")
-    p.add_argument("--state-model", "--statemodel", dest="state_model", default="classic",
+    p.add_argument("--state-model", "--statemodel", dest="state_model", default="xlstm",
                    help="classic | xlstm")
     p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.7)
     p.add_argument("--session-id", dest="session_id", default=None)

@@ -10,7 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
 from ProVoice.models.xlstm_model import (
-    encode_frame,
+    encode_and_resample,
+    DEFAULT_RESAMPLE_HZ,
     D_IN,
     STATE_CAT,
     STATE_NUM,
@@ -136,6 +137,7 @@ class SeqDataset(Dataset):
         split: str = "train",
         log_fh=None,
         window_seconds: float | None = None,
+        resample_hz: float | None = None,
     ):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
@@ -158,8 +160,10 @@ class SeqDataset(Dataset):
             # Keep only the LAST window_seconds of the segment (frames are
             # chronological within a segment). None/0 = use the full segment.
             rows = truncate_frames_by_seconds(rows, window_seconds)
-            xs = [encode_frame(r.get('functionname') or "", r) for r in rows]
-            X = np.stack(xs, axis=0).astype(np.float32)
+            # Then put every segment on the same time grid, so T depends on the
+            # segment's DURATION and not on the rate the session happened to
+            # achieve. None/0 = encode the raw frames (pre-resampling behaviour).
+            X = encode_and_resample(rows, resample_hz, window_seconds)
             self.groups.append((X, y, lvl))
             if log_fh is not None:
                 log_encoded_frames(log_fh, split, str(gid), X, label=y)
@@ -287,7 +291,10 @@ def main():
     ap.add_argument("--seed",   type=int, default=42)
     ap.add_argument("--lr",     type=float, default=2e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--context-length", dest="context_length", type=int, default=DEFAULT_CONTEXT_LENGTH)
+    ap.add_argument("--context-length", dest="context_length", type=int, default=None,
+                    help="Max sequence length. Defaults to window_seconds * resample_hz "
+                         "(the exact grid length, so the frame cap never binds), or "
+                         f"{DEFAULT_CONTEXT_LENGTH} when resampling is disabled.")
     ap.add_argument("--embedding-dim", dest="embedding_dim", type=int, default=64)
     ap.add_argument("--num-blocks", dest="num_blocks", type=int, default=2)
     ap.add_argument("--num-heads", dest="num_heads", type=int, default=4)
@@ -296,6 +303,17 @@ def main():
                          "(by frame timestamps, so it is robust to the actual sampling "
                          "rate). Default 20 = the full label window. 0 disables. "
                          "Stored in the checkpoint so fine-tuning and inference inherit it.")
+    ap.add_argument("--resample-hz", dest="resample_hz", type=float, default=DEFAULT_RESAMPLE_HZ,
+                    help="Resample every segment onto a fixed time grid at this rate "
+                         "AFTER the window_seconds truncation, so the number of "
+                         "timesteps depends on a window's duration and not on the "
+                         "sampling rate the session achieved (which varies ~2x between "
+                         "sessions and correlates with scene load). Continuous dims are "
+                         "linearly interpolated, one-hot/binary dims are held from the "
+                         "last real frame, and holes longer than "
+                         "xlstm_model.RESAMPLE_GAP_S are held rather than interpolated. "
+                         "0 disables. Stored in the checkpoint so fine-tuning and "
+                         "inference inherit it.")
     ap.add_argument("--loss", choices=["ce", "corn", "coral"], default="ce",
                     help="'ce': softmax head + cross-entropy (nominal). 'corn': rank-consistent "
                          "ordinal head (K-1 conditional logits) + CORN loss (Shi et al. 2023). "
@@ -306,6 +324,25 @@ def main():
                          "by fine_tune_XLSTM.py and the decision engine.")
     args = ap.parse_args()
     head_type = {"corn": "corn", "coral": "coral"}.get(args.loss, "softmax")
+
+    # Derive the sequence cap from the grid unless it was given explicitly. With
+    # resampling on, window_seconds * resample_hz IS the sequence length, so any
+    # other value either truncates real history or pads that never fills. The old
+    # default (400) happened to equal 20 s x 20 Hz, which is why the frame cap and
+    # the time cap used to coincide exactly at the nominal rate — and why the
+    # effective history silently shrank whenever a session ran faster than that.
+    resample_hz = args.resample_hz if args.resample_hz and args.resample_hz > 0 else None
+    if args.context_length is None:
+        if resample_hz and args.window_seconds and args.window_seconds > 0:
+            args.context_length = int(round(args.window_seconds * resample_hz))
+        else:
+            args.context_length = DEFAULT_CONTEXT_LENGTH
+    if resample_hz:
+        print(f"[data] resampling to {resample_hz:g} Hz over {args.window_seconds:g} s "
+              f"→ context_length={args.context_length}")
+    else:
+        print(f"[data] resampling DISABLED — sequence length follows the achieved "
+              f"sampling rate (context_length={args.context_length})")
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -371,9 +408,9 @@ def main():
         print(f"[log] writing feature log → {args.log_path}")
     try:
       train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh,
-                            window_seconds=args.window_seconds)
+                            window_seconds=args.window_seconds, resample_hz=resample_hz)
       test_ds  = SeqDataset(te_df, context_length=args.context_length, split="val",   log_fh=log_fh,
-                            window_seconds=args.window_seconds)
+                            window_seconds=args.window_seconds, resample_hz=resample_hz)
     finally:
       if log_fh:
           log_fh.close()
@@ -431,10 +468,13 @@ def main():
         num_blocks=args.num_blocks, num_heads=args.num_heads,
         context_length=args.context_length,
         head_type=head_type,
-        # Data contract, not a model kwarg: the time window segments were cut
-        # to. load_checkpoint() keeps it in arch but does not pass it to the
-        # constructor; fine-tuning and inference inherit it from here.
+        # Data contracts, not model kwargs: the time window segments were cut to
+        # and the grid they were resampled onto. load_checkpoint() keeps them in
+        # arch but does not pass them to the constructor; fine-tuning and
+        # inference inherit them from here, so train and serve cannot end up on
+        # different grids.
         window_seconds=(args.window_seconds if args.window_seconds and args.window_seconds > 0 else None),
+        resample_hz=resample_hz,
     )
 
     for ep in range(args.epochs):

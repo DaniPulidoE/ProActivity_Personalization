@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +73,260 @@ FEATURE_NAMES: List[str] = (
     + [f"lab_{l}"     for l in LAB_VOCAB]                 #  6  multi-hot distraction
 )
 assert len(FEATURE_NAMES) == D_IN, f"FEATURE_NAMES length {len(FEATURE_NAMES)} != D_IN {D_IN}"
+
+
+# --------------------------------------------------------------------------- #
+# Fixed-grid resampling — a DATA contract, shared by train and serve.
+# --------------------------------------------------------------------------- #
+# The collection loop is paced by `sampling_interval` but only ever falls BELOW
+# its nominal rate (CPU contention, camera stalls), so the achieved rate varies
+# per session: 19.6 Hz and 9.3 Hz have both been measured on the same machine on
+# the same day. `truncate_frames_by_seconds` already pins the WALL-CLOCK span of
+# the input, but the number of recurrent steps spanning that span still floats
+# with the rate — 20 s is ~396 frames at 19.6 Hz and ~186 at 9.3 Hz. An xLSTM
+# learns its time constants per STEP, not per second, so that is a 2x rescaling
+# of every learned dynamic from one session to the next. Worse, the achieved
+# rate is set by scene load (night, rain, junctions, YOLO), which correlates
+# with both the covariates and the labels, so sequence length is a leakage
+# channel: the model can read the condition off the step count instead of off
+# the driver.
+#
+# Resampling each window onto a fixed time grid makes the step count a function
+# of the window's DURATION alone. 10 Hz is chosen from the physiology, not from
+# the camera: the eye-closure indicator has an integrated autocorrelation time
+# of ~830 ms, so a 10 Hz grid is ~8 samples per correlation time — oversampled
+# for every feature in STATE_NUM, all of which are 30 s- or 180 s-smoothed.
+#
+# This runs DOWNSTREAM of the detectors, so it fixes the temporal geometry only.
+# A feature mismeasured at collection time (see the duration-gated blink counter
+# in data_collector._visual_process, whose yield drops once dt approaches the
+# 100/500 ms gate) stays mismeasured; that is a separate problem.
+DEFAULT_RESAMPLE_HZ = 10.0
+
+# Columns that may be LINEARLY interpolated onto the grid. Everything else is
+# carried from the last real frame at or before each grid point.
+#
+# The criterion is NOT "is this a float" — it is whether the change BETWEEN two
+# consecutive real samples is small relative to the feature's own quantum. Where
+# it is, interpolation estimates a value the signal genuinely passed through;
+# where it is not, interpolation manufactures a value the pipeline never
+# produced and the model never saw at training time.
+#
+# What is held, and why:
+#   * emotion one-hot / lab multi-hot — a blend (emotion_happy=0.4 next to
+#     emotion_sad=0.6) is a state that never occurred.
+#   * is_night / is_junction — binary.
+#   * environment_len / secondary_task_len — a CATEGORY encoded as a string
+#     length; the midpoint of two lengths is not a category.
+#   * the 12 FCD dims — ordinal 1-5 ratings looked up per FUNCTION, not measured
+#     over time. Constant while functionname is (the common case, and always so
+#     at serving, where one name applies to the whole window), but a segment
+#     spanning a function change would otherwise get a blend of two functions'
+#     profiles — a rating vector no real function has.
+#   * blink_rate — a deterministic function of an INTEGER count over a trailing
+#     window, so there is no continuous latent value to estimate. Two regimes,
+#     both measured on data/raw_data.jsonl: for the first 30 s of a session
+#     `elapsed_s` is still growing, so the rate decays as 60N/elapsed (370
+#     distinct values in one session); after that `elapsed_s` pins to 30 and the
+#     rate is exactly 2N — a strict lattice of 2 blinks/min (8 distinct values,
+#     84% of all frames). Holding costs <=0.13 blinks/min of ramp error in the
+#     first regime and zero in the second; interpolating costs up to a full 2.0
+#     quantum in the second. Hold dominates, so the ramp needs no special case.
+#   * yawn_rate — same, and without even the ramp: the divisor is the fixed
+#     180 s window, so the served feature is Anscombe(N) on {0, 1.12, 1.86, ...}
+#     for integer N. Anything between those is a fractional yawn.
+#   * hr_delta / rr_delta — the rPPG worker emits an estimate only about every
+#     6 s and the collection loop reads the held value on every tick, so these
+#     are staircases with ~6.7 s plateaus (measured: 25 and 21 distinct values
+#     across a 4867 s recording). Heart rate is a continuous latent signal, but
+#     the pipeline never observed it between readings; a plateau of 6.7 s is a
+#     third of a 20 s window, so interpolating would reshape a 3-step staircase
+#     into a smooth ramp built entirely from values the system never had.
+#     Holding also matches the carry-forward the collector already applies
+#     between readings.
+#
+# What survives as linear is exactly the set measured at FULL loop rate and
+# moving in small per-frame increments: the two visual driver-state features and
+# the CARLA vehicle/world channels.
+_LINEAR_FEATURES = frozenset(
+    ['perclos', 'gaze_score']
+    + ['speed_ratio_max', 'speed_ratio_limit', 'brake', 'steer', 'precipitation']
+)
+assert _LINEAR_FEATURES <= set(FEATURE_NAMES), (
+    f"unknown feature name in _LINEAR_FEATURES: {_LINEAR_FEATURES - set(FEATURE_NAMES)}")
+
+# Dims that are continuous EXCEPT for a reserved "missing" marker, mapped to
+# that marker's value. They interpolate normally among real readings, but a grid
+# point whose two bracketing samples include the marker is HELD instead: a
+# blend of a real value and a sentinel reads as a real value and is not one.
+#
+#   * speed_ratio_limit — `speed / speed_limit`, or -1 when the limit is unknown
+#     or zero (data_collector._carla_process). Both operands are non-negative,
+#     so a genuine ratio can never be -1 and the marker is unambiguous. Without
+#     this guard a -1 -> 0.9 transition spread over ~5 grid steps would
+#     manufacture a deceleration-then-acceleration that never happened.
+SENTINEL_VALUES: Dict[str, float] = {'speed_ratio_limit': -1.0}
+assert set(SENTINEL_VALUES) <= _LINEAR_FEATURES, (
+    "a sentinel column must also be linear, else the guard is dead code: "
+    f"{set(SENTINEL_VALUES) - _LINEAR_FEATURES}")
+_SENTINEL_COLS: List[Tuple[int, float]] = [
+    (FEATURE_NAMES.index(n), float(v)) for n, v in SENTINEL_VALUES.items()]
+LINEAR_COLS = np.array(
+    [i for i, n in enumerate(FEATURE_NAMES) if n in _LINEAR_FEATURES], dtype=np.intp)
+HOLD_COLS = np.array(
+    [i for i, n in enumerate(FEATURE_NAMES) if n not in _LINEAR_FEATURES], dtype=np.intp)
+
+# A hole longer than this means the pipeline stopped observing (face absent,
+# loop stall) rather than that the signal moved smoothly between two samples.
+# Interpolating across it would invent a ramp that never happened, so every
+# column is held instead — the same carry-forward the DataCollector already
+# applies while the face is out of frame.
+RESAMPLE_GAP_S = 1.0
+
+
+def secs_of_day(ts: Any) -> Optional[float]:
+    """Parse a frame timestamp ('HH:MM:SS.fff' or full ISO) to seconds-of-day."""
+    if not ts:
+        return None
+    s = str(ts).strip()
+    t = None
+    try:
+        t = datetime.fromisoformat(s).time()
+    except Exception:
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S"):
+            try:
+                t = datetime.strptime(s, fmt).time()
+                break
+            except Exception:
+                continue
+    if t is None:
+        return None
+    return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+
+
+def _relative_times(seq: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+    """``(kept_indices, seconds_since_first_kept_frame)``, monotone non-decreasing.
+
+    Frames whose timestamp cannot be parsed are DROPPED — resampling needs a time
+    for every sample, unlike ``truncate_frames_by_seconds`` which keeps them
+    because their age is merely unknowable. Handles midnight wrap-around, since
+    frame timestamps are time-of-day only.
+    """
+    idx: List[int] = []
+    secs: List[float] = []
+    for i, fr in enumerate(seq):
+        t = secs_of_day(fr.get("timestamp")) if isinstance(fr, dict) else None
+        if t is not None:
+            idx.append(i)
+            secs.append(t)
+    if len(idx) < 2:
+        return np.asarray(idx, dtype=np.intp), np.zeros(len(idx), dtype=np.float64)
+    out = np.empty(len(secs), dtype=np.float64)
+    out[0] = 0.0
+    for k in range(1, len(secs)):
+        d = secs[k] - secs[k - 1]
+        if d < -43200.0:      # more than half a day backwards → midnight wrap
+            d += 86400.0
+        elif d < 0.0:         # small backward clock jitter → treat as same instant
+            d = 0.0
+        out[k] = out[k - 1] + d
+    return np.asarray(idx, dtype=np.intp), out
+
+
+def resample_encoded(
+    X: np.ndarray,
+    seq: List[Dict[str, Any]],
+    resample_hz: Optional[float],
+    window_seconds: Optional[float] = None,
+    gap_s: float = RESAMPLE_GAP_S,
+) -> np.ndarray:
+    """Resample encoded frames onto a fixed ``resample_hz`` time grid.
+
+    Args:
+        X:              (T, D_IN) encoded frames, one row per entry in ``seq``.
+        seq:            the source frame dicts — read only for ``timestamp``.
+        resample_hz:    grid rate; None/0 returns ``X`` unchanged (legacy path).
+        window_seconds: caps the grid length, so the result is at most
+                        ``round(window_seconds * resample_hz)`` steps.
+        gap_s:          holes longer than this are held, never interpolated.
+
+    Returns (n, D_IN) where n depends ONLY on the window's duration, never on the
+    rate at which it was sampled. Falls back to ``X`` unchanged whenever the
+    timestamps cannot support resampling (fewer than 2 parseable), so a
+    malformed log degrades to the old behaviour instead of raising.
+    """
+    if not resample_hz or float(resample_hz) <= 0.0:
+        return X
+    if X.ndim != 2 or X.shape[0] != len(seq):
+        raise ValueError(
+            f"resample_encoded: X has {X.shape[0]} rows but seq has {len(seq)} frames")
+    keep, t = _relative_times(seq)
+    if len(keep) < 2:
+        return X
+    Xk = X[keep]
+    span = float(t[-1] - t[0])
+    dt = 1.0 / float(resample_hz)
+    if span < dt:
+        # Shorter than a single grid step: one sample, the most recent frame.
+        return Xk[-1:].astype(np.float32, copy=True)
+    n = int(np.floor(span / dt)) + 1
+    if window_seconds and float(window_seconds) > 0.0:
+        n = min(n, max(1, int(round(float(window_seconds) * float(resample_hz)))))
+    # Anchor the grid at the NEWEST frame and step backwards: forward() reads the
+    # hidden state at the last timestep, so the most recent observation has to
+    # land exactly on it. Stepping back from t[-1] also guarantees grid[0] >=
+    # t[0], so the grid never extrapolates before the first real frame.
+    grid = t[-1] - dt * np.arange(n - 1, -1, -1, dtype=np.float64)
+
+    # The two real samples bracketing each grid point. `prev` is the last sample
+    # at or before it (causal — never a future frame); `nxt` is the one after,
+    # clamped at the end where grid[-1] coincides with t[-1].
+    prev = np.clip(np.searchsorted(t, grid, side='right') - 1, 0, len(t) - 1)
+    nxt = np.minimum(prev + 1, len(t) - 1)
+
+    out = np.empty((n, X.shape[1]), dtype=np.float32)
+    for c in LINEAR_COLS:
+        out[:, c] = np.interp(grid, t, Xk[:, c])
+    if HOLD_COLS.size:
+        out[:, HOLD_COLS] = Xk[np.ix_(prev, HOLD_COLS)]
+    # Sentinel guard: revert to a hold wherever either bracketing sample carries
+    # the reserved "missing" marker, so no grid point lands between a real
+    # reading and a sentinel. Interpolation among real readings is untouched.
+    for c, sentinel in _SENTINEL_COLS:
+        col = Xk[:, c]
+        touching = np.isclose(col[prev], sentinel) | np.isclose(col[nxt], sentinel)
+        if touching.any():
+            out[touching, c] = col[prev[touching]]
+    # Long holes: hold every column, including the interpolatable ones.
+    stale = (t[nxt] - t[prev]) > float(gap_s)
+    if stale.any():
+        out[stale] = Xk[prev[stale]]
+    return out
+
+
+def encode_and_resample(
+    rows: List[Dict[str, Any]],
+    resample_hz: Optional[float] = None,
+    window_seconds: Optional[float] = None,
+    functionname: Optional[str] = None,
+) -> np.ndarray:
+    """Encode ``rows`` and resample them — the ONE path train and serve share.
+
+    ``functionname=None`` takes the name per row (the trainer's JSONL carries it
+    on every frame); passing it explicitly applies one name to the whole window,
+    which is what the decision engine does.
+    """
+    if not rows:
+        raise ValueError("encode_and_resample got an empty frame list")
+    xs = [
+        encode_frame(
+            functionname if functionname is not None else (r.get("functionname") or ""),
+            r,
+        )
+        for r in rows
+    ]
+    X = np.stack(xs, axis=0).astype(np.float32)
+    return resample_encoded(X, rows, resample_hz, window_seconds)
 
 
 def log_encoded_frames(
@@ -329,10 +584,14 @@ def load_checkpoint(path: str, map_location: str = 'cpu') -> Tuple[XLSTMSequence
     # last-step (the only behaviour forward() ever implemented), so the key is
     # dropped rather than passed to a constructor that no longer accepts it.
     arch.pop("pool", None)
-    # 'window_seconds' is a DATA contract (how segments were cut at training),
-    # not a model kwarg: keep it in the returned arch for callers (fine-tuning,
-    # sweep, inference) but don't pass it to the constructor.
-    ctor_kwargs = {k: v for k, v in arch.items() if k != "window_seconds"}
+    # 'window_seconds' and 'resample_hz' are DATA contracts (how segments were
+    # cut and onto which time grid they were resampled at training), not model
+    # kwargs: keep them in the returned arch for callers (fine-tuning, sweep,
+    # inference) but don't pass them to the constructor. Checkpoints written
+    # before resampling existed simply lack the key, and .get() yields None →
+    # resampling stays off for them, which is the old behaviour.
+    _DATA_CONTRACT_KEYS = ("window_seconds", "resample_hz")
+    ctor_kwargs = {k: v for k, v in arch.items() if k not in _DATA_CONTRACT_KEYS}
     model = XLSTMSequenceClassifier(**ctor_kwargs)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
