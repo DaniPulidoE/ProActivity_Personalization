@@ -10,6 +10,18 @@ window ``[window_start_timestamp, window_end_timestamp]``. The driver's
 ``user_selected_loa`` becomes the label (NOT the system's own predicted ``LoA``,
 which would be circular).
 
+A window can carry MORE THAN ONE label. Under ``--random-function`` the drive UI
+shows two prompts per 20 s window, about two different functions, and both rows
+share the window's index and its start/end. Every frame in such a window is
+therefore emitted once PER LABEL: same features, different function and different
+LoA. Taking only the first match would silently throw half the labels away.
+
+The function a segment is attributed to comes from the LABEL row, not from the
+frame. ProVoice is started with a single ``functionname`` and stamps it (and the
+FCD vector it implies) on every frame it logs, which is wrong for every prompt
+that drew a different function; the label row records what the driver was
+actually asked about.
+
 It writes two files, matching exactly what the trainers expect:
 
   * ``labeled_data.jsonl`` — every labelled frame + ``segment_id`` + ``Level_1..5``
@@ -28,7 +40,8 @@ It writes two files, matching exactly what the trainers expect:
   * ``fcd_out.csv``        — per-segment aggregated FCD features + ``Level_1..5``
       (feed to ``ProVoice.train_fcd_loa`` / ``data/processed_data/fcd_out.csv``)
 
-A "segment" is one 20 s label window (``segment_id = <session_id>|win<idx>``).
+A "segment" is one label: ``segment_id = <session_id>|win<idx>`` for a window with
+a single prompt, ``<session_id>|win<idx>p<n>`` once a window holds several.
 ``Level_k`` is the one-hot of the driver's LoA: LoA 0..4 -> Level_1..5.
 
 Usage::
@@ -111,10 +124,37 @@ def _loa_to_levels(loas) -> Dict[str, int]:
     return levels
 
 
+def _prompt_order(prompt: Any) -> int:
+    try:
+        return int(float(prompt))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _segment_id(sid: str, window_idx: Any, prompt: Any) -> str:
+    """``<session>|win<NNN>``, plus ``p<n>`` once a window holds several prompts.
+
+    The suffix is what keeps the prompts of one window apart: they share a
+    window_idx and its 20 s span and differ only in the function asked about.
+    Labels written before prompts existed carry no ``prompt_in_window``, so they
+    keep the original id and datasets rebuilt from older CSVs are unchanged.
+    """
+    idx = str(window_idx)
+    base = (f"{sid}|win{int(float(idx)):03d}" if idx.replace('.', '', 1).isdigit()
+            else f"{sid}|win{idx}")
+    order = _prompt_order(prompt)
+    return f"{base}p{order}" if order else base
+
+
 def load_label_windows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    """session_id -> list of windows (start/end seconds-of-day, loa, context)."""
+    """session_id -> list of labels (start/end seconds-of-day, loa, context).
+
+    One entry per LABEL row, not per window: a window answered about two
+    functions contributes two entries with identical start/end.
+    """
     by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     kept = skipped = 0
+    windows_seen = set()
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             sid = (row.get("session_id") or "").strip()
@@ -128,26 +168,37 @@ def load_label_windows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
             if not loa:
                 skipped += 1
                 continue
+            window_idx = (row.get("window_idx") or "").strip() or str(len(by_session[sid]) + 1)
+            prompt = (row.get("prompt_in_window") or "").strip()
             by_session[sid].append({
-                "window_idx": (row.get("window_idx") or "").strip() or str(len(by_session[sid]) + 1),
+                "window_idx": window_idx,
+                "prompt_in_window": prompt,
+                # Empty for a run that fixed one function with --functionname; the
+                # frame's own name is then used, and the two agree anyway.
+                "functionname": (row.get("functionname") or "").strip(),
+                "segment_id": _segment_id(sid, window_idx, prompt),
                 "start_s": start_s,
                 "end_s": end_s,
                 "loa": loa,
             })
+            windows_seen.add((sid, window_idx))
             kept += 1
     for sid in by_session:
-        by_session[sid].sort(key=lambda w: w["start_s"])
-    print(f"[labels] {kept} usable windows across {len(by_session)} sessions ({skipped} skipped)")
+        by_session[sid].sort(key=lambda w: (w["start_s"], _prompt_order(w["prompt_in_window"])))
+    print(f"[labels] {kept} usable labels over {len(windows_seen)} windows "
+          f"across {len(by_session)} sessions ({skipped} skipped)")
     return by_session
 
 
-def _match_window(windows: List[Dict[str, Any]], t: float) -> Optional[Dict[str, Any]]:
+def _match_windows(windows: List[Dict[str, Any]], t: float) -> List[Dict[str, Any]]:
+    """EVERY label whose window contains ``t`` — a window may carry more than one."""
+    out = []
     for w in windows:
         s, e = w["start_s"], w["end_s"]
         inside = (s <= t <= e) if s <= e else (t >= s or t <= e)  # tolerate midnight wrap
         if inside:
-            return w
-    return None
+            out.append(w)
+    return out
 
 
 def iter_raw_frames(path: Path):
@@ -162,10 +213,20 @@ def iter_raw_frames(path: Path):
                 continue
 
 
-def _fcd_vector(frame: Dict[str, Any]) -> List[float]:
-    fcd = frame.get("FCD") or frame.get("fcd")
-    if not isinstance(fcd, dict):
-        fcd = get_fcd_for_function(str(frame.get("functionname", "")))
+def _fcd_vector(frame: Dict[str, Any], functionname: str = "") -> List[float]:
+    """FCD features for one frame.
+
+    ``functionname`` is the function the LABEL asked about, and it wins over the
+    frame's own ``FCD``: ProVoice derived that from the single function it was
+    started with, so it describes the wrong function for every prompt that drew a
+    different one.
+    """
+    if functionname:
+        fcd = get_fcd_for_function(functionname)
+    else:
+        fcd = frame.get("FCD") or frame.get("fcd")
+        if not isinstance(fcd, dict):
+            fcd = get_fcd_for_function(str(frame.get("functionname", "")))
     out = []
     for name in FCD_NAMES:
         try:
@@ -199,6 +260,7 @@ def main() -> None:
     seg_frames: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     seg_meta: Dict[str, Dict[str, Any]] = {}
     n_total = n_labeled = n_no_session = n_no_window = 0
+    n_frames_used = n_multi = 0
     loa_hist: Dict[int, int] = defaultdict(int)
 
     with out_jsonl.open("w", encoding="utf-8") as fo:
@@ -209,21 +271,40 @@ def main() -> None:
             if not sid or sid not in windows or t is None:
                 n_no_session += 1
                 continue
-            w = _match_window(windows[sid], t)
-            if w is None:
+            matches = _match_windows(windows[sid], t)
+            if not matches:
                 n_no_window += 1
                 continue
-            seg_id = f"{sid}|win{int(float(w['window_idx'])):03d}" if str(w["window_idx"]).replace('.', '', 1).isdigit() else f"{sid}|win{w['window_idx']}"
-            row = dict(frame)
-            row["segment_id"] = seg_id
-            row["user_loa"] = ";".join(str(v) for v in w["loa"])
-            row.update(_loa_to_levels(w["loa"]))
-            fo.write(json.dumps(row, ensure_ascii=False) + "\n")
-            n_labeled += 1
-            for _loa in w["loa"]:   # a multi-mark counts toward every level it names
-                loa_hist[_loa] += 1
-            seg_frames[seg_id].append(frame)
-            seg_meta[seg_id] = {"loa": w["loa"], "functionname": str(frame.get("functionname", ""))}
+            n_frames_used += 1
+            if len(matches) > 1:
+                n_multi += 1
+            # One row per label: the same 20 s of driving answered about two
+            # functions is two training examples, identical features apart from
+            # the function and the LoA.
+            for w in matches:
+                row = dict(frame)
+                row["segment_id"] = w["segment_id"]
+                row["user_loa"] = ";".join(str(v) for v in w["loa"])
+                if w["functionname"] and w["functionname"] != str(frame.get("functionname", "")):
+                    # What the trainer encodes from: encode_frame() rebuilds the
+                    # FCD vector from this name, so it has to be the function the
+                    # driver was actually asked about, not ProVoice's run-level
+                    # one. Its FCD goes with it — a frame carrying one function's
+                    # name next to another's FCD is a trap for anything reading
+                    # the field directly. Untouched when the two already agree,
+                    # so datasets rebuilt from older labels stay byte-identical.
+                    row["functionname"] = w["functionname"]
+                    row["FCD"] = get_fcd_for_function(w["functionname"])
+                row.update(_loa_to_levels(w["loa"]))
+                fo.write(json.dumps(row, ensure_ascii=False) + "\n")
+                n_labeled += 1
+                for _loa in w["loa"]:   # a multi-mark counts toward every level it names
+                    loa_hist[_loa] += 1
+                seg_frames[w["segment_id"]].append(frame)
+                seg_meta[w["segment_id"]] = {
+                    "loa": w["loa"],
+                    "functionname": w["functionname"] or str(frame.get("functionname", "")),
+                }
 
     # Per-segment aggregated FCD table for the FCD trainer.
     n_seg = 0
@@ -231,7 +312,7 @@ def main() -> None:
         w = csv.writer(f)
         w.writerow(LEVELS + FEATS + ["function_group", "segment_id", "n_frames"])
         for seg_id, frames in seg_frames.items():
-            vecs = [_fcd_vector(fr) for fr in frames]
+            vecs = [_fcd_vector(fr, seg_meta[seg_id]["functionname"]) for fr in frames]
             agg = []
             for j in range(len(FCD_NAMES)):
                 col = [v[j] for v in vecs if v[j] == v[j]]  # drop NaN
@@ -241,11 +322,19 @@ def main() -> None:
             w.writerow([levels[k] for k in LEVELS] + agg + [seg_meta[seg_id]["functionname"], seg_id, len(frames)])
             n_seg += 1
 
-    print(f"[frames] {n_total} read | {n_labeled} labelled | "
-          f"{n_no_session} no-session-match | {n_no_window} outside-any-window")
+    print(f"[frames] {n_total} read | {n_frames_used} inside a window | "
+          f"{n_no_session} no-session-match | {n_no_window} outside-any-window "
+          f"(the scene is frozen while a popup is open, and no window covers that time)")
+    print(f"[rows] {n_labeled} labelled rows written "
+          f"({n_multi} frames carried more than one label)")
     print(f"[segments] {n_seg} -> {out_fcd}")
     print(f"[labelled frames] -> {out_jsonl}")
     print("[LoA distribution] " + ", ".join(f"LoA{k}={loa_hist[k]}" for k in sorted(loa_hist)))
+    by_function: Dict[str, int] = defaultdict(int)
+    for meta in seg_meta.values():
+        by_function[meta["functionname"] or "(unnamed)"] += 1
+    print("[segments by function] " + ", ".join(
+        f"{name}={n}" for name, n in sorted(by_function.items(), key=lambda kv: -kv[1])))
     if n_labeled == 0:
         raise SystemExit("nothing aligned — check that drive & ProVoice shared the same session_id "
                          "(PV_SESSION_ID / --session-id) and ran on the same machine clock.")

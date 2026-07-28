@@ -278,6 +278,16 @@ def _current_session_id(explicit_session_id=''):
 
 
 def _load_latest_system_decision_snapshot(session_id=''):
+    """Latest decision ProVoice logged FOR THIS SESSION, or {} if there is none.
+
+    decisions.csv is appended to across runs, so the last line of the file
+    usually belongs to an earlier session. Falling back to it whenever this
+    session has no decisions yet — which is every row of a --data-collection run,
+    and the opening rows of any run — stamps another run's prediction onto these
+    labels and invents a system answer that was never made. Rows with a blank
+    session_id still count: they come from decisions.csv files written before the
+    column existed.
+    """
     cwd = os.getcwd()
     path = os.path.join(cwd, 'data', 'decisions.csv')
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -292,7 +302,8 @@ def _load_latest_system_decision_snapshot(session_id=''):
                 if session_id and row.get('session_id') not in (None, '', session_id):
                     continue
                 last_match = row
-            chosen = last_match or last_any
+            # last_any only when nothing identifies this session in the first place.
+            chosen = last_match if session_id else last_any
             if chosen:
                 chosen['_source_path'] = path
                 return chosen
@@ -483,6 +494,78 @@ RANDOM_FUNCTION_POOL = (
 # driving instead of one, each asking about a different function. Drawing without
 # replacement is what keeps the pair distinct.
 PROMPTS_PER_WINDOW = 2
+
+
+# --- Waiting for ProVoice before the first window -----------------------------
+# ProVoice needs the better part of a minute to load its models and start
+# logging, while Drive's popup clock would otherwise start the moment the driver
+# presses START. Windows opened in that gap have no driver-state frames behind
+# them, and scripts/build_loa_dataset.py drops their labels — in one measured run
+# that was half the session's labels.
+#
+# So the clock starts at ProVoice's FIRST logged frame instead. The first popup
+# then follows one full interval later, which means the 20 s the driver is asked
+# about is covered by data end to end.
+PROVOICE_RAW_LOG = os.path.join('data', 'raw_data.jsonl')
+POPUP_WAIT_TIMEOUT_S = 180.0
+
+
+def _last_logged_session_id(path, tail_bytes=65536):
+    """session_id on the last complete line of a JSONL log, or None.
+
+    Only the tail is read: the log grows to tens of MB over a session and this
+    runs every second. ProVoice appends in order, so once it is writing for this
+    session its rows are the newest ones and the last line is enough.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()          # drop the partial line the seek landed in
+            chunk = f.read()
+    except OSError:
+        return None
+    for raw in reversed(chunk.splitlines()):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw.decode('utf-8', 'replace'))
+        except Exception:
+            continue                  # half-written line; try the one before it
+        return (record.get('session_id') or '').strip()
+    return None
+
+
+class ProVoiceReadyWatcher(object):
+    """Polls the raw log until ProVoice starts writing frames for this session."""
+
+    def __init__(self, session_id, timeout_s, poll_s=1.0, path=None):
+        self.session_id = (session_id or '').strip()
+        self.timeout_ms = max(0.0, float(timeout_s)) * 1000.0
+        self.poll_ms = poll_s * 1000.0
+        self.path = path or os.path.join(os.getcwd(), PROVOICE_RAW_LOG)
+        self.started_ms = None
+        self._next_poll_ms = 0
+
+    def start(self, now_ms):
+        self.started_ms = now_ms
+        self._next_poll_ms = now_ms
+
+    def waited_s(self, now_ms):
+        return 0.0 if self.started_ms is None else (now_ms - self.started_ms) / 1000.0
+
+    def poll(self, now_ms):
+        """'waiting' | 'ready' | 'timeout'. Cheap between polls."""
+        if self.started_ms is None or now_ms < self._next_poll_ms:
+            return 'waiting'
+        self._next_poll_ms = now_ms + self.poll_ms
+        if self.session_id and _last_logged_session_id(self.path) == self.session_id:
+            return 'ready'
+        if self.timeout_ms and (now_ms - self.started_ms) >= self.timeout_ms:
+            return 'timeout'
+        return 'waiting'
 
 
 # --- Practice popups (--test-popup) -------------------------------------------
@@ -2168,6 +2251,17 @@ def _resolve_popup_input(args, has_wheel):
     return mode
 
 
+def _should_wait_for_provoice(args):
+    """Whether the LoA windows hold until ProVoice's first frame.
+
+    Only a run that actually records labels alongside ProVoice has anything to
+    gain: --test-popup teaches the control with no ProVoice process at all and
+    would wait forever, and --no-popup opens no windows to protect.
+    """
+    return (not args.no_popup and not args.test_popup
+            and args.popup_wait_timeout > 0)
+
+
 def _advance_or_close(loa_popup, world, now_ms):
     """Move to the next prompt of this window, or end the window.
 
@@ -2238,7 +2332,13 @@ def game_loop(args):
             function_pool=RANDOM_FUNCTION_POOL if args.random_function else ())
         start_overlay = StartScreenOverlay(args.width, args.height)
         started = False
+        wait_for_provoice = _should_wait_for_provoice(args)
+        popups_armed = False
         session_id = _current_session_id(getattr(args, 'session_id', ''))
+        # Same id the labels are written under, which is exactly what has to be
+        # matched in ProVoice's log — a second _current_session_id() call would
+        # mint a different one whenever no id was passed in.
+        provoice_watcher = ProVoiceReadyWatcher(session_id, args.popup_wait_timeout)
         label_context = {
             'session_id': session_id,
             'participantid': getattr(args, 'participantid', ''),
@@ -2269,6 +2369,12 @@ def game_loop(args):
                       % (loa_popup.prompts_per_window, ', '.join(RANDOM_FUNCTION_POOL)))
             else:
                 print("[INFO] 1 prompt per window about '%s'" % loa_popup.function_name)
+            if wait_for_provoice:
+                print("[INFO] The first window waits for ProVoice's first logged frame "
+                      "(giving up after %.0f s)" % args.popup_wait_timeout)
+            elif not args.test_popup:
+                print("[WARN] Not waiting for ProVoice (--popup-wait-timeout 0): windows "
+                      "opened before it logs have no driver-state data behind them")
 
         if args.sync:
             sim_world.tick()
@@ -2294,12 +2400,43 @@ def game_loop(args):
                         return
                     if action == 'start':
                         started = True
-                        loa_popup.start()
+                        if wait_for_provoice:
+                            provoice_watcher.start(now_ms)
+                            print("[INFO] Holding the LoA windows until ProVoice logs "
+                                  "its first frame for this session...")
+                            world.hud.notification(
+                                'Waiting for ProVoice to start logging...', seconds=6.0)
+                        else:
+                            loa_popup.start()
+                            popups_armed = True
                         break
                 world.render(display)
                 start_overlay.render(display)
                 pygame.display.flip()
                 continue
+
+            if not popups_armed:
+                # Driving is already live — only the label windows wait, so the
+                # hold doubles as the driver's adaptation time.
+                state = provoice_watcher.poll(now_ms)
+                if state in ('ready', 'timeout'):
+                    loa_popup.start()
+                    popups_armed = True
+                    waited = provoice_watcher.waited_s(now_ms)
+                    if state == 'ready':
+                        print("[INFO] ProVoice is logging after %.1f s; first window "
+                              "starts now and its popup opens in %.0f s, so the whole "
+                              "window has driver-state data."
+                              % (waited, loa_popup.interval_ms / 1000.0))
+                        world.hud.notification('Recording started', seconds=4.0)
+                    else:
+                        print("[WARN] No ProVoice frame for this session after %.0f s "
+                              "— starting the LoA windows anyway. Early windows may "
+                              "have no driver-state data, and scripts/"
+                              "build_loa_dataset.py will drop those labels."
+                              % waited)
+                        world.hud.notification(
+                            'ProVoice not logging - labels may be unusable', seconds=8.0)
 
             if loa_popup.should_open(now_ms):
                 loa_popup.open(now_ms)
@@ -2479,6 +2616,16 @@ def main():
              'the scene freezes every 20 s and a popup asks for the acceptable LoAs; '
              'with this flag there are no popups, no freezes, and nothing is appended '
              'to data/user_loa_labels.csv')
+    argparser.add_argument(
+        '--popup-wait-timeout', dest='popup_wait_timeout', type=float,
+        default=POPUP_WAIT_TIMEOUT_S,
+        help='Seconds to wait for ProVoice to log its first frame for this session '
+             'before opening the first LoA window anyway (default: %(default)s). The '
+             'wait is what keeps early windows from being labelled with no '
+             'driver-state data behind them: the first window starts when ProVoice '
+             'does, so the popup one interval later covers a fully logged 20 s. '
+             'Driving is not held up, only the windows. 0 disables the wait; ignored '
+             'with --test-popup, which runs without ProVoice.')
     argparser.add_argument(
         '--random-function', dest='random_function', action='store_true',
         help='Draw the function each popup asks about at random from the %d study '

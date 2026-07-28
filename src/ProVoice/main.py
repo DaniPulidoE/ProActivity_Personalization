@@ -202,6 +202,12 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--carla-timeout", dest="carla_timeout", type=float, default=10.0)
     p.add_argument("--vehicle-state-url", dest="vehicle_state_url", default=None)
+    p.add_argument("--state-poll-hz", dest="state_poll_hz", type=float, default=2.0,
+                   help="How often to poll vehicle_state_url. The 2 Hz default "
+                        "is the historical one; start_experiment.py --vehicle-bridge "
+                        "raises it to match the collection loop, because at 2 Hz "
+                        "steer/brake are sampled ten times slower than a direct "
+                        "CARLA read and are visibly degraded.")
     p.add_argument("--log-path", dest="log_path", default=None,
                    help="JSONL log of features fed to the xLSTM; unset disables.")
     p.add_argument("--calibration-only", dest="calibration_only", action="store_true",
@@ -529,6 +535,7 @@ def main():
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
         vehicle_state_url=vehicle_state_url,
+        state_poll_hz=args.state_poll_hz,
         window_size=window_sz,
         decision_hz=args.decision_hz,
         calibration_only=args.calibration_only,
@@ -555,13 +562,26 @@ def main():
     data_collector.start()
 
     def handle_exit(_, __):
-        print("KeyboardInterrupt received")
+        print("[main] shutdown signal received — stopping cleanly.")
         if data_collector:
             data_collector.stop()
         server.should_exit = True
 
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
+    # SIGBREAK is what Windows delivers for CTRL_BREAK_EVENT, and that is how
+    # start_experiment.py now asks this process to stop. Without this handler
+    # the default action terminates the process outright, which is exactly the
+    # abrupt death we are trying to avoid: it leaves the CARLA RPC connection
+    # severed rather than closed, and CARLA cannot then distinguish a normal
+    # end-of-run from a ProVoice crash.
+    #
+    # Registering it matters more than it looks. Until now the launcher stopped
+    # this process with TerminateProcess (Popen.terminate() is an alias for
+    # kill() on Windows), so NEITHER handler above had ever run in a real
+    # session -- every run ended abruptly, whether or not anything went wrong.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, handle_exit)
 
     try:
         server.run()

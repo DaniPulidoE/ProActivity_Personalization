@@ -1,10 +1,40 @@
 import carla
 import random
+import signal
 import time
 import argparse
 
 
+def _install_graceful_stop():
+    """Turn a stop signal into KeyboardInterrupt so the cleanup below runs.
+
+    start_experiment.py asks children to exit with CTRL_BREAK_EVENT, which
+    arrives here as SIGBREAK; its default action kills the process outright.
+    Re-raising as KeyboardInterrupt hands control to the `except
+    KeyboardInterrupt` block at the end of main(), which destroys the spawned
+    NPC vehicles.
+
+    That block had never executed in a real session: the launcher previously
+    stopped this process with TerminateProcess (Popen.terminate() is an alias
+    for kill() on Windows), so every run left its vehicles behind in a CARLA
+    world that outlives the run, and severed its CARLA connection abruptly
+    rather than closing it.
+    """
+    def _graceful(_sig, _frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGBREAK", "SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _graceful)
+        except (ValueError, OSError):
+            pass  # not settable on this platform/thread; default stays
+
+
 def main():
+    _install_graceful_stop()
     # =========================
     # CONFIG
     # =========================

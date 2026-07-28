@@ -37,6 +37,7 @@ import re
 import sys
 import uuid
 import time
+import signal
 import subprocess
 import argparse
 from pathlib import Path
@@ -49,6 +50,11 @@ from pathlib import Path
 # Used when neither --functionname nor --random-function is given. Kept in sync
 # with Drive's and ProVoice's own defaults.
 DEFAULT_FUNCTIONNAME = "Adjust seat positioning"
+
+# Port nothing listens on, for --provoice-no-carla. 1 is reserved (tcpmux) and
+# never bound in practice, so connections fail instantly with ECONNREFUSED
+# rather than hanging until a timeout.
+_DEAD_PORT = 1
 
 
 # =========================
@@ -185,6 +191,39 @@ def report_probable_cause(name: str, code: int, since: float) -> None:
                 if fault_log.exists():
                     print(f"        ProVoice runs faulthandler: {fault_log}")
                     print("        holds a Python stack for EVERY thread as of the fault.")
+                # Measured 2026-07-28, twice consecutively with a clean control
+                # run in between: after a ProVoice crash, the NEXT ProVoice
+                # connection killed the CARLA server within ~10-12 s.
+                #   16:44 ProVoice crash -> 16:51 ProVoice start -> CARLA dead +12s
+                #   17:09 ProVoice crash -> 17:12 ProVoice start -> CARLA dead +10s
+                # The first ProVoice run against a freshly launched CARLA was
+                # clean, --test-drive runs never trip it, and an idle CARLA
+                # survives indefinitely -- so it is orphaned client state that
+                # only the next connection touches, not decay over time.
+                #
+                # There is a SECOND route into the same CARLA fault that this
+                # advice does not cover. Of the nine recorded 0x1b8 crashes,
+                # four had no ProVoice crash anywhere in that CARLA session
+                # (2026-05-27, 07-25 13:16, 07-25 13:33, 07-27 18:44) -- CARLA
+                # dying during ordinary operation. All four predate the
+                # set_hybrid_physics_mode(False) change of 2026-07-28 12:52 in
+                # src/drive/fixed_npc_traffic.py, and none has recurred since,
+                # so that change plausibly closed this route. Only two crashes
+                # have been observed post-fix though, which under the previous
+                # rate would come up clean by luck ~18% of the time -- suggestive,
+                # not settled.
+                #
+                # The route below is the one still live, and its root cause is
+                # ProVoice's own heap corruption, not CARLA -- see
+                # --provoice-no-carla.
+                print()
+                print("  ***  RESTART CARLA BEFORE THE NEXT RUN.  ***")
+                print("       After a ProVoice crash, the next ProVoice connection")
+                print("       has killed the CARLA server within ~10-12s. Relaunching")
+                print("       CARLA broke that chain every time it was tried.")
+                print("       Not a guarantee: CARLA has also died on fresh sessions")
+                print("       with no prior ProVoice crash, though every such case")
+                print("       predates the 2026-07-28 traffic-manager fix.")
     except Exception as e:  # noqa: BLE001 — diagnostics must never mask the crash
         print(f"[CAUSE] (could not determine: {e})")
 
@@ -236,6 +275,7 @@ def build_drive_cmd(session, args):
         # Drive owns the draw: it is the process that shows the popups, so the
         # pool lives there and only the switch is forwarded.
         *(["--random-function"] if args.random_function else []),
+        "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
 
@@ -260,6 +300,27 @@ def build_provoice_cmd(session, args, vehicle_id):
         f"decision_hz={args.decision_hz}",
         f"host={args.host}",
         f"port={args.port}",
+        # DIAGNOSTIC (--provoice-no-carla): ProVoice's main() skips the direct
+        # CARLA connection entirely when vehicle_state_url is set, expecting a
+        # bridge to serve vehicle state over HTTP. Pointing it at a dead port
+        # gives us a ProVoice that runs completely normally -- every perception
+        # thread, every model, all logging -- while making ZERO CARLA calls.
+        # _poll_vehicle_state swallows the connection errors and the vehicle
+        # fields stay at their defaults, so this run's speed/steer/brake columns
+        # are unusable. It exists to answer one question: is ProVoice's heap
+        # corruption coming from the CARLA client?
+        # Both paths below set vehicle_state_url, and setting it AT ALL is what
+        # matters: main.py then skips get_carla_vehicle_by_id() entirely, so no
+        # carla.Client is ever constructed, carla_vehicle stays None, and the
+        # per-frame CARLA block in DataCollector._carla_process is skipped
+        # wholesale. --vehicle-bridge points at a real server so the vehicle
+        # columns are still populated; --provoice-no-carla points at a dead port
+        # so they are not (diagnostic only).
+        *([f"vehicle_state_url=http://127.0.0.1:{args.bridge_port}",
+           f"state_poll_hz={args.bridge_poll_hz}"]
+          if args.vehicle_bridge else []),
+        *([f"vehicle_state_url=http://127.0.0.1:{_DEAD_PORT}"]
+          if args.provoice_no_carla and not args.vehicle_bridge else []),
         # Bare flags, not key=value: ProVoice parses these with store_true, which
         # rejects an explicit "=value". _normalize_argv passes "-"-prefixed
         # tokens through untouched.
@@ -273,10 +334,19 @@ def build_provoice_cmd(session, args, vehicle_id):
 # =========================
 
 class ProcessManager:
+    # A supervised child that keeps dying is a symptom, not something to paper
+    # over forever: past this many restarts inside the window we stop and say so
+    # rather than spinning silently for a whole session.
+    RESTART_WINDOW_S = 120.0
+    MAX_RESTARTS_IN_WINDOW = 6
+
     def __init__(self):
         self.processes = []
+        # name -> {"cmd", "below_normal", "restarts": [monotonic timestamps],
+        #          "total", "gave_up"}
+        self.supervised = {}
 
-    def start(self, cmd, name, below_normal=False):
+    def start(self, cmd, name, below_normal=False, restart=False):
         """Spawn a child process.
 
         ``below_normal`` drops it to BELOW_NORMAL priority on Windows. Used for
@@ -303,8 +373,21 @@ class ProcessManager:
         print("        ", " ".join(cmd))
 
         kwargs = {}
-        if below_normal and os.name == "nt":
-            kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        if os.name == "nt":
+            # CREATE_NEW_PROCESS_GROUP is what makes a graceful stop possible:
+            # stop_all() signals CTRL_BREAK_EVENT, which is delivered to an
+            # entire process group, so each child needs its own or the launcher
+            # would be signalled along with it.
+            #
+            # Trade-off to know about: a new process group also stops Ctrl-C in
+            # this console from reaching the children. That is now handled
+            # explicitly -- the KeyboardInterrupt path runs stop_all(), which
+            # signals each child -- so the shutdown is more deterministic than
+            # relying on console-wide Ctrl-C delivery, not less.
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            if below_normal:
+                flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+            kwargs["creationflags"] = flags
 
         p = subprocess.Popen(
             cmd,
@@ -313,21 +396,109 @@ class ProcessManager:
         )
 
         self.processes.append((name, p))
+        if restart:
+            self.supervised.setdefault(name, {
+                "cmd": cmd, "below_normal": below_normal,
+                "restarts": [], "total": 0, "gave_up": False,
+            })
         return p
 
-    def stop_all(self):
+    def restart_supervised(self, name):
+        """Relaunch a supervised child that exited. Returns True if relaunched.
+
+        Used for the vehicle-state bridge: it is the only process whose death
+        should not end the session. It holds nothing but a CARLA client and an
+        HTTP server, so a fresh one recovers the vehicle feed within a second,
+        and the alternative -- tearing down a live participant run because a
+        read-only side channel died -- is far worse.
+        """
+        info = self.supervised.get(name)
+        if info is None or info["gave_up"]:
+            return False
+
+        now = time.monotonic()
+        info["restarts"] = [t for t in info["restarts"]
+                            if now - t < self.RESTART_WINDOW_S]
+        if len(info["restarts"]) >= self.MAX_RESTARTS_IN_WINDOW:
+            info["gave_up"] = True
+            print(f"[GIVE UP] {name} died {len(info['restarts'])} times in "
+                  f"{self.RESTART_WINDOW_S:.0f}s: not restarting again.")
+            print(f"          The session continues WITHOUT it; ProVoice will "
+                  f"hold its last known vehicle state.")
+            return False
+
+        info["restarts"].append(now)
+        info["total"] += 1
+        # Drop the dead entry so the main loop does not keep re-reporting it.
+        self.processes = [(n, p) for n, p in self.processes if n != name]
+        print(f"[RESTART] {name} (attempt {info['total']})")
+        self.start(info["cmd"], name, below_normal=info["below_normal"],
+                   restart=True)
+        return True
+
+    @staticmethod
+    def _ask_to_stop(p) -> None:
+        """Request a GRACEFUL exit, so the child runs its own cleanup.
+
+        This used to be a bare p.terminate(). On Windows that is an alias for
+        kill(): it calls TerminateProcess, which delivers NO signal and runs no
+        atexit handler, no `finally` block and no destructor. ProVoice's
+        SIGINT/SIGTERM handlers (src/ProVoice/main.py) therefore never ran once,
+        and fixed_npc_traffic.py's KeyboardInterrupt cleanup never ran either.
+
+        Why that matters beyond tidiness: ProVoice holds a CARLA RPC connection.
+        Killed that way, the connection is severed exactly as if the process had
+        crashed -- so CARLA cannot tell a normal end-of-run from a crash, and
+        the observed "first run fine, second run dies" pattern follows. Sending
+        CTRL_BREAK lets the child close that connection itself.
+
+        CTRL_BREAK_EVENT goes to a whole process group, which is why start()
+        spawns each child with CREATE_NEW_PROCESS_GROUP -- without it the signal
+        would hit this launcher too.
+        """
+        try:
+            if os.name == "nt":
+                p.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                p.terminate()
+        except Exception as e:  # noqa: BLE001 — already-dead child, bad pid, ...
+            print(f"        (graceful stop failed, will force: {e})")
+
+    def stop_all(self, grace: float = 8.0):
         print("[CLEANUP] stopping processes...")
 
-        for name, p in self.processes:
-            print(f"[STOP] {name}")
-            p.terminate()
+        alive = [(n, p) for n, p in self.processes if p.poll() is None]
+        for name, p in alive:
+            print(f"[STOP] {name} (asking to exit)")
+            self._ask_to_stop(p)
 
-        time.sleep(2)
+        # Give them a bounded window to shut down on their own. ProVoice has the
+        # most to do (stop the collector, flush and close the logger, drop the
+        # CARLA client), so the budget is shared rather than per-process.
+        deadline = time.monotonic() + grace
+        for name, p in alive:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
 
-        for name, p in self.processes:
+        for name, p in alive:
             if p.poll() is None:
-                print(f"[KILL] {name}")
+                print(f"[KILL] {name} (no clean exit within {grace:.0f}s)")
                 p.kill()
+                # kill() only REQUESTS termination — TerminateProcess returns
+                # before the process is gone. Wait so this method's
+                # postcondition is "the children are dead", not "we asked".
+                try:
+                    p.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    print(f"        WARNING: {name} (pid {p.pid}) still alive "
+                          f"after kill; it may hold the camera or CARLA port.")
+            else:
+                print(f"[STOPPED] {name} exited cleanly")
 
 
 # =========================
@@ -453,6 +624,34 @@ def main():
                              "no decision engine and no interventions. The live "
                              "calibration is skipped (the participant's stored baseline "
                              "is reused, or neutral defaults if there is none).")
+    parser.add_argument("--vehicle-bridge", dest="vehicle_bridge",
+                        action="store_true",
+                        help="Run scripts/vehicle_state_server.py in its own "
+                             "process and have ProVoice read vehicle state from "
+                             "it over local HTTP instead of holding its own "
+                             "CARLA client. ProVoice reliably corrupts its heap "
+                             "when it polls CARLA directly; this keeps libcarla "
+                             "out of that process while preserving the vehicle "
+                             "columns. The bridge is supervised and restarted if "
+                             "it dies, so its failure costs a short gap in "
+                             "vehicle state rather than the session.")
+    parser.add_argument("--bridge-port", dest="bridge_port", type=int, default=8080,
+                        help="Loopback port for the vehicle-state bridge.")
+    parser.add_argument("--bridge-poll-hz", dest="bridge_poll_hz", type=float,
+                        default=20.0,
+                        help="How often ProVoice polls the bridge. Defaults to "
+                             "20 Hz to match the collection loop; ProVoice's own "
+                             "built-in default is 2 Hz, which would sample "
+                             "steer/brake ten times slower than a direct CARLA "
+                             "read and visibly degrade those features.")
+    parser.add_argument("--provoice-no-carla", dest="provoice_no_carla",
+                        action="store_true",
+                        help="DIAGNOSTIC: run ProVoice with NO CARLA connection "
+                             "(everything else normal) to test whether the CARLA "
+                             "client is the source of its heap corruption. The "
+                             "vehicle-state columns (speed, steer, brake, ...) "
+                             "stay at their defaults, so the run is NOT usable as "
+                             "participant data.")
     parser.add_argument("--test-drive", dest="test_drive", action="store_true",
                         help="Test drive: launch NPC traffic and Drive only, without "
                              "the ProVoice proactive-assistance process. No "
@@ -484,6 +683,15 @@ def main():
                                   "ENTER confirms. The popup ignores the wheel, which "
                                   "still steers. Default when no wheel is attached.")
     parser.set_defaults(popup_input=None)
+    parser.add_argument("--popup-wait-timeout", dest="popup_wait_timeout",
+                        type=float, default=180.0,
+                        help="Seconds Drive waits for ProVoice's first logged frame "
+                             "before opening the first LoA window anyway. ProVoice "
+                             "needs the better part of a minute to load its models, "
+                             "and a window opened before it logs has no driver-state "
+                             "data behind it, so its labels are dropped when the "
+                             "dataset is built. Driving starts immediately either "
+                             "way; only the windows wait. 0 disables the wait.")
     parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
@@ -494,6 +702,24 @@ def main():
         parser.error("--calibration-only and --data-collection are mutually exclusive.")
     if args.calibration_only and args.test_drive:
         parser.error("--calibration-only needs ProVoice, which --test-drive disables.")
+    if args.vehicle_bridge and args.provoice_no_carla:
+        parser.error("--vehicle-bridge and --provoice-no-carla contradict each "
+                     "other: both keep CARLA out of ProVoice, but the bridge "
+                     "supplies real vehicle state while --provoice-no-carla "
+                     "deliberately supplies none. Pick one.")
+    if args.vehicle_bridge and (args.test_drive or args.test_popup):
+        parser.error("--vehicle-bridge only feeds ProVoice, which %s does not "
+                     "start." % ("--test-drive" if args.test_drive else "--test-popup"))
+    if args.provoice_no_carla and (args.test_drive or args.test_popup):
+        parser.error("--provoice-no-carla only affects ProVoice, which %s does not "
+                     "start." % ("--test-drive" if args.test_drive else "--test-popup"))
+    if args.provoice_no_carla:
+        # Loud, because the run looks completely normal and silently produces
+        # rows whose vehicle columns are all defaults.
+        print("[WARN] --provoice-no-carla: ProVoice will make NO CARLA calls. "
+              "speed/steer/brake/junction and every other vehicle field stay at "
+              "their defaults, so THIS RUN IS NOT USABLE PARTICIPANT DATA. It is "
+              "a diagnostic for the heap corruption only.")
     if args.test_popup and args.no_popup:
         parser.error("--test-popup and --no-popup contradict each other: one is "
                      "nothing but popups, the other suppresses them.")
@@ -589,6 +815,29 @@ def main():
         vehicle_id = wait_for_vehicle_id(root, drive_proc, args.vehicle_id_timeout)
 
         # =========================
+        # START VEHICLE-STATE BRIDGE
+        # =========================
+        # Started here, after the id exists and before ProVoice, so the feed is
+        # already serving when ProVoice's poller makes its first request. The id
+        # is passed explicitly rather than letting the bridge read
+        # vehicle_id.txt: it has already been read and validated above, and a
+        # restart mid-session must not race a rewrite of that file.
+        if args.vehicle_bridge and not (args.test_drive or args.test_popup):
+            bridge_cmd = [
+                sys.executable,
+                "scripts/vehicle_state_server.py",
+                "--port", str(args.bridge_port),
+                "--bind", "127.0.0.1",
+                "--carla-host", args.host,
+                "--carla-port", str(args.port),
+                "--vehicle-id", str(vehicle_id),
+            ]
+            pm.start(bridge_cmd, "VEHICLE_BRIDGE", restart=True)
+            # The bridge connects to CARLA and caches the map before it binds;
+            # a short head start keeps ProVoice's first polls from all failing.
+            time.sleep(2)
+
+        # =========================
         # START PROVOICE
         # =========================
         if args.test_drive or args.test_popup:
@@ -611,7 +860,8 @@ def main():
 
         while True:
             time.sleep(1)
-            for name, p in pm.processes:
+            # Snapshot: restart_supervised() rewrites pm.processes.
+            for name, p in list(pm.processes):
                 code = p.poll()
                 if code is None:
                     continue
@@ -619,6 +869,21 @@ def main():
                     # Expected: ProVoice exits itself once the baseline is stored.
                     print("[DONE] calibration stored; stopping the experiment")
                     raise SystemExit(0)
+
+                # A supervised side channel dying must not end a participant
+                # session. Report it loudly -- the gap it leaves is real, the
+                # vehicle fields freeze at their last values until it is back --
+                # then bring it straight back up.
+                if name in pm.supervised and not pm.supervised[name]["gave_up"]:
+                    print(f"[DOWN] {name} exited with code "
+                          f"{describe_exit_code(code)}")
+                    print("       Vehicle state is FROZEN at its last values "
+                          "until the bridge is back; the run continues.")
+                    if pm.restart_supervised(name):
+                        continue
+                    # Fell through to gave_up: keep running without it.
+                    continue
+
                 print(f"[CRASH] {name} exited with code {describe_exit_code(code)}")
                 report_probable_cause(name, code, session_start)
                 raise SystemExit(1)  # or break, or restart it

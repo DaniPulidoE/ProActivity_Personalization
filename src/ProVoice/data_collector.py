@@ -187,6 +187,7 @@ class DataCollector:
         carla_vehicle: Optional[Any] = None,
         window_size: int = 400, # 20 seconds at 20Hz (as user inputs label each 20 seconds)
         vehicle_state_url: Optional[str] = None,
+        state_poll_hz: float = 2.0,
         calibration_dir: str = _CALIBRATION_DIR,
         rppg_fps: float = 30.0,
         face_box_hz: float = 1.0,
@@ -272,6 +273,11 @@ class DataCollector:
         self._carla_world = None
         self._carla_map = None
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
+        # Seconds between bridge polls. Every vehicle field is held constant
+        # between polls, so this is the real sampling rate of speed/steer/brake
+        # when the bridge is in use — it should track the collection rate, not
+        # sit at the old 2 Hz default.
+        self._state_poll_interval = 1.0 / max(1e-3, float(state_poll_hz))
         self._cached_speed: int = 0
         self._cached_steer: int = 0
         self._cached_brake: int = 0
@@ -2214,8 +2220,16 @@ class DataCollector:
                 self._yolo_dets = list(dets or [])
         print("[DataCollector] YOLO distraction worker stopped.")
 
-    def _poll_vehicle_state(self, interval: float = 0.5) -> None:
-        """Background thread: fetch vehicle state from the bridge every `interval` seconds."""
+    def _poll_vehicle_state(self, interval: Optional[float] = None) -> None:
+        """Background thread: fetch vehicle state from the bridge.
+
+        Cadence comes from state_poll_hz (see __init__); the argument is kept
+        only so an explicit override still works.
+        """
+        interval = self._state_poll_interval if interval is None else interval
+        print(f"[DataCollector] Vehicle-state poller started "
+              f"({1.0 / interval:.1f} Hz -> {self.vehicle_state_url}).")
+        _fail_streak = 0
         while self._running:
             try:
                 with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
@@ -2238,8 +2252,21 @@ class DataCollector:
                 self._cached_fog_light           = bool(state.get("fog_light", self._cached_fog_light))
                 self._cached_left_indicator      = bool(state.get("left_indicator", self._cached_left_indicator))
                 self._cached_right_indicator     = bool(state.get("right_indicator", self._cached_right_indicator))
-            except Exception:
-                pass  # keep using last cached values on any error
+                if _fail_streak:
+                    print(f"[DataCollector] Vehicle-state bridge back after "
+                          f"{_fail_streak} failed poll(s) "
+                          f"(~{_fail_streak * interval:.1f}s of frozen state).")
+                    _fail_streak = 0
+            except Exception as e:  # noqa: BLE001 — keep the last cached values
+                # Silence here would be dangerous: every vehicle field simply
+                # STOPS UPDATING and the rows keep being written as if fine.
+                # Report the start of an outage and then throttle, so a long
+                # outage is visible in the log without flooding it at 20 Hz.
+                _fail_streak += 1
+                if _fail_streak == 1 or _fail_streak % 100 == 0:
+                    print(f"[DataCollector] Vehicle-state poll FAILED "
+                          f"(#{_fail_streak}, ~{_fail_streak * interval:.1f}s "
+                          f"frozen): {type(e).__name__}: {e}")
             time.sleep(interval)
 
     def start(self) -> None:
