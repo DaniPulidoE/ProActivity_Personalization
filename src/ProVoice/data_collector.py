@@ -268,6 +268,9 @@ class DataCollector:
 
         self.face_landmarker = None
         self.carla_vehicle = carla_vehicle
+        # Cached per session — see the note at the get_weather() call site.
+        self._carla_world = None
+        self._carla_map = None
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
         self._cached_speed: int = 0
         self._cached_steer: int = 0
@@ -1428,14 +1431,32 @@ class DataCollector:
 
                 speed_lim = self.carla_vehicle.get_speed_limit()
 
-                world = self.carla_vehicle.get_world()
+                # World and Map are CACHED, not re-fetched per frame.
+                #
+                # get_world() built a fresh World wrapper every tick and
+                # get_map() re-downloaded and re-parsed the entire OpenDRIVE
+                # description behind it — at 20 Hz, twenty full map parses a
+                # second, purely to read one `is_junction` flag. The project's
+                # own bridge already caches exactly this
+                # (scripts/vehicle_state_server.py: "get_map() is expensive to
+                # call at 20 Hz"); the in-process path never got the same fix.
+                #
+                # Neither object changes for the life of a session (the map is
+                # only reloaded by loading a new town, which this experiment
+                # never does), so caching is safe as well as far cheaper.
+                if self._carla_world is None:
+                    self._carla_world = self.carla_vehicle.get_world()
+                    self._carla_map = self._carla_world.get_map()
+                    print("[DataCollector] Cached CARLA world and map "
+                          "(previously re-fetched every frame).")
+                world = self._carla_world
                 weather = world.get_weather()
                 precipitation = round(weather.precipitation / 100.0, 3)
                 is_night = bool(weather.sun_altitude_angle < 0)
                 fog_density = round(weather.fog_density / 100.0, 3)
 
                 location = self.carla_vehicle.get_location()
-                waypoint = world.get_map().get_waypoint(location)
+                waypoint = self._carla_map.get_waypoint(location)
                 is_junction = bool(waypoint.is_junction)
 
                 # traffic light state (Red/Yellow/Green/Off/Unknown)

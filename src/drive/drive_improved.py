@@ -13,6 +13,17 @@ LoA Popups:
                    repeat quickly, so the driver can learn the control. Nothing
                    is written to data/user_loa_labels.csv
 
+LoA Popup Function:
+    (default)        : Every popup asks about --functionname, one popup per window
+    --random-function: Each popup draws its function from the five study functions;
+                       a window then holds two prompts about two different ones
+
+LoA Popup Input (which interface answers the popup):
+    --wheel-input    : Paddles move the cursor, the front button ticks the level
+                       under it, CONFIRM submits. Default when a wheel is bound.
+    --keyboard-input : Number keys 0-4 tick a level, the same number again unticks
+                       it, ENTER confirms. Default when no wheel is bound.
+
 Basic Controls (available in both modes):
     W            : throttle
     S            : brake
@@ -91,6 +102,7 @@ try:
     from pygame.locals import K_DOWN
     from pygame.locals import K_ESCAPE
     from pygame.locals import K_F1
+    from pygame.locals import K_KP_ENTER
     from pygame.locals import K_LEFT
     from pygame.locals import K_PERIOD
     from pygame.locals import K_RETURN
@@ -177,6 +189,11 @@ DEFAULT_DECISION_COLUMNS = [
 USER_LOA_LABEL_COLUMNS = [
     'session_id',
     'window_idx',
+    # 1-based position of this prompt inside its window. Two prompts share a
+    # window_idx and its timestamps, so this (with functionname) is what tells
+    # them apart, and it is what any check for order effects between the first
+    # and the second answer has to group on.
+    'prompt_in_window',
     'window_start_ms',
     'window_end_ms',
     'window_start_timestamp',
@@ -435,6 +452,39 @@ LOA_LABELS = (
 CONFIRM_ROW = len(LOA_LABELS)
 
 
+# --- Which interface answers the popup ----------------------------------------
+# The two are experiment conditions, not a preference: 'wheel' keeps the hands on
+# the rim (cursor + confirm row, as above), 'keyboard' addresses the levels
+# directly by number and needs no cursor at all. Selected with --wheel-input /
+# --keyboard-input; 'auto' resolves to the wheel whenever one is bound.
+POPUP_INPUT_WHEEL = 'wheel'
+POPUP_INPUT_KEYBOARD = 'keyboard'
+POPUP_INPUT_AUTO = 'auto'
+
+
+# --- Function pool for --random-function ---------------------------------------
+# The five functions this data-collection run covers, drawn per prompt instead of
+# fixing one for the whole session with --functionname.
+#
+# The spellings are NOT free text: they have to match src/ProVoice/fcd_config.py
+# exactly, because resolve_function_key() maps anything it does not recognise to
+# the FIRST entry of its table ('Adjust seat positioning') without warning. A
+# paraphrase like 'Send a message' or 'Change music' would therefore be logged
+# against the wrong FCD vector rather than failing loudly.
+RANDOM_FUNCTION_POOL = (
+    'Send a text message',
+    'Start a phone call',
+    'Provide weather update',
+    'Provide traffic news',
+    'Change song',
+)
+
+# Prompts per window once the pool is in play: two labels for the same 20 s of
+# driving instead of one, each asking about a different function. Drawing without
+# replacement is what keeps the pair distinct.
+PROMPTS_PER_WINDOW = 2
+
+
 # --- Practice popups (--test-popup) -------------------------------------------
 # Teaching the control is repetition, not a driving window: the first prompt
 # opens the moment the session starts and the rest follow this much later, so a
@@ -444,7 +494,8 @@ TEST_POPUP_INTERVAL_S = 8
 
 class LoASelectionPopup(object):
     def __init__(self, width, height, interval_seconds=20, enabled=True,
-                 open_immediately=False):
+                 open_immediately=False, input_mode=POPUP_INPUT_KEYBOARD,
+                 function_name='', function_pool=()):
         self.enabled = enabled
         self.open_immediately = open_immediately
         self.interval_ms = int(interval_seconds * 1000)
@@ -464,7 +515,22 @@ class LoASelectionPopup(object):
         # and the set of LoAs marked acceptable — more than one is allowed.
         self.selected = None
         self.chosen = set()
-        self.wheel_enabled = False
+        self.input_mode = input_mode
+        # The vehicle function the levels refer to. Shown under the title so the
+        # driver answers about the right one; the line is dropped entirely when
+        # no name is available. With a pool (--random-function) this holds the
+        # function of the prompt currently on screen, redrawn every window;
+        # without one it stays the fixed --functionname for the whole session.
+        self.fixed_function_name = (function_name or '').strip()
+        self.function_name = self.fixed_function_name
+        self.function_pool = tuple(function_pool)
+        # One prompt per window with a fixed function — a second would ask the
+        # identical question about the identical 20 s. The pool is what makes a
+        # second prompt worth showing, so it is also what turns it on.
+        self.prompts_per_window = (min(PROMPTS_PER_WINDOW, len(self.function_pool))
+                                   if self.function_pool else 1)
+        self.prompt_in_window = 0
+        self._window_functions = ()
         # Paddle/confirm indices are device-specific; without them the wheel
         # cannot drive the popup and we fall back to the keyboard.
         self.wheel_mapped = (LOA_WHEEL_BUTTON_CONFIRM is not None
@@ -492,12 +558,9 @@ class LoASelectionPopup(object):
         return (not self.active) and self.next_prompt_ms and now_ms >= self.next_prompt_ms
 
     def open(self, now_ms):
-        self.active = True
-        # Never carry a choice over from the last window.
-        self.selected = None
-        self.chosen = set()
-        self.prompt_started_ms = now_ms
+        """Open the first prompt of a new window."""
         self.window_idx += 1
+        self.prompt_in_window = 0
         self.window_start_ms = max(self.session_started_ms, now_ms - self.interval_ms)
         self.window_end_ms = now_ms
         if self.session_started_walltime is not None:
@@ -506,6 +569,35 @@ class LoASelectionPopup(object):
             end_wall = self.session_started_walltime + datetime.timedelta(milliseconds=self.window_end_ms - self.session_started_ms)
             self.window_start_timestamp = start_wall.isoformat()
             self.window_end_timestamp = end_wall.isoformat()
+        if self.function_pool:
+            # sample() draws WITHOUT replacement, which is what guarantees the
+            # two prompts of a window never ask about the same function.
+            self._window_functions = tuple(
+                random.sample(self.function_pool, self.prompts_per_window))
+        else:
+            self._window_functions = (self.fixed_function_name,) * self.prompts_per_window
+        self._open_prompt(now_ms)
+
+    def advance(self, now_ms):
+        """Open the next prompt of the SAME window; False when the window is done.
+
+        The window fields are deliberately left untouched: both prompts label the
+        same 20 s of driving and only differ in the function they ask about, so
+        they belong to one window_idx and share its start/end timestamps.
+        """
+        if self.prompt_in_window >= self.prompts_per_window:
+            return False
+        self._open_prompt(now_ms)
+        return True
+
+    def _open_prompt(self, now_ms):
+        self.active = True
+        # Never carry a choice over from the previous prompt.
+        self.selected = None
+        self.chosen = set()
+        self.prompt_started_ms = now_ms
+        self.function_name = self._window_functions[self.prompt_in_window]
+        self.prompt_in_window += 1
 
     def close(self, now_ms):
         self.active = False
@@ -546,14 +638,28 @@ class LoASelectionPopup(object):
         if event.type == pygame.QUIT:
             return 'quit', None
 
-        # Keyboard stays available regardless of the wheel.
+        # The number keys stay live in wheel mode too: they are the fallback if
+        # the rim buttons turn out to be unmapped or the wheel drops out
+        # mid-session, which would otherwise leave the popup unanswerable and
+        # the scene frozen for good.
         if event.type == pygame.KEYDOWN:
             if event.key == K_ESCAPE:
                 return 'quit', None
             if event.unicode in ('0', '1', '2', '3', '4'):
-                # Number keys toggle rather than submit — otherwise a second
-                # LoA could never be added from the keyboard.
+                # Number keys toggle rather than submit — otherwise a second LoA
+                # could never be added, and pressing the same number again is
+                # how a level is taken back off the list.
                 self._toggle(int(event.unicode))
+                return None, None
+            if event.key in (K_RETURN, K_KP_ENTER):
+                # Submitting nothing would write an empty label, so it is a no-op.
+                if self.chosen:
+                    return 'select', sorted(self.chosen)
+                return None, None
+            if self.input_mode == POPUP_INPUT_KEYBOARD:
+                # Numbers and ENTER are the entire interface here; the cursor
+                # exists only to give the wheel's single button something to
+                # point at, so leave it parked on None.
                 return None, None
             if event.key in (K_LEFT, K_a):
                 self._move(-1)
@@ -563,11 +669,16 @@ class LoASelectionPopup(object):
                 submitted = self._activate()
                 if submitted:
                     return 'select', submitted
-            elif event.key == K_RETURN and self.chosen:
-                return 'select', sorted(self.chosen)
             return None, None
 
-        if not self.wheel_enabled:
+        # Quitting from the rim works in both modes, exactly as it does on the
+        # start screen and while driving.
+        if (event.type == pygame.JOYBUTTONDOWN
+                and WHEEL_BUTTON_QUIT is not None
+                and event.button == WHEEL_BUTTON_QUIT):
+            return 'quit', None
+
+        if self.input_mode != POPUP_INPUT_WHEEL:
             return None, None
 
         if event.type == pygame.JOYHATMOTION:
@@ -578,9 +689,6 @@ class LoASelectionPopup(object):
             return None, None
 
         if event.type == pygame.JOYBUTTONDOWN:
-            # Checked first so quitting works even when navigation is unmapped.
-            if WHEEL_BUTTON_QUIT is not None and event.button == WHEEL_BUTTON_QUIT:
-                return 'quit', None
             if LOA_WHEEL_BUTTON_PREV is not None and event.button == LOA_WHEEL_BUTTON_PREV:
                 self._move(-1)          # left paddle -> lower LoA
             elif LOA_WHEEL_BUTTON_NEXT is not None and event.button == LOA_WHEEL_BUTTON_NEXT:
@@ -599,25 +707,45 @@ class LoASelectionPopup(object):
         overlay.fill((0, 0, 0))
         display.blit(overlay, (0, 0))
 
-        if self.wheel_enabled and self.wheel_mapped:
+        if self.input_mode != POPUP_INPUT_WHEEL:
+            hint = 'Number keys 0-4 tick a level (same key again unticks)  -  ENTER confirms'
+        elif self.wheel_mapped:
             hint = 'Paddles move  -  front button ticks a level  -  then pick CONFIRM'
-        elif self.wheel_enabled:
+        else:
             # Unmapped buttons would make the whole wheel feel dead; say so
             # rather than leaving the driver pressing an inert control.
             hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
                     'Use number keys 0-4 for now.')
-        else:
-            hint = 'Number keys 0-4 tick a level, ENTER confirms'
 
         header = [
-            (self._title_font, 'Level of Proactivity Selection Required'),
-            (self._text_font, 'Mark EVERY Level of Proactivity you would accept for the last 20 seconds.'),
-            (self._text_font, hint),
+            (self._title_font, 'Level of Proactivity Selection Required', (255, 255, 255)),
         ]
+        if self.prompts_per_window > 1:
+            # Two prompts in a row look identical apart from the function line, so
+            # say which one this is — otherwise confirming the first reads as if
+            # the popup simply failed to close.
+            header.append((self._small_font,
+                           'Question %d of %d for this 20 s window'
+                           % (self.prompt_in_window, self.prompts_per_window),
+                           (200, 200, 200)))
+        if self.function_name:
+            # Blue, not the yellow/green used for the cursor and the ticks: this
+            # line is context, never something that can be selected.
+            header.append(
+                (self._text_font, 'FUNCTION: %s' % self.function_name, (140, 200, 255)))
+        header.extend([
+            (self._text_font,
+             'Mark EVERY Level of Proactivity you would accept for the last 20 seconds.',
+             (255, 255, 255)),
+            (self._text_font, hint, (255, 255, 255)),
+        ])
 
-        y = int(self.height * 0.32)
-        for font, text in header:
-            surface = font.render(text, True, (255, 255, 255))
+        # Each header line beyond the original three would push the confirm row
+        # toward the bottom edge of a 720p window, so the block rises half a line
+        # per extra one and keeps the footprint it had.
+        y = int(self.height * 0.32) - 22 * (len(header) - 3)
+        for font, text, colour in header:
+            surface = font.render(text, True, colour)
             rect = surface.get_rect(center=(self.width // 2, y))
             display.blit(surface, rect)
             y += 45
@@ -641,11 +769,16 @@ class LoASelectionPopup(object):
             display.blit(surface, rect)
             y += 45
 
+        # In keyboard mode there is no cursor to park on a CONFIRM row, so the
+        # line names the key that actually submits instead.
+        confirm_label = ('CONFIRM' if self.input_mode == POPUP_INPUT_WHEEL
+                         else 'Press ENTER to confirm')
         if self.chosen:
-            confirm_text = 'CONFIRM (%s)' % ', '.join(str(v) for v in sorted(self.chosen))
+            confirm_text = '%s (%s)' % (
+                confirm_label, ', '.join(str(v) for v in sorted(self.chosen)))
             confirm_colour = (255, 220, 0) if self.selected == CONFIRM_ROW else (200, 200, 200)
         else:
-            confirm_text = 'CONFIRM (tick at least one level first)'
+            confirm_text = '%s (tick at least one level first)' % confirm_label
             confirm_colour = (140, 140, 140)
         if self.selected == CONFIRM_ROW:
             confirm_text = '> %s <' % confirm_text
@@ -2016,6 +2149,38 @@ class CameraManager(object):
 # ==============================================================================
 
 
+def _resolve_popup_input(args, has_wheel):
+    """Decide which interface answers the LoA popup.
+
+    Without either flag this keeps the behaviour the experiment had before they
+    existed: the wheel whenever one is bound, the keyboard otherwise. Asking for
+    the wheel on a rig that has none would leave the participant staring at a
+    popup they cannot answer with the scene frozen behind it, so that falls back
+    loudly instead of failing.
+    """
+    mode = getattr(args, 'popup_input', POPUP_INPUT_AUTO)
+    if mode == POPUP_INPUT_AUTO:
+        return POPUP_INPUT_WHEEL if has_wheel else POPUP_INPUT_KEYBOARD
+    if mode == POPUP_INPUT_WHEEL and not has_wheel:
+        print('[WARN] --wheel-input, but no steering wheel is bound — the LoA '
+              'popup falls back to the keyboard (0-4 tick, ENTER confirms).')
+        return POPUP_INPUT_KEYBOARD
+    return mode
+
+
+def _advance_or_close(loa_popup, world, now_ms):
+    """Move to the next prompt of this window, or end the window.
+
+    The scene stays frozen between the prompts of one window: they label the same
+    20 s of driving, so letting the car roll on between them would put the second
+    answer about a stretch the driver has already driven past.
+    """
+    if loa_popup.advance(now_ms):
+        return
+    loa_popup.close(now_ms)
+    _set_world_frozen(world, False)
+
+
 def game_loop(args):
     pygame.init()
     pygame.font.init()
@@ -2061,13 +2226,16 @@ def game_loop(args):
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
+        # Only advertise wheel controls in the popup if a wheel is actually bound.
+        popup_input = _resolve_popup_input(args, controller.has_wheel)
         loa_popup = LoASelectionPopup(
             args.width, args.height,
             interval_seconds=TEST_POPUP_INTERVAL_S if args.test_popup else 20,
             enabled=not args.no_popup,
-            open_immediately=args.test_popup)
-        # Only advertise wheel controls in the popup if a wheel is actually bound.
-        loa_popup.wheel_enabled = controller.has_wheel
+            open_immediately=args.test_popup,
+            input_mode=popup_input,
+            function_name=getattr(args, 'functionname', ''),
+            function_pool=RANDOM_FUNCTION_POOL if args.random_function else ())
         start_overlay = StartScreenOverlay(args.width, args.height)
         started = False
         session_id = _current_session_id(getattr(args, 'session_id', ''))
@@ -2090,6 +2258,17 @@ def game_loop(args):
                   f"selections are NOT logged")
         else:
             print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
+        if not args.no_popup:
+            print("[INFO] LoA popup input: %s" % (
+                'steering wheel (paddles move, front button ticks, CONFIRM submits)'
+                if popup_input == POPUP_INPUT_WHEEL
+                else 'keyboard (0-4 tick, same key again unticks, ENTER confirms)'))
+            if loa_popup.prompts_per_window > 1:
+                print("[INFO] %d prompts per window, each about a different function "
+                      "drawn from: %s"
+                      % (loa_popup.prompts_per_window, ', '.join(RANDOM_FUNCTION_POOL)))
+            else:
+                print("[INFO] 1 prompt per window about '%s'" % loa_popup.function_name)
 
         if args.sync:
             sim_world.tick()
@@ -2137,18 +2316,22 @@ def game_loop(args):
                         if args.test_popup:
                             # Practice answers teach the control, they are not
                             # data — nothing is computed or appended for them.
-                            print("[INFO] practice selection %s (not logged)"
-                                  % (sorted(selected_loa),))
-                            loa_popup.close(now_ms)
-                            _set_world_frozen(world, False)
-                            continue
+                            print("[INFO] practice selection %s for '%s' (not logged)"
+                                  % (sorted(selected_loa), loa_popup.function_name))
+                            _advance_or_close(loa_popup, world, now_ms)
+                            break
                         player_velocity = world.player.get_velocity() if world and world.player else carla.Vector3D()
                         speed_kmh = 3.6 * math.sqrt(
                             player_velocity.x ** 2 + player_velocity.y ** 2 + player_velocity.z ** 2)
                         system_snapshot = _load_latest_system_decision_snapshot(label_context['session_id'])
                         append_user_loa_selection({
                             **label_context,
+                            # Overrides label_context: with --random-function the
+                            # function is drawn per prompt, so the row has to
+                            # record the one that was actually on screen.
+                            'functionname': loa_popup.function_name,
                             'window_idx': loa_popup.window_idx,
+                            'prompt_in_window': loa_popup.prompt_in_window,
                             'window_start_ms': loa_popup.window_start_ms,
                             'window_end_ms': loa_popup.window_end_ms,
                             'window_start_timestamp': loa_popup.window_start_timestamp,
@@ -2171,9 +2354,11 @@ def game_loop(args):
                             'system_fallback_reason': system_snapshot.get('fallback_reason', ''),
                             'system_fcd': system_snapshot.get('fcd', system_snapshot.get('FCD', '')),
                         })
-                        loa_popup.close(now_ms)
-                        # Resume the simulation now that the label is captured.
-                        _set_world_frozen(world, False)
+                        _advance_or_close(loa_popup, world, now_ms)
+                        # Stop reading this batch: anything still queued was typed
+                        # at the prompt just answered and must not leak into the
+                        # next one.
+                        break
                 world.render(display)
                 loa_popup.render(display)
                 pygame.display.flip()
@@ -2294,11 +2479,47 @@ def main():
              'the scene freezes every 20 s and a popup asks for the acceptable LoAs; '
              'with this flag there are no popups, no freezes, and nothing is appended '
              'to data/user_loa_labels.csv')
+    argparser.add_argument(
+        '--random-function', dest='random_function', action='store_true',
+        help='Draw the function each popup asks about at random from the %d study '
+             'functions (%s) instead of using --functionname for the whole session. '
+             'Each 20 s window then holds %d prompts about %d DIFFERENT functions '
+             '(drawn without replacement), and each row records the function it was '
+             'actually shown.'
+             % (len(RANDOM_FUNCTION_POOL), ', '.join(RANDOM_FUNCTION_POOL),
+                PROMPTS_PER_WINDOW, PROMPTS_PER_WINDOW))
+    popup_input_group = argparser.add_mutually_exclusive_group()
+    popup_input_group.add_argument(
+        '--wheel-input', dest='popup_input', action='store_const',
+        const=POPUP_INPUT_WHEEL,
+        help='Answer the LoA popups from the steering wheel: the paddles move the '
+             'cursor, the front button ticks the level under it, and the CONFIRM row '
+             'submits. Default when a wheel is bound. The number keys stay live as a '
+             'fallback in case the rim buttons are unmapped.')
+    popup_input_group.add_argument(
+        '--keyboard-input', dest='popup_input', action='store_const',
+        const=POPUP_INPUT_KEYBOARD,
+        help='Answer the LoA popups from the keyboard: number keys 0-4 tick a level, '
+             'pressing the same number again unticks it, ENTER confirms. The popup '
+             'ignores the wheel in this mode (it still steers). Default when no wheel '
+             'is bound.')
+    argparser.set_defaults(popup_input=POPUP_INPUT_AUTO)
     args = argparser.parse_args()
 
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '
                         'nothing but popups, the other suppresses them.')
+    if args.popup_input == POPUP_INPUT_WHEEL and args.no_wheel:
+        argparser.error('--wheel-input needs the steering wheel that --no-wheel '
+                        'disables. Drop one of the two.')
+    if args.popup_input != POPUP_INPUT_AUTO and args.no_popup:
+        # Not fatal, but it means the run was configured for an interface it will
+        # never show — worth saying rather than silently ignoring the flag.
+        print('[WARN] --%s-input has no effect with --no-popup: there are no popups '
+              'to answer.' % args.popup_input)
+    if args.random_function and args.no_popup:
+        print('[WARN] --random-function has no effect with --no-popup: the function '
+              'is only ever asked about in a popup.')
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
 

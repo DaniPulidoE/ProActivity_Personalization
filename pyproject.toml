@@ -61,6 +61,24 @@ dependencies = [
 
 [tool.uv]
 package = true
+# Exactly ONE OpenCV distribution may be installed. `opencv-python` and
+# `opencv-contrib-python` both ship the same top-level `cv2` package (same
+# module, same DLLs, contrib merely adds the extra modules), so installing both
+# means one wheel silently overwrites the other's files and the RECORDs
+# disagree about who owns them — upstream's own README says never to do this.
+#
+# We ended up with both transitively:
+#     emotiefflib, ultralytics -> opencv-python
+#     mediapipe                -> opencv-contrib-python
+# and all three are required, so neither parent can simply be dropped.
+#
+# `opencv-contrib-python` is a strict superset, so the resolution is to make
+# every request for the plain build inapplicable via a marker that can never be
+# true, leaving contrib to provide `cv2` for everyone. Verified afterwards with
+# `import cv2` + a contrib-only symbol (cv2.aruco).
+override-dependencies = [
+    "opencv-python ; sys_platform == 'no-such-platform'",
+]
 environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]

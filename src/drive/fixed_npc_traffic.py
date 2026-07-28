@@ -78,7 +78,30 @@ def main():
 
     tm.set_random_device_seed(SEED)
 
-    tm.set_hybrid_physics_mode(True)
+    # Hybrid physics mode is OFF. It was True, and it is the leading suspect for
+    # the CARLA server crashes (GameThread, EXCEPTION_ACCESS_VIOLATION reading
+    # 0x1b8, see %LOCALAPPDATA%\CarlaUnreal\Saved\Crashes).
+    #
+    # What it does: vehicles further than the hybrid radius from the HERO actor
+    # (Drive's ego -- drive_improved.py's --rolename defaults to "hero") get
+    # their physics DISABLED and are moved kinematically; inside the radius
+    # physics is switched back on. So while the participant drives, NPCs cross
+    # that boundary over and over, and each crossing issues actor-level physics
+    # toggles that the server executes on its GameThread -- exactly the thread
+    # and exactly the kind of actor-state churn that is faulting.
+    #
+    # Why turning it off is nearly free: it exists to make fleets of HUNDREDS of
+    # vehicles affordable. This script spawns 11 (VEHICLE_CONFIGS has 11 entries;
+    # the NUM_VEHICLES = 50 above is dead -- the spawn loop never reads it). Full
+    # physics on 11 cars costs almost nothing, so this trades a feature we do not
+    # need for the removal of the most complex thing the traffic manager does.
+    #
+    # Evidence this is the right area: freezing the traffic manager entirely
+    # stopped the crashes, and the crash uptimes are scattered from 10 min to
+    # 24 h (event-driven, not a timed leak). Evidence it is specifically THIS
+    # setting: none yet -- it is the cheapest single thing to eliminate first.
+    # If crashes continue, re-enable this and try auto_lane_change(False) next.
+    tm.set_hybrid_physics_mode(False)
 
     # =========================
     # RANDOM SEED

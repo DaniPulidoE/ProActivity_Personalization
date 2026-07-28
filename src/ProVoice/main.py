@@ -12,10 +12,18 @@ import argparse as ap
 # their thread pools once, at load time, and ignore these variables afterwards.
 #
 # Why cap them at all: this process shares the machine with the CARLA server and
-# the Drive client, and CARLA runs in SYNCHRONOUS mode (drive_improved.py sets
-# fixed_delta_seconds=0.05 and drives the world with sim_world.tick()), so the
-# simulation only advances as fast as Drive's loop does. Anything that stalls
-# Drive is a visible sim hitch.
+# the Drive client. CARLA runs ASYNCHRONOUSLY — drive_improved.py only calls
+# sim_world.tick() under `if args.sync:`, `--sync` defaults to False, and
+# start_experiment.py never passes it, so Drive takes the wait_for_tick() branch
+# and the simulator advances on its own clock. That means an all-core burst here
+# does not stall a tick Drive owes the server; it starves CARLA's render and
+# physics threads and Drive's render loop directly, which the participant sees
+# as dropped frames and laggy steering. Either way the cap is what stops this
+# process from taking the whole machine.
+#
+# (An earlier version of this comment asserted synchronous mode with
+# fixed_delta_seconds=0.05. That was wrong — check the `--sync` flag before
+# relying on any claim about tick ownership.)
 #
 # Left at its default, torch sizes its intra-op pool to the core count (20 on
 # the lab machine) and every xLSTM forward becomes an all-core stampede.
@@ -41,6 +49,34 @@ os.environ.setdefault("KMP_BLOCKTIME", "0")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# ── Crash diagnostics ────────────────────────────────────────────────────────
+# This process has died with STATUS_ACCESS_VIOLATION (0xC0000005 -> exit code
+# 3221225477) inside native code. A hard fault like that kills the interpreter
+# outright: no traceback, no excepthook, nothing on stdout past the last normal
+# print. faulthandler installs an OS-level handler that dumps the Python stack
+# of EVERY thread at the moment of the fault, which turns "PROVOICE exited with
+# code 3221225477" into a named file and line.
+#
+# Enabled here — before torch/cv2/mediapipe are imported — so a fault during
+# library init is covered too. The log is opened line-buffered and kept alive
+# for the whole process: faulthandler writes to the raw fd, so the object must
+# not be garbage-collected (hence the module-level name).
+_FAULT_LOG = None
+try:
+    import faulthandler
+    _log_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _fault_path = os.path.join(_log_dir, "provoice_faults.log")
+    _FAULT_LOG = open(_fault_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    _FAULT_LOG.write(f"\n===== ProVoice start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"pid={os.getpid()} =====\n")
+    faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+    print(f"[main] faulthandler active -> {_fault_path}")
+except Exception as _e:
+    print(f"[main] could not enable faulthandler: {_e}")
 
 import uvicorn
 
@@ -240,7 +276,7 @@ def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 
     """
     if not HAS_CARLA:
         print("[WARN] CARLA python API not available in this process.")
-        return None
+        return None, None, None
     for attempt in range(1, retries + 1):
         try:
             client = carla.Client(host, port)
@@ -249,18 +285,26 @@ def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 
             actor = world.get_actor(actor_id)
             if actor is None:
                 print(f"[WARN] No actor with id {actor_id} in CARLA world.")
-                return None
+                return None, None, None
             if not actor.type_id.startswith("vehicle"):
                 print(f"[WARN] Actor {actor_id} is not a vehicle (type: {actor.type_id})")
             else:
                 print(f"[INFO] Connected to CARLA vehicle actor id={actor_id} type={actor.type_id}")
-            return actor
+            # The client and world are returned, NOT dropped on the floor.
+            # Previously both were locals and only the actor escaped, so the
+            # objects owning the RPC connection lost their last Python
+            # reference the moment this function returned and were left to the
+            # garbage collector, while the actor kept being used for the whole
+            # session. CARLA's documented usage is to keep the client alive for
+            # as long as anything obtained from it is in use; the caller now
+            # holds all three for the process lifetime.
+            return actor, client, world
         except (NotImplementedError, RuntimeError, UnicodeDecodeError) as e:
             print(f"[WARN] CARLA connect attempt {attempt}/{retries} failed ({type(e).__name__}): {e}")
             if attempt < retries:
                 time.sleep(1.0)
     print(f"[WARN] Could not connect to CARLA after {retries} attempts. Running without vehicle actor.")
-    return None
+    return None, None, None
 
 
 
@@ -427,6 +471,11 @@ def main():
     # Add: Read vehicle_id and attempt to connect to CARLA to get the vehicle actor (optional)
     # ---------------------------------------------------------------------
     vehicle_actor = None
+    # Held for the process lifetime, deliberately: these own the RPC connection
+    # the actor is read through, and letting them be collected would leave the
+    # actor pointing at a torn-down client. Not otherwise used, hence the names.
+    _carla_client = None
+    _carla_world = None
     if vehicle_state_url:
         # Bridge URL provided — no direct CARLA connection needed; the bridge
         # reads from CARLA locally on the remote and serves speed/location over HTTP.
@@ -443,7 +492,8 @@ def main():
             vehicle_id = read_vehicle_id(wait_seconds=10.0)
 
         if vehicle_id is not None and HAS_CARLA:
-            vehicle_actor = get_carla_vehicle_by_id(vehicle_id, host=host, port=port, timeout=carla_timeout)
+            vehicle_actor, _carla_client, _carla_world = get_carla_vehicle_by_id(
+                vehicle_id, host=host, port=port, timeout=carla_timeout)
             if vehicle_actor is None:
                 print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
             else:

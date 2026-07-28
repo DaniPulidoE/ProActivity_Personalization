@@ -13,15 +13,27 @@ MAIN OPTIONS:
 --test-drive: don't launch provoice
 --test-popup: teaching mode, simulator UI + immediate LoA popups, nothing logged
 
+LoA POPUP INTERFACE (pick one; default = wheel if one is attached, else keyboard):
+--wheel-input: paddles move the cursor, front button ticks, CONFIRM row submits
+--keyboard-input: number keys 0-4 tick (same key again unticks), ENTER confirms
+
+LoA POPUP FUNCTION:
+--functionname: one function for the whole run, one popup per 20 s window
+--random-function: function drawn per popup from the five study functions; each
+    20 s window then holds TWO popups about two different ones (mutually
+    exclusive with --functionname)
+
 
 EXPERIMENT SETUP:
 0. Teaching the LoA control: --test-popup --fullscreen
 1. Driver adaptation phase: --test-drive --no-popup --fullscreen
-2. Calibration: --fixed --no-popup --calibration-only --fullscreen --participantid 
-3. Inference: --data-collection --participantid --functionname --fullscreen
+2. Calibration: --fixed --no-popup --calibration-only --fullscreen --participantid
+3. Inference: --data-collection --participantid --random-function --fullscreen
 """
 
+import html
 import os
+import re
 import sys
 import uuid
 import time
@@ -33,6 +45,148 @@ from pathlib import Path
 # =========================
 # CONFIG
 # =========================
+
+# Used when neither --functionname nor --random-function is given. Kept in sync
+# with Drive's and ProVoice's own defaults.
+DEFAULT_FUNCTIONNAME = "Adjust seat positioning"
+
+
+# =========================
+# CRASH DIAGNOSIS
+# =========================
+
+# Exit codes >= 0xC0000000 are NT status codes: the OS killed the process, so
+# there is NO Python traceback anywhere and the bare number is all the launcher
+# has. Decoding it is the difference between "exited with code 3221226505" and
+# knowing the process was killed for a memory fault.
+_NT_STATUS = {
+    0xC0000005: ("ACCESS_VIOLATION",
+                 "read or write through a bad pointer, inside native code"),
+    0xC0000409: ("STACK_BUFFER_OVERRUN / __fastfail",
+                 "MSVC fastfail: usually an unhandled C++ exception reaching "
+                 "std::terminate, e.g. an RPC layer whose server vanished"),
+    0xC000041D: ("FATAL_USER_CALLBACK_EXCEPTION",
+                 "exception escaping a callback"),
+    0xC00000FD: ("STACK_OVERFLOW", "runaway recursion"),
+    0xC0000374: ("HEAP_CORRUPTION", "the heap was already corrupted earlier"),
+    0xC000013A: ("CONTROL_C_EXIT", "Ctrl-C or console close"),
+}
+
+
+def describe_exit_code(code: int) -> str:
+    """Render a child's exit code with its NT status name where there is one."""
+    if code == 0:
+        return "0 (clean exit)"
+    status = code & 0xFFFFFFFF
+    known = _NT_STATUS.get(status)
+    # ASCII only in anything printed: the Windows console is cp1252, so an
+    # em dash here comes out as mojibake in the middle of a crash report.
+    if known:
+        return f"{code} (0x{status:08X} {known[0]}: {known[1]})"
+    if status >= 0xC0000000:
+        return f"{code} (0x{status:08X}: NT status; the OS killed the process)"
+    return str(code)
+
+
+def _carla_crash_dirs():
+    """Unreal crash-report directories for the CARLA server, if they exist."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    return [p for p in (Path(local) / game / "Saved" / "Crashes"
+                        for game in ("CarlaUnreal", "CarlaUE4"))
+            if p.is_dir()]
+
+
+def find_carla_crash(since: float):
+    """Newest CARLA server crash report written after ``since`` (epoch seconds).
+
+    This exists because the failure mode is counter-intuitive: when the CARLA
+    server dies, its Python clients die 2-13 s LATER with a native exit code
+    that names the CLIENT. Read literally, "[CRASH] NPC_TRAFFIC exited with
+    code 3221226505" sends you to debug NPC_TRAFFIC, which was a victim. The
+    server's own crash report is the actual evidence, so surface it here.
+    """
+    newest = None
+    for d in _carla_crash_dirs():
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for sub in entries:
+            try:
+                if not sub.is_dir():
+                    continue
+                mtime = sub.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= since and (newest is None or mtime > newest[0]):
+                newest = (mtime, sub)
+    if newest is None:
+        return None
+
+    mtime, sub = newest
+    info = {"path": sub, "when": mtime, "error": "", "thread": "", "uptime": ""}
+    try:
+        raw = (sub / "CrashContext.runtime-xml").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return info
+
+    def tag(name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", raw, re.S)
+        return html.unescape(m.group(1)).strip() if m else ""
+
+    info["error"] = tag("ErrorMessage")
+    info["uptime"] = tag("SecondsSinceStart")
+    for thread in re.findall(r"<Thread>(.*?)</Thread>", raw, re.S):
+        if "<IsCrashed>true</IsCrashed>" in thread:
+            m = re.search(r"<ThreadName>(.*?)</ThreadName>", thread, re.S)
+            info["thread"] = html.unescape(m.group(1)).strip() if m else ""
+            break
+    return info
+
+
+def report_probable_cause(name: str, code: int, since: float) -> None:
+    """Print the likely root cause of a child's death. Never raises."""
+    try:
+        crash = find_carla_crash(since)
+        if crash is None:
+            # The crash reporter can take a few seconds to write the report,
+            # and the client dies first — so one short re-check is worth it.
+            time.sleep(3.0)
+            crash = find_carla_crash(since)
+
+        if crash is not None:
+            gap = time.time() - crash["when"]
+            print(f"[CAUSE] The CARLA SERVER crashed ~{gap:.0f}s ago. "
+                  f"{name} is a client and almost")
+            print(f"        certainly died downstream of it: debug CARLA, not {name}.")
+            if crash["error"]:
+                print(f"        {crash['error']}")
+            detail = []
+            if crash["thread"]:
+                detail.append(f"thread {crash['thread']}")
+            if crash["uptime"]:
+                try:
+                    detail.append(f"CARLA uptime {int(crash['uptime']) // 60} min")
+                except ValueError:
+                    pass
+            if detail:
+                print(f"        ({', '.join(detail)})")
+            print(f"        report: {crash['path']}")
+            return
+
+        if (code & 0xFFFFFFFF) >= 0xC0000000:
+            print("[CAUSE] No CARLA crash report newer than this session, so the "
+                  "fault looks local to this process.")
+            if name == "PROVOICE":
+                fault_log = Path.cwd() / "logs" / "provoice_faults.log"
+                if fault_log.exists():
+                    print(f"        ProVoice runs faulthandler: {fault_log}")
+                    print("        holds a Python stack for EVERY thread as of the fault.")
+    except Exception as e:  # noqa: BLE001 — diagnostics must never mask the crash
+        print(f"[CAUSE] (could not determine: {e})")
 
 
 
@@ -76,6 +230,12 @@ def build_drive_cmd(session, args):
         *(["--no-popup"] if args.no_popup else []),
         *(["--test-popup"] if args.test_popup else []),
         *(["--fixed"] if args.fixed else []),
+        # Omitted when neither flag was given, so Drive keeps its own default
+        # (the wheel when one is bound, the keyboard otherwise).
+        *([f"--{args.popup_input}-input"] if args.popup_input else []),
+        # Drive owns the draw: it is the process that shows the popups, so the
+        # pool lives there and only the switch is forwarded.
+        *(["--random-function"] if args.random_function else []),
     ]
 
 
@@ -88,6 +248,10 @@ def build_provoice_cmd(session, args, vehicle_id):
         f"participantid={args.participantid}",
         f"environment={args.environment}",
         f"secondary_task={args.secondary_task}",
+        # Under --random-function this is the fallback default, not what the
+        # popups ask about: ProVoice takes one function for the whole run, and in
+        # a --data-collection run it is only a tag on the raw rows. The function
+        # per label lives in data/user_loa_labels.csv, written by Drive.
         f"functionname={args.functionname}",
         f"modeltype={args.modeltype}",
         f"state_model={args.state_model}",
@@ -116,12 +280,24 @@ class ProcessManager:
         """Spawn a child process.
 
         ``below_normal`` drops it to BELOW_NORMAL priority on Windows. Used for
-        PROVOICE: CARLA runs in synchronous mode, so the simulation advances only
-        when Drive calls world.tick() — whenever the Windows scheduler picks a
-        ProVoice worker over Drive's or CARLA's threads, that shows up as sim lag.
+        PROVOICE: it shares the machine with the CARLA server and Drive, and its
+        perception workers will otherwise take whatever cores the Windows
+        scheduler hands them. Starving CARLA's render/physics threads or Drive's
+        render loop shows up as dropped frames and input lag for the participant.
         Priority does NOT reduce ProVoice's work, it only settles who yields when
         both want the same core, so it complements the thread caps in
         src/ProVoice/main.py rather than replacing them. No-op off Windows.
+
+        CARLA runs ASYNCHRONOUSLY here — do not assume otherwise. Every
+        sim_world.tick() in drive_improved.py sits behind ``if args.sync:``,
+        ``--sync`` is store_true (so it defaults to False), and build_drive_cmd()
+        below never passes it. Drive therefore takes the wait_for_tick() branch,
+        fixed_delta_seconds is never set, and the simulator advances on its own
+        clock rather than on any client's tick. src/drive/fixed_npc_traffic.py
+        matches this: SYNC_MODE=False, so its traffic manager is asynchronous too.
+        Stated explicitly because a previous version of this docstring claimed
+        synchronous mode, and that claim misled a debugging session into
+        "fixing" a nonexistent sync mismatch, which froze all NPC traffic.
         """
         print(f"[START] {name}{' (below-normal priority)' if below_normal else ''}")
         print("        ", " ".join(cmd))
@@ -237,7 +413,20 @@ def main():
     parser.add_argument("--participantid", default="001")
     parser.add_argument("--environment", default="city")
     parser.add_argument("--secondary-task", default="none")
-    parser.add_argument("--functionname", default="Adjust seat positioning")
+    # Default deferred to DEFAULT_FUNCTIONNAME below: left as None here so
+    # "--functionname was given" can be told apart from "nobody said", which is
+    # what makes the --random-function conflict detectable.
+    parser.add_argument("--functionname", default=None,
+                        help="Function the LoA popups ask about, for the whole run "
+                             "(default: %s). Mutually exclusive with "
+                             "--random-function." % DEFAULT_FUNCTIONNAME)
+    parser.add_argument("--random-function", dest="random_function", action="store_true",
+                        help="Draw the function each popup asks about at random from "
+                             "the five study functions instead of fixing one with "
+                             "--functionname. Every 20 s window then holds TWO prompts "
+                             "about two DIFFERENT functions, doubling the labels per "
+                             "window. The pool lives in src/drive/drive_improved.py "
+                             "(RANDOM_FUNCTION_POOL).")
     parser.add_argument("--modeltype", default="combined")
     parser.add_argument("--state-model", default="xlstm")
     parser.add_argument("--w-fcd", type=float, default=0.7)
@@ -281,6 +470,20 @@ def main():
                         help="Suppress Drive's LoA selection popups for the whole "
                              "session: no scene freezes and no user labels. ProVoice "
                              "still runs and logs its own decisions.")
+    popup_input = parser.add_mutually_exclusive_group()
+    popup_input.add_argument("--wheel-input", dest="popup_input", action="store_const",
+                             const="wheel",
+                             help="Answer the LoA popups from the steering wheel: the "
+                                  "paddles move the cursor, the front button ticks the "
+                                  "level under it, the CONFIRM row submits. Default "
+                                  "when a wheel is attached.")
+    popup_input.add_argument("--keyboard-input", dest="popup_input", action="store_const",
+                             const="keyboard",
+                             help="Answer the LoA popups from the keyboard: number keys "
+                                  "0-4 tick a level, the same number again unticks it, "
+                                  "ENTER confirms. The popup ignores the wheel, which "
+                                  "still steers. Default when no wheel is attached.")
+    parser.set_defaults(popup_input=None)
     parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
@@ -308,8 +511,41 @@ def main():
         # baseline. Worth saying out loud rather than silently forcing.
         print("[WARN] --calibration-only without --no-popup: the LoA popups will "
               "interrupt the 180 s baseline. Add --no-popup unless that is intended.")
+    if args.popup_input and args.no_popup:
+        # Harmless, but it means the run was configured for an interface it will
+        # never show — worth saying rather than silently ignoring the flag.
+        print("[WARN] --%s-input has no effect with --no-popup: this run shows no "
+              "LoA popups." % args.popup_input)
+    if args.random_function and args.functionname is not None:
+        parser.error("--random-function and --functionname contradict each other: "
+                     "one draws the function per popup, the other fixes it for the "
+                     "whole run.")
+    if args.random_function and args.no_popup:
+        print("[WARN] --random-function has no effect with --no-popup: the function "
+              "is only ever asked about in a popup.")
+    if args.random_function and not (args.data_collection or args.test_drive
+                                     or args.test_popup or args.calibration_only):
+        # ProVoice's decision engine is driven by ONE functionname for the whole
+        # run (its FCD vector comes from it), and there is no channel for Drive to
+        # tell it which function a given popup drew. The user labels stay correct
+        # either way, but system_* and user rows would then describe different
+        # functions, which is exactly the comparison the analysis makes.
+        print("[WARN] --random-function with a live ProVoice decision engine: its "
+              "decisions all assume functionname='%s', while the popups ask about "
+              "whichever function they drew. Intended for --data-collection runs."
+              % (args.functionname or DEFAULT_FUNCTIONNAME))
+
+    # Resolve the default only after the conflict check above, which needs to see
+    # whether --functionname was actually given.
+    if args.functionname is None:
+        args.functionname = DEFAULT_FUNCTIONNAME
 
     root = Path.cwd()
+
+    # Cut-off for "did CARLA die during THIS session?". Taken before anything is
+    # launched, so crash reports left by earlier sessions (CARLA is normally
+    # left running across many runs) are never mistaken for this one's.
+    session_start = time.time()
 
     session = write_session_id(root)
 
@@ -383,7 +619,8 @@ def main():
                     # Expected: ProVoice exits itself once the baseline is stored.
                     print("[DONE] calibration stored; stopping the experiment")
                     raise SystemExit(0)
-                print(f"[CRASH] {name} exited with code {code}")
+                print(f"[CRASH] {name} exited with code {describe_exit_code(code)}")
+                report_probable_cause(name, code, session_start)
                 raise SystemExit(1)  # or break, or restart it
 
     except KeyboardInterrupt:
