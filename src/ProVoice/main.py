@@ -9,6 +9,7 @@ import argparse as ap
 import json
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── CPU thread budget ────────────────────────────────────────────────────────
@@ -304,11 +305,13 @@ def _build_parser() -> ap.ArgumentParser:
                         "car. Normally left unset and adopted from the vehicle "
                         "bridge's /session.")
     p.add_argument("--bridge-session-timeout", dest="bridge_session_timeout",
-                   type=float, default=15.0,
-                   help="How long to wait for the remote bridge's /session "
-                        "endpoint at startup. Only used with vehicle_state_url. "
-                        "0 skips the fetch entirely, leaving session_id and "
-                        "participantid exactly as given here.")
+                   type=float, default=10.0,
+                   help="How long to wait for the remote bridge to publish a "
+                        "session id AND a participant id at /session. Only used "
+                        "with vehicle_state_url. A bridge that answers with "
+                        "neither is still starting up, so that counts as not "
+                        "answered. 0 skips the fetch entirely, leaving both "
+                        "exactly as given here.")
     p.add_argument("--state-poll-hz", dest="state_poll_hz", type=float, default=2.0,
                    help="How often to poll vehicle_state_url. The 2 Hz default "
                         "is the historical one; start_experiment.py --vehicle-bridge "
@@ -380,9 +383,9 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
     return None
 
 
-def fetch_bridge_session(url: str, timeout: float = 15.0,
+def fetch_bridge_session(url: str, timeout: float = 10.0,
                          request_timeout: float = 3.0) -> dict | None:
-    """Read {session_id, participantid} from the remote bridge's /session.
+    """Wait up to ``timeout`` for {session_id, participantid} from /session.
 
     In a --remote run the launcher on the CARLA machine mints the session id and
     holds the participant id, and THIS process has to agree with both or the
@@ -390,20 +393,31 @@ def fetch_bridge_session(url: str, timeout: float = 15.0,
     bridge publishes them; this reads them back, so neither id depends on a
     human retyping it into a second terminal.
 
-    Retries until ``timeout`` because the two machines are started by hand and
-    in either order: a ProVoice launched first would otherwise get one refused
-    connection and fall back for the rest of the session. This runs ONCE, at
-    startup, so a plain urlopen is right here — the keep-alive machinery in
-    DataCollector exists for the 2 Hz state poll, not for one request.
+    It waits for the IDS, not merely for the endpoint. Those are different
+    events: the bridge starts serving as soon as its socket is open, and a
+    /session that answers 200 with two nulls is a bridge that is up but does not
+    yet know who is driving. Returning on the first answer would take those
+    nulls as the truth and mint a local session id a second later — the exact
+    split-identity failure this function exists to prevent. So a nulls-only
+    answer is treated like no answer at all and polled again.
 
-    Returns None when the bridge never answered, or answered with something
-    unusable (a bridge predating this route 404s). None means "no information",
-    never "no session": the caller keeps whatever it already had.
+    The wait also covers the ordinary case of the two machines being started by
+    hand, in either order: a ProVoice launched first would otherwise get one
+    refused connection and fall back for the rest of the session. This runs
+    ONCE, at startup, so a plain urlopen is right here — the keep-alive
+    machinery in DataCollector exists for the 2 Hz state poll, not for this.
+
+    Returns None when the bridge never answered at all, or answered with
+    something unusable (a bridge predating this route 404s). None means "no
+    information", never "no session": the caller keeps whatever it already had.
+    A partial answer at the deadline is returned as-is rather than discarded —
+    one id is better than none, and the caller says out loud what is missing.
     """
     endpoint = url.rstrip("/") + "/session"
     deadline = time.monotonic() + max(0.0, timeout)
     attempt = 0
     last_err: str | None = None
+    last_info: dict | None = None
     while True:
         attempt += 1
         try:
@@ -413,12 +427,18 @@ def fetch_bridge_session(url: str, timeout: float = 15.0,
                 info = json.loads(resp.read())
             if not isinstance(info, dict):
                 raise ValueError(f"expected an object, got {type(info).__name__}")
-            return {
+            last_info = {
                 # Normalize "" to None here so the caller has one "unknown".
                 "session_id": (info.get("session_id") or None),
                 "participantid": (info.get("participantid") or None),
                 "status_url": (info.get("status_url") or None),
             }
+            if last_info["session_id"] and last_info["participantid"]:
+                return last_info
+            last_err = ("bridge is up but has published no %s yet"
+                        % (" or ".join(
+                            k for k in ("session_id", "participantid")
+                            if not last_info[k])))
         except urllib.error.HTTPError as e:
             # A routed answer, just not this route: the bridge is older than
             # this feature. Retrying cannot change that, so stop immediately.
@@ -430,10 +450,84 @@ def fetch_bridge_session(url: str, timeout: float = 15.0,
         if time.monotonic() >= deadline:
             break
         if attempt == 1:
-            print(f"[bridge] waiting for {endpoint} ({last_err}) ...")
+            print(f"[bridge] waiting up to {timeout:.0f}s for the session ids at "
+                  f"{endpoint} ({last_err}) ...")
         time.sleep(1.0)
+
+    if last_info is not None:
+        # Answered, but never with both ids. Hand back what there was: status_url
+        # alone is still worth having, and resolve_session_identity() reports
+        # each missing id where the operator will see it.
+        print(f"[bridge] {endpoint} did not publish both ids within "
+              f"{timeout:.0f}s ({last_err}).")
+        return last_info
     print(f"[bridge] {endpoint} did not answer within {timeout:.0f}s "
           f"({last_err}). Using the local command line.")
+    return None
+
+
+def _status_channel_alive(status_url: str, timeout: float = 2.0) -> bool:
+    """Can this process actually reach the reverse bridge? One cheap GET."""
+    try:
+        with urllib.request.urlopen(status_url.rstrip("/") + "/health",
+                                    timeout=timeout) as resp:
+            resp.read()
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 — unreachable is the answer, not an error
+        return False
+
+
+def resolve_status_url(status_url: str, vehicle_state_url: str | None,
+                       timeout: float = 2.0) -> str | None:
+    """Confirm the reverse bridge is reachable, repairing the host if it is not.
+
+    The address published at /session is built on the CARLA machine from ITS
+    idea of its own IP. That is a guess, and it is wrong in two setups that
+    both look fine until the moment it matters:
+
+      * a tunnel (ngrok) in front of the vehicle bridge — the ProVoice machine
+        reaches the tunnel, never the LAN address behind it;
+      * a CARLA machine with several NICs (Hyper-V, VPN adapters), where the
+        interface that routes to 8.8.8.8 is not the one this machine talks to.
+
+    Either way the POST is dropped rather than refused, so it fails by TIMEOUT,
+    and the failure that matters is provoice_ended — sent while the process is
+    exiting, with nothing left to retry and a participant still driving.
+
+    So: probe it now. If the published address does not answer, try the host
+    this process demonstrably reaches the vehicle bridge on, with the published
+    port. That covers the multi-NIC case exactly and the LAN-address-behind-a-
+    tunnel case whenever the status port is exposed the same way.
+
+    Returns a URL that answered, or None. None is not fatal anywhere — it means
+    the operator gets told NOW, at startup, instead of at shutdown.
+    """
+    if not status_url:
+        return None
+    if _status_channel_alive(status_url, timeout):
+        print(f"[status] reverse bridge reachable at {status_url}")
+        return status_url
+
+    print(f"[status] {status_url} did not answer /health within {timeout:.0f}s.")
+    candidate = None
+    if vehicle_state_url:
+        published = urllib.parse.urlsplit(status_url)
+        reached = urllib.parse.urlsplit(vehicle_state_url)
+        if published.port and reached.hostname and \
+                reached.hostname != published.hostname:
+            candidate = f"{reached.scheme}://{reached.hostname}:{published.port}"
+            print(f"[status] trying {candidate} instead — that is the host this "
+                  f"process actually reaches the vehicle bridge on.")
+            if _status_channel_alive(candidate, timeout):
+                print(f"[status] reverse bridge reachable at {candidate}; using it.")
+                return candidate
+
+    print("[status] NO reverse channel. This run will still record everything, "
+          "but the CARLA machine will not learn when it starts or ends: Drive "
+          "there falls back to its popup-wait timeout and must be stopped by "
+          "hand. Fix by allowing the status port inbound on the CARLA machine, "
+          "or — behind a tunnel — by exposing it too and passing "
+          "status_url=<that url> here.")
     return None
 
 
@@ -629,6 +723,18 @@ def main():
         if not status_url and (bridge or {}).get("status_url"):
             status_url = bridge["status_url"]
             print(f"[status] adopting status_url={status_url!r} from the bridge.")
+        # Probed here rather than trusted: an address that only fails at
+        # shutdown fails at the one moment nothing can be done about it.
+        if args.status_url:
+            # Hand-typed, so it is checked but never replaced — an operator
+            # naming a tunnel outranks anything derivable from the bridge host.
+            if not _status_channel_alive(status_url):
+                print("[status] the status_url given on the command line did "
+                      "not answer /health. Keeping it, since it was given "
+                      "explicitly, but the signals will not arrive unless it "
+                      "becomes reachable.")
+        elif status_url:
+            status_url = resolve_status_url(status_url, vehicle_state_url)
 
     # Last resort, after the bridge has had its chance: a local run, or a bridge
     # that published nothing. A generated id keeps this session's rows
@@ -914,9 +1020,12 @@ def main():
                 name="status-started", daemon=True).start()
         data_collector.on_first_frame_logged = _first_frame
     elif vehicle_state_url:
-        print("[status] no reverse bridge (no status_url from the command line "
-              "or the bridge): Drive on the other machine will fall back to its "
-              "popup-wait timeout and will not be told when this run ends.")
+        # Either none was published, or the one published could not be reached
+        # (resolve_status_url has already said which, and how to fix it).
+        print("[status] running WITHOUT a reverse bridge: Drive on the other "
+              "machine will fall back to its popup-wait timeout for the start, "
+              "and will not be told when this run ends — stop the drive there "
+              "by hand.")
 
     data_collector.start()
 

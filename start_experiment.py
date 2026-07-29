@@ -86,17 +86,22 @@ that machine runs neither CARLA nor Drive and this launcher previously had no
 mode for "ProVoice alone". They start ProVoice and nothing else:
 
     --experiment-calibration-provoice-remote [URL]
-        = ProVoice with --calibration-only, reading vehicle state from
+        = ProVoice with --calibration-only --webcam, reading vehicle state from
           <URL>/ and its participant/session ids AND the status-bridge address
           from <URL>/session. Runs the 180 s baseline, stores it under the
           participant id the bridge reports, and exits by itself -- which is
           also what ends the drive on the other machine. Nothing is written to
           raw_data.jsonl.
     --experiment-data-collection-provoice-remote [URL]
-        = ProVoice with --data-collection, same id handling. Records
+        = ProVoice with --data-collection --webcam, same id handling. Records
           raw_data.jsonl only: no decision engine, no interventions, and the
           participant's stored baseline is reused rather than re-measured.
           Its first logged frame is what opens the LoA windows over there.
+
+    Both imply --webcam, i.e. the external driver-facing camera rather than
+    this machine's built-in one, and both imply it so the baseline and the
+    session it normalizes are measured through the SAME lens. --no-webcam
+    cancels it; use that for both phases or neither.
 
     Neither ProVoice-machine preset starts a bridge of its own: both bridges
     live on the CARLA machine (see above), so this machine needs no inbound
@@ -526,9 +531,22 @@ _CARLA_PRESETS = {
 }
 
 _PROVOICE_PRESETS = {
-    # attribute name -> flags for the ProVoice this machine will start alone
-    "experiment_calibration_provoice_remote": {"calibration_only": True},
-    "experiment_data_collection_provoice_remote": {"data_collection": True},
+    # attribute name -> flags for the ProVoice this machine will start alone.
+    #
+    # webcam=True in BOTH, and that is the point of setting it here rather than
+    # leaving it to the operator: the driver-facing camera is the external one
+    # on this machine, and the setting has to be IDENTICAL in the two phases.
+    # The two cameras differ in framing and frame rate, and the achieved frame
+    # rate is the rPPG sampling rate -- so calibrating on one and collecting on
+    # the other silently rescales that participant's HR/RR against a baseline
+    # measured from a different signal. Nothing in the data says so; it shows
+    # up, if at all, as one participant whose physiological features sit oddly.
+    # Tying both presets to the same choice removes the chance to get it half
+    # right. --no-webcam overrides, for a machine that only has a built-in one.
+    "experiment_calibration_provoice_remote": {"calibration_only": True,
+                                               "webcam": True},
+    "experiment_data_collection_provoice_remote": {"data_collection": True,
+                                                   "webcam": True},
 }
 
 
@@ -590,6 +608,12 @@ def apply_experiment_presets(parser, args) -> None:
                 "PV_BRIDGE_URL in this shell."
                 % (name.replace("_", "-"), name.replace("_", "-")))
         args.bridge_url = normalize_bridge_url(raw, args.remote_port)
+
+    if args.no_webcam:
+        # Honoured rather than overridden: a preset expresses the usual rig,
+        # and the operator looking at the actual machine outranks it.
+        overrides = {k: v for k, v in overrides.items() if k != "webcam"}
+        args.webcam = False
 
     for flag, value in overrides.items():
         setattr(args, flag, value)
@@ -1011,6 +1035,13 @@ def main():
                              "bridge's /session, so it is never typed by hand. "
                              "Needs the same inbound firewall allowance as "
                              "--remote-port.")
+    parser.add_argument("--status-url", dest="status_url", default=None,
+                        help="Address the ProVoice machine should post its "
+                             "signals to, when this machine cannot work it out: "
+                             "behind a tunnel (ngrok) the LAN address published "
+                             "by default is unreachable from there, so expose "
+                             "the status port too and give its public URL here. "
+                             "On a plain LAN leave it unset.")
     parser.add_argument("--status-file", dest="status_file",
                         default="provoice_status.json",
                         help="File the reverse bridge publishes into and Drive "
@@ -1105,7 +1136,14 @@ def main():
                              "across all participants: the two cameras differ in "
                              "framing and frame rate, and the achieved frame rate is "
                              "the rPPG sampling rate, so switching mid-study changes "
-                             "the HR/RR scale.")
+                             "the HR/RR scale. The two ProVoice-machine presets set "
+                             "this for you.")
+    parser.add_argument("--no-webcam", dest="no_webcam", action="store_true",
+                        help="Cancel the --webcam that the ProVoice-machine presets "
+                             "set, for a machine whose only camera is the built-in "
+                             "one. Use it for BOTH phases or neither: a participant "
+                             "calibrated on one camera and recorded on the other has "
+                             "an HR/RR baseline measured from a different signal.")
 
     # --- Protocol presets (see the table in the module docstring) ------------
     presets = parser.add_argument_group(
@@ -1141,13 +1179,17 @@ def main():
                               "ALONE in --calibration-only mode against the "
                               "bridge at BRIDGE (bare IP, IP:PORT or URL; "
                               "PV_BRIDGE_URL is used when omitted). Participant "
-                              "and session ids come from BRIDGE/session.")
+                              "and session ids come from BRIDGE/session. Implies "
+                              "--webcam (the driver-facing camera on this "
+                              "machine); --no-webcam cancels it.")
     presets.add_argument("--experiment-data-collection-provoice-remote",
                          dest="experiment_data_collection_provoice_remote",
                          nargs="?", const="", default=None, metavar="BRIDGE",
                          help="Phase 3 on the ProVoice machine: start ProVoice "
                               "ALONE in --data-collection mode against BRIDGE. "
-                              "Same id handling as the calibration preset.")
+                              "Same id handling as the calibration preset, and "
+                              "the same --webcam, which is what keeps the two "
+                              "phases on ONE camera.")
 
     args = parser.parse_args()
 
@@ -1383,7 +1425,14 @@ def main():
                 "--session-id", session,
             ]
             pm.start(status_cmd, "STATUS_SERVER", restart=True)
-            status_url = f"http://{outbound_ip()}:{args.status_port}"
+            # A GUESS, and published as one: outbound_ip() reports the interface
+            # that routes to the internet from HERE, which is not necessarily
+            # the address the ProVoice machine can reach — a second NIC, or a
+            # tunnel in front of the vehicle bridge, breaks it. ProVoice probes
+            # this before trusting it and falls back to the host it actually
+            # reached the vehicle bridge on, so a wrong guess costs a line in
+            # its log rather than the end-of-session signal.
+            status_url = args.status_url or f"http://{outbound_ip()}:{args.status_port}"
 
         # =========================
         # START DRIVE
