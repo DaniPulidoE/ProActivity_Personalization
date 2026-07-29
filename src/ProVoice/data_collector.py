@@ -2300,12 +2300,14 @@ class DataCollector:
                 # unread response leaves the socket mid-message and the next
                 # request would raise ResponseNotReady.
                 body = resp.read()
+                print(f"[DataCollector] HTTP GET {self.vehicle_state_url} "
+                      f"-> {resp.status} {resp.reason} ({len(body)} bytes)")
                 if resp.status != 200:
                     raise ValueError(f"bridge returned HTTP {resp.status} {resp.reason}")
                 age_hdr = resp.getheader("X-State-Age")
                 age = None
                 if age_hdr is not None:
-                    try:
+                    try: 
                         age = float(age_hdr)
                     except ValueError:
                         age = None

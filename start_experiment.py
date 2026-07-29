@@ -11,6 +11,8 @@ MAIN OPTIONS:
 --calibration-only: provoice only on calibration mode, no inference afterwards
 --data-collection: don't perform calibration, jump directly to data collection, no inference
 --test-drive: don't launch provoice
+--webcam: use the external USB webcam instead of the laptop's built-in camera
+    (ProVoice probes indices 0-4 and takes the lowest that opens above 0)
 --test-popup: teaching mode, simulator UI + immediate LoA popups, nothing logged
 --remote: CARLA + traffic + Drive (with the LoA popups) run HERE and vehicle
     state is served over HTTP; ProVoice runs on ANOTHER machine and is started
@@ -387,6 +389,12 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
         # tokens through untouched.
         *(["--calibration-only"] if args.calibration_only else []),
         *(["--data-collection"] if args.data_collection else []),
+        # Forwarded rather than resolved here on purpose: ProVoice owns the
+        # camera, and probing an index means OPENING the device. Doing that in
+        # this process would leave the launcher holding a handle that Windows
+        # has not necessarily released by the time ProVoice tries to open the
+        # same device -- exactly the failure the restart delay below exists for.
+        *(["--webcam"] if args.webcam else []),
     ]
 
 
@@ -826,6 +834,15 @@ def main():
     parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
+    parser.add_argument("--webcam", action="store_true",
+                        help="Tell ProVoice to probe camera indices 0-4 and use the "
+                             "lowest that opens above 0 — the external webcam on a "
+                             "laptop, where index 0 is the built-in one. Without it "
+                             "ProVoice always takes index 0. Keep this setting FIXED "
+                             "across all participants: the two cameras differ in "
+                             "framing and frame rate, and the achieved frame rate is "
+                             "the rPPG sampling rate, so switching mid-study changes "
+                             "the HR/RR scale.")
 
     args = parser.parse_args()
 
@@ -885,6 +902,9 @@ def main():
     if args.provoice_no_carla and (args.test_drive or args.test_popup):
         parser.error("--provoice-no-carla only affects ProVoice, which %s does not "
                      "start." % ("--test-drive" if args.test_drive else "--test-popup"))
+    if args.webcam and (args.test_drive or args.test_popup):
+        parser.error("--webcam only affects ProVoice, which %s does not start."
+                     % ("--test-drive" if args.test_drive else "--test-popup"))
     if args.provoice_no_carla:
         # Loud, because the run looks completely normal and silently produces
         # rows whose vehicle columns are all defaults.
