@@ -202,6 +202,11 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--carla-timeout", dest="carla_timeout", type=float, default=10.0)
     p.add_argument("--vehicle-state-url", dest="vehicle_state_url", default=None)
+    p.add_argument("--vehicle-state-file", dest="vehicle_state_file", default=None,
+                   help="Path published by scripts/vehicle_state_file_bridge.py. "
+                        "Like --vehicle-state-url it means THIS process makes no "
+                        "CARLA calls at all, but it reads a file instead of a "
+                        "socket, keeping the network stack out of the loop.")
     p.add_argument("--state-poll-hz", dest="state_poll_hz", type=float, default=2.0,
                    help="How often to poll vehicle_state_url. The 2 Hz default "
                         "is the historical one; start_experiment.py --vehicle-bridge "
@@ -338,6 +343,7 @@ def main():
     port = args.port
     carla_timeout = args.carla_timeout
     vehicle_state_url = args.vehicle_state_url  # e.g. http://0.tcp.ngrok.io:PORT
+    vehicle_state_file = args.vehicle_state_file  # local file bridge (preferred)
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
     xlstm_log = args.log_path  # e.g. "state_data.log"; empty/unset = disabled
@@ -482,7 +488,14 @@ def main():
     # actor pointing at a torn-down client. Not otherwise used, hence the names.
     _carla_client = None
     _carla_world = None
-    if vehicle_state_url:
+    if vehicle_state_file:
+        # File bridge: a separate process owns the CARLA client and publishes
+        # state to a file. Skipping the connection here is the entire point —
+        # this process must never construct a carla.Client, because polling
+        # CARLA from inside ProVoice corrupts its heap.
+        print(f"[INFO] vehicle_state_file set ({vehicle_state_file}) — "
+              f"skipping direct CARLA connection.")
+    elif vehicle_state_url:
         # Bridge URL provided — no direct CARLA connection needed; the bridge
         # reads from CARLA locally on the remote and serves speed/location over HTTP.
         print(f"[INFO] vehicle_state_url set — skipping direct CARLA connection.")
@@ -535,6 +548,7 @@ def main():
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
         vehicle_state_url=vehicle_state_url,
+        vehicle_state_path=vehicle_state_file,
         state_poll_hz=args.state_poll_hz,
         window_size=window_sz,
         decision_hz=args.decision_hz,

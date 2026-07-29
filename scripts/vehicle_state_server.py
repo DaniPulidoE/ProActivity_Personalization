@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
-Lightweight HTTP bridge: owns the CARLA client in its OWN process and serves
-vehicle state as JSON.
+Lightweight HTTP bridge: reads vehicle state from a local CARLA instance and
+serves it as JSON so ProVoice can fetch it through an ngrok tunnel.
 
-PRIMARY USE (local, same machine) -- process isolation, not remoting:
+Run this on the REMOTE machine (alongside CARLA and drive_improved.py):
 
-    start_experiment.py --vehicle-bridge
+    python scripts/vehicle_state_server.py --port 8080
 
-    ProVoice then runs with carla_vehicle=None and never loads a CARLA client
-    of its own. Measured 2026-07-28: ProVoice reliably corrupts its own heap
-    when it polls CARLA directly (crashes landing in unrelated threads -- YOLO
-    convolutions, xLSTM encode_frame, a CPython dict lookup), and runs clean
-    across repeated sessions with the CARLA calls removed. Moving those calls
-    into this process contains the fault: if libcarla misbehaves here, only
-    this bridge dies, the launcher restarts it, and the participant session
-    plus all logging continue.
+Then open a second ngrok tunnel:
 
-    Binds 127.0.0.1 by default, so nothing is exposed off the machine.
+    ngrok http 8080
 
-SECONDARY USE (the original one) -- CARLA on a remote host: run this next to
-CARLA, expose it with `--bind 0.0.0.0` plus a tunnel, and pass the public URL
-to ProVoice as vehicle_state_url=...
+And pass the URL to ProVoice on your local machine:
 
-    python scripts/vehicle_state_server.py --port 8080 --bind 0.0.0.0
+    python src/ProVoice/main.py vehicle_state_url=https://<ngrok-id>.ngrok-free.app ...
+
+NOTE: for a LOCAL, same-machine setup do NOT use this script -- use
+scripts/vehicle_state_file_bridge.py instead. It publishes the same fields
+through a file rather than a socket, which keeps ~20 TCP connections/second
+out of the kernel's network stack.
 """
 
 import argparse
@@ -57,30 +53,16 @@ def read_vehicle_id(path: str, wait: float = 60.0) -> int | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--bind", default="127.0.0.1",
-                        help="Interface to listen on. Default is loopback only, "
-                             "which is what the local same-machine setup wants. "
-                             "Use 0.0.0.0 only when CARLA is remote and the "
-                             "bridge must be reachable from another host.")
     parser.add_argument("--carla-host", default="localhost")
     parser.add_argument("--carla-port", type=int, default=2000)
     parser.add_argument("--vehicle-id-path", default="vehicle_id.txt")
-    parser.add_argument("--vehicle-id", type=int, default=None,
-                        help="Skip vehicle_id.txt discovery. start_experiment.py "
-                             "passes this because it has already read and "
-                             "validated the id, which also avoids re-reading a "
-                             "file that a restart could catch mid-write.")
     args = parser.parse_args()
 
-    if args.vehicle_id is not None:
-        vehicle_id = args.vehicle_id
-        print(f"[bridge] Using vehicle id {vehicle_id} from the command line.")
-    else:
-        print(f"[bridge] Waiting for {args.vehicle_id_path} ...")
-        vehicle_id = read_vehicle_id(args.vehicle_id_path)
-        if vehicle_id is None:
-            print("[bridge] vehicle_id.txt not found after 60 s. Exiting.")
-            sys.exit(1)
+    print(f"[bridge] Waiting for {args.vehicle_id_path} ...")
+    vehicle_id = read_vehicle_id(args.vehicle_id_path)
+    if vehicle_id is None:
+        print("[bridge] vehicle_id.txt not found after 60 s. Exiting.")
+        sys.exit(1)
 
     print(f"[bridge] Connecting to CARLA at {args.carla_host}:{args.carla_port} ...")
     client = carla.Client(args.carla_host, args.carla_port)
@@ -92,7 +74,7 @@ def main() -> None:
         sys.exit(1)
     carla_map = world.get_map()  # cache — get_map() is expensive to call at 20 Hz
     print(f"[bridge] Tracking actor id={vehicle_id} type={actor.type_id}")
-    print(f"[bridge] Serving on http://{args.bind}:{args.port}/", flush=True)
+    print(f"[bridge] Serving on http://0.0.0.0:{args.port}/")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -149,10 +131,7 @@ def main() -> None:
         def log_message(self, *args):
             pass  # suppress per-request noise
 
-    # allow_reuse_address so a supervised restart can rebind immediately instead
-    # of failing on the previous socket's TIME_WAIT.
-    HTTPServer.allow_reuse_address = True
-    HTTPServer((args.bind, args.port), Handler).serve_forever()
+    HTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

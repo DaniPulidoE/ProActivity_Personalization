@@ -316,7 +316,7 @@ def build_provoice_cmd(session, args, vehicle_id):
         # wholesale. --vehicle-bridge points at a real server so the vehicle
         # columns are still populated; --provoice-no-carla points at a dead port
         # so they are not (diagnostic only).
-        *([f"vehicle_state_url=http://127.0.0.1:{args.bridge_port}",
+        *([f"vehicle_state_file={args.bridge_file}",
            f"state_poll_hz={args.bridge_poll_hz}"]
           if args.vehicle_bridge else []),
         *([f"vehicle_state_url=http://127.0.0.1:{_DEAD_PORT}"]
@@ -346,7 +346,8 @@ class ProcessManager:
         #          "total", "gave_up"}
         self.supervised = {}
 
-    def start(self, cmd, name, below_normal=False, restart=False):
+    def start(self, cmd, name, below_normal=False, restart=False,
+              restart_delay=0.0):
         """Spawn a child process.
 
         ``below_normal`` drops it to BELOW_NORMAL priority on Windows. Used for
@@ -400,6 +401,7 @@ class ProcessManager:
             self.supervised.setdefault(name, {
                 "cmd": cmd, "below_normal": below_normal,
                 "restarts": [], "total": 0, "gave_up": False,
+                "delay": restart_delay,
             })
         return p
 
@@ -431,9 +433,18 @@ class ProcessManager:
         info["total"] += 1
         # Drop the dead entry so the main loop does not keep re-reporting it.
         self.processes = [(n, p) for n, p in self.processes if n != name]
+        delay = info.get("delay", 0.0)
+        if delay:
+            # ProVoice owns the camera. The OS releases the device when the
+            # process dies, but not instantly, and a replacement that grabs it
+            # too early gets a failed VideoCapture and runs blind for the rest
+            # of the session.
+            print(f"[RESTART] {name} in {delay:.0f}s (letting the camera and "
+                  f"file handles be released)...")
+            time.sleep(delay)
         print(f"[RESTART] {name} (attempt {info['total']})")
         self.start(info["cmd"], name, below_normal=info["below_normal"],
-                   restart=True)
+                   restart=True, restart_delay=delay)
         return True
 
     @staticmethod
@@ -626,17 +637,23 @@ def main():
                              "is reused, or neutral defaults if there is none).")
     parser.add_argument("--vehicle-bridge", dest="vehicle_bridge",
                         action="store_true",
-                        help="Run scripts/vehicle_state_server.py in its own "
+                        help="Run scripts/vehicle_state_file_bridge.py in its own "
                              "process and have ProVoice read vehicle state from "
-                             "it over local HTTP instead of holding its own "
+                             "the file it publishes, instead of holding its own "
                              "CARLA client. ProVoice reliably corrupts its heap "
                              "when it polls CARLA directly; this keeps libcarla "
                              "out of that process while preserving the vehicle "
                              "columns. The bridge is supervised and restarted if "
                              "it dies, so its failure costs a short gap in "
-                             "vehicle state rather than the session.")
-    parser.add_argument("--bridge-port", dest="bridge_port", type=int, default=8080,
-                        help="Loopback port for the vehicle-state bridge.")
+                             "vehicle state rather than the session. Uses a FILE, "
+                             "not HTTP: the earlier socket version generated ~20 "
+                             "TCP connections/second, the kernel path suspected "
+                             "in the 2026-07-28 machine bugchecks.")
+    parser.add_argument("--bridge-file", dest="bridge_file",
+                        default="vehicle_state.json",
+                        help="File the vehicle-state bridge publishes into and "
+                             "ProVoice reads. Written atomically, so a reader "
+                             "never sees a partial record.")
     parser.add_argument("--bridge-poll-hz", dest="bridge_poll_hz", type=float,
                         default=20.0,
                         help="How often ProVoice polls the bridge. Defaults to "
@@ -644,6 +661,26 @@ def main():
                              "built-in default is 2 Hz, which would sample "
                              "steer/brake ten times slower than a direct CARLA "
                              "read and visibly degrade those features.")
+    parser.add_argument("--restart-provoice", dest="restart_provoice",
+                        action="store_true",
+                        help="Relaunch ProVoice if it crashes instead of ending "
+                             "the session. Salvages a participant run at the "
+                             "cost of a ~30-60s hole in raw_data.jsonl and "
+                             "decisions.csv while the models reload; Drive keeps "
+                             "running so the LoA labels are unbroken. STRONGLY "
+                             "recommended only with --vehicle-bridge: without it "
+                             "the new ProVoice reconnects to CARLA, and a "
+                             "reconnect after a crash has killed the server "
+                             "within ~10-12s every time it was observed.")
+    parser.add_argument("--bridge-zeros", dest="bridge_zeros", action="store_true",
+                        help="DIAGNOSTIC, use with --vehicle-bridge: the bridge "
+                             "still reads CARLA at the normal rate but publishes "
+                             "zeros. Isolates the ONE variable that separates a "
+                             "crashing --vehicle-bridge run from a clean "
+                             "--provoice-no-carla run: the numbers ProVoice "
+                             "receives. Crashes anyway -> the values are "
+                             "irrelevant; stays clean -> they are implicated. "
+                             "NOT usable participant data.")
     parser.add_argument("--provoice-no-carla", dest="provoice_no_carla",
                         action="store_true",
                         help="DIAGNOSTIC: run ProVoice with NO CARLA connection "
@@ -702,6 +739,32 @@ def main():
         parser.error("--calibration-only and --data-collection are mutually exclusive.")
     if args.calibration_only and args.test_drive:
         parser.error("--calibration-only needs ProVoice, which --test-drive disables.")
+    if args.restart_provoice and args.calibration_only:
+        parser.error("--restart-provoice and --calibration-only are "
+                     "incompatible: a baseline assembled from two partial "
+                     "180 s measurements either side of a crash is not a "
+                     "baseline. Re-run the calibration instead.")
+    if args.restart_provoice and (args.test_drive or args.test_popup):
+        parser.error("--restart-provoice has nothing to restart: %s does not "
+                     "start ProVoice." % ("--test-drive" if args.test_drive
+                                          else "--test-popup"))
+    if args.restart_provoice and not args.vehicle_bridge:
+        # Allowed, because the alternative is losing the session outright, but
+        # the odds are poor and the user should not discover that afterwards.
+        print("[WARN] --restart-provoice WITHOUT --vehicle-bridge: the relaunched "
+              "ProVoice will open its own CARLA connection, and a reconnect "
+              "after a ProVoice crash has killed the CARLA server within "
+              "~10-12s in every observed case. Add --vehicle-bridge so the "
+              "restart never touches CARLA.")
+    if args.bridge_zeros and not args.vehicle_bridge:
+        parser.error("--bridge-zeros only affects the vehicle bridge; add "
+                     "--vehicle-bridge (without it, nothing publishes at all, "
+                     "which is what --provoice-no-carla already gives you).")
+    if args.bridge_zeros:
+        print("[WARN] --bridge-zeros: the bridge will publish ZEROS. Vehicle "
+              "columns will be inert, so THIS RUN IS NOT USABLE PARTICIPANT "
+              "DATA. It exists to isolate whether real vehicle values are what "
+              "distinguishes a crashing run from a clean one.")
     if args.vehicle_bridge and args.provoice_no_carla:
         parser.error("--vehicle-bridge and --provoice-no-carla contradict each "
                      "other: both keep CARLA out of ProVoice, but the bridge "
@@ -823,14 +886,29 @@ def main():
         # vehicle_id.txt: it has already been read and validated above, and a
         # restart mid-session must not race a rewrite of that file.
         if args.vehicle_bridge and not (args.test_drive or args.test_popup):
+            # Remove any file left by a previous session BEFORE either process
+            # opens it. Without this, ProVoice's first polls would read the last
+            # run's vehicle state; the record's "ts" makes that detectable as
+            # stale, but not reading it at all is better than detecting it.
+            # Must happen here: once ProVoice holds the file open, Windows will
+            # refuse the delete.
+            try:
+                Path(args.bridge_file).unlink()
+                print(f"[CLEANUP] removed stale {args.bridge_file}")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"[WARN] could not remove {args.bridge_file}: {e}")
+
             bridge_cmd = [
                 sys.executable,
-                "scripts/vehicle_state_server.py",
-                "--port", str(args.bridge_port),
-                "--bind", "127.0.0.1",
+                "scripts/vehicle_state_file_bridge.py",
+                "--out", args.bridge_file,
+                "--hz", str(args.bridge_poll_hz),
                 "--carla-host", args.host,
                 "--carla-port", str(args.port),
                 "--vehicle-id", str(vehicle_id),
+                *(["--zeros"] if args.bridge_zeros else []),
             ]
             pm.start(bridge_cmd, "VEHICLE_BRIDGE", restart=True)
             # The bridge connects to CARLA and caches the map before it binds;
@@ -851,7 +929,13 @@ def main():
             # Pass the id explicitly so ProVoice skips its own file discovery
             # (read_vehicle_id) — the file has already been read and validated here.
             provoice_cmd = build_provoice_cmd(session, args, vehicle_id)
-            pm.start(provoice_cmd, "PROVOICE", below_normal=True)
+            # The same session_id is reused on a restart, so raw_data.jsonl and
+            # decisions.csv stay one continuous session (both are opened in
+            # append mode) with a visible timestamp gap rather than splitting
+            # into two. Calibration is reloaded from the participant's stored
+            # baseline, so a restart does not re-run the 180 s routine.
+            pm.start(provoice_cmd, "PROVOICE", below_normal=True,
+                     restart=args.restart_provoice, restart_delay=3.0)
 
         # =========================
         # MAIN LOOP (keep alive)
@@ -877,8 +961,21 @@ def main():
                 if name in pm.supervised and not pm.supervised[name]["gave_up"]:
                     print(f"[DOWN] {name} exited with code "
                           f"{describe_exit_code(code)}")
-                    print("       Vehicle state is FROZEN at its last values "
-                          "until the bridge is back; the run continues.")
+                    if name == "VEHICLE_BRIDGE":
+                        print("       Vehicle state is FROZEN at its last values "
+                              "until the bridge is back; the run continues.")
+                    elif name == "PROVOICE":
+                        # Worth stating plainly: this is a real hole in the
+                        # participant's record, not a hiccup. Reloading torch,
+                        # YOLO, MMRPhys and the emotion model takes tens of
+                        # seconds, and nothing is logged to raw_data.jsonl or
+                        # decisions.csv until it is back. Drive keeps running,
+                        # so the LoA labels in user_loa_labels.csv are unbroken.
+                        print("       NO ProVoice data is being recorded until it "
+                              "is back (model reload takes ~30-60s).")
+                        print("       Drive keeps running, so the LoA labels are "
+                              "unaffected. The gap is visible as a jump in the "
+                              "raw_data.jsonl timestamps.")
                     if pm.restart_supervised(name):
                         continue
                     # Fell through to gave_up: keep running without it.

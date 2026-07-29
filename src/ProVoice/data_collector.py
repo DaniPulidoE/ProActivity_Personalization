@@ -21,6 +21,10 @@ from mediapipe.tasks.python import vision as mp_vision
 
 from rPPG.rppg_infer_simple import OnlineRPPG
 from ProVoice import perception as _perception  # in-tree replacement for yolov5-deepsort
+# Standalone module (src/vehicle_state_io.py), deliberately outside the
+# ProVoice package so the lightweight bridge process can import it without
+# dragging in torch/cv2/mediapipe.
+from vehicle_state_io import VehicleStateChannel
 
 HAS_CV2 = True
 HAS_MYFRAME = True  # kept for backward-compat
@@ -187,6 +191,7 @@ class DataCollector:
         carla_vehicle: Optional[Any] = None,
         window_size: int = 400, # 20 seconds at 20Hz (as user inputs label each 20 seconds)
         vehicle_state_url: Optional[str] = None,
+        vehicle_state_path: Optional[str] = None,
         state_poll_hz: float = 2.0,
         calibration_dir: str = _CALIBRATION_DIR,
         rppg_fps: float = 30.0,
@@ -273,6 +278,11 @@ class DataCollector:
         self._carla_world = None
         self._carla_map = None
         self.vehicle_state_url = vehicle_state_url.rstrip("/") if vehicle_state_url else None
+        # File published by scripts/vehicle_state_file_bridge.py. Preferred over
+        # the URL for a same-machine setup: reading a small file avoids the ~20
+        # TCP connections/second the HTTP bridge generated, which is the kernel
+        # path suspected in the two machine bugchecks of 2026-07-28.
+        self.vehicle_state_path = vehicle_state_path or None
         # Seconds between bridge polls. Every vehicle field is held constant
         # between polls, so this is the real sampling rate of speed/steer/brake
         # when the bridge is in use — it should track the collection rate, not
@@ -1420,6 +1430,8 @@ class DataCollector:
         headlight = fog_light = left_indicator = right_indicator = None
 
         if self.carla_vehicle is not None:
+            
+            
             try:
                 vel = self.carla_vehicle.get_velocity()
                 speed = int((vel.x**2 + vel.y**2 + vel.z**2)**0.5 * 3.6)
@@ -1522,8 +1534,8 @@ class DataCollector:
                 fog_light = self._cached_fog_light
                 left_indicator = self._cached_left_indicator
                 right_indicator = self._cached_right_indicator
-
-        elif self.vehicle_state_url is not None:
+        
+        elif self.vehicle_state_url is not None or self.vehicle_state_path is not None:
             # Updated by _poll_vehicle_state background thread — just read cache.
             speed = self._cached_speed
             brake = self._cached_brake
@@ -2227,13 +2239,51 @@ class DataCollector:
         only so an explicit override still works.
         """
         interval = self._state_poll_interval if interval is None else interval
+        source = self.vehicle_state_path or self.vehicle_state_url
+        kind = "file" if self.vehicle_state_path else "http"
         print(f"[DataCollector] Vehicle-state poller started "
-              f"({1.0 / interval:.1f} Hz -> {self.vehicle_state_url}).")
+              f"({1.0 / interval:.1f} Hz, {kind} -> {source}).")
         _fail_streak = 0
+        _stale_since = 0.0
+        _channel = None
+        # ISOLATION CONTRACT: nothing the bridge does may take ProVoice down.
+        # The bridge is a separate process that can die, be restarted by the
+        # launcher, hold the lock too long, publish garbage, or never start at
+        # all. Every one of those raises inside this try, is logged, and leaves
+        # the _cached_* fields at their last good values -- which _carla_process
+        # reads. Collection, perception, decisions and logging carry on
+        # untouched; only the vehicle columns go stale. This thread must never
+        # propagate an exception, because that would kill the thread and freeze
+        # the vehicle state silently for the rest of the session.
         while self._running:
             try:
-                with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
-                    state = json.loads(resp.read())
+                if self.vehicle_state_path:
+                    # read() takes the same advisory lock the bridge holds while
+                    # writing, so a half-written record cannot be observed. A
+                    # missing or empty file just means the bridge has not
+                    # published yet, and raises into the handler below.
+                    if _channel is None:
+                        _channel = VehicleStateChannel(self.vehicle_state_path)
+                    state = _channel.read()
+                    _ts = state.get("ts")
+                    if _ts is not None:
+                        age = time.time() - float(_ts)
+                        # Stale means the bridge stopped updating: the fields
+                        # below are then frozen history being written into rows
+                        # as if current, so it has to be said out loud.
+                        if age > max(2.0, 10.0 * interval):
+                            if _stale_since == 0.0:
+                                _stale_since = time.time()
+                            if _fail_streak == 0:
+                                print(f"[DataCollector] Vehicle state is STALE "
+                                      f"({age:.1f}s old) — the bridge has stopped "
+                                      f"publishing; values are frozen.")
+                                _fail_streak = 1
+                            raise ValueError(f"stale vehicle state ({age:.1f}s)")
+                        _stale_since = 0.0
+                else:
+                    with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
+                        state = json.loads(resp.read())
                 self._cached_speed               = int(state.get("speed_kmh", self._cached_speed))
                 self._cached_brake               = float(state.get("brake", self._cached_brake))
                 self._cached_steer               = float(state.get("steer", self._cached_steer))
@@ -2267,6 +2317,24 @@ class DataCollector:
                     print(f"[DataCollector] Vehicle-state poll FAILED "
                           f"(#{_fail_streak}, ~{_fail_streak * interval:.1f}s "
                           f"frozen): {type(e).__name__}: {e}")
+                # Drop the cached handle so the next tick reopens. The launcher
+                # restarts a dead bridge, and a stale handle must not stop us
+                # picking the new one up.
+                if _channel is not None:
+                    try:
+                        _channel.close()
+                    except Exception:
+                        pass
+                    _channel = None
+            except BaseException as e:  # noqa: BLE001
+                # Belt and braces for the isolation contract above: even a
+                # non-Exception escape (bar the shutdown signals) must not be
+                # allowed to kill this thread and silently freeze vehicle state.
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                print(f"[DataCollector] Vehicle-state poller: unexpected "
+                      f"{type(e).__name__}: {e} — continuing with cached values.")
+                _channel = None
             time.sleep(interval)
 
     def start(self) -> None:
@@ -2302,7 +2370,7 @@ class DataCollector:
         if self.visual_enabled:
             self._yolo_thread = threading.Thread(target=self._yolo_loop, daemon=True)
             self._yolo_thread.start()
-        if self.vehicle_state_url:
+        if self.vehicle_state_url or self.vehicle_state_path:
             self._state_poll_thread = threading.Thread(target=self._poll_vehicle_state, daemon=True)
             self._state_poll_thread.start()
             print(f"[DataCollector] Vehicle state polling started → {self.vehicle_state_url}")
