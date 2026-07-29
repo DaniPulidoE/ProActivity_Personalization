@@ -36,22 +36,84 @@ EXPERIMENT SETUP:
 3. Inference: --data-collection --participantid --random-function --fullscreen
 
 EXPERIMENT SETUP (remote):
-0. Teaching the LoA control: 
-    CARLA MACHINE:  uv run python start_experiment.py --test-popup --fullscreen
-1. Driver adaptation phase: 
-    CARLA MACHINE:  uv run python start_experiment.py --test-drive --no-popup --fullscreen
-2. Calibration: 
-    CARLA MACHINE:  uv run python start_experiment.py --fixed --test-drive --no-popup --fullscreen --participantid
-    PROVOICE MACHINE: uv run python start_experiment.py --calibration-provoice
+0. Teaching the LoA control:
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-popup
+1. Driver adaptation phase:
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-adaptation
+2. Calibration:
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-calibration-carla-remote --participantid <participantid>
+    PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote <carla-machine-ip>
 3. Data collection:
-    CARLA MACHINE: uv run python start_experiment.py --remote --data-collection --random-function --participantid 001
-    PROVOICE MACHINE: uv run provoice --data-collection vehicle_state_url= 
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-data-collection-carla-remote --participantid <participantid>
+    PROVOICE MACHINE: uv run python start_experiment.py --experiment-data-collection-provoice-remote <carla-machine-ip>
 
+--participantid is given ONCE, on the CARLA machine: the ProVoice machine reads
+it (and the session id) from the bridge, so there is no second place to mistype
+it. The ProVoice side needs only the address to read it FROM -- a bare IP, an
+IP:PORT or a full URL, or nothing at all if PV_BRIDGE_URL is set in that
+shell's environment.
 
+TWO BRIDGES, BOTH ON THE CARLA MACHINE, BOTH STARTED BY --remote
+    scripts/vehicle_state_server.py  :8080  CARLA state -> ProVoice (polled)
+    scripts/provoice_status_server.py :8081  ProVoice's lifecycle -> Drive
+The second one is what makes a split session behave like a single-machine one:
+ProVoice posts 'collection_started' at its first logged frame, so Drive holds
+its LoA windows until then exactly as it holds them for the first line of a
+local raw_data.jsonl, and posts 'provoice_ended' when it exits, on which Drive
+stops the car and shows the end-of-session screen. ProVoice is told where to
+post through the vehicle bridge's /session, so still nothing is typed twice --
+but BOTH inbound ports have to be open on the CARLA machine.
 
+WHAT EACH --experiment- PRESET EXPANDS TO
+Presets set flags and nothing else: every one of them is exactly equivalent to
+the line beside it, and any flag they do not mention (--webcam, --environment,
+--res, --host, ...) can still be added on the same command line.
 
-SPLIT ACROSS TWO MACHINES (--remote): run 2. and 3. as above plus --remote on
-the CARLA machine, then paste the printed command on the ProVoice machine.
+    --experiment-popup
+        = --test-popup --fullscreen
+    --experiment-adaptation
+        = --test-drive --no-popup --fullscreen
+    --experiment-calibration-carla-remote
+        = --fixed --remote --no-popup --fullscreen
+          (--remote alone means "ProVoice runs on the other machine, not
+           here", so --test-drive would add nothing; --no-popup because the
+           baseline drive collects no labels)
+    --experiment-data-collection-carla-remote
+        = --remote --data-collection --random-function --fullscreen
+
+The two ProVoice-machine presets have no equivalent flag spelling, because
+that machine runs neither CARLA nor Drive and this launcher previously had no
+mode for "ProVoice alone". They start ProVoice and nothing else:
+
+    --experiment-calibration-provoice-remote [URL]
+        = ProVoice with --calibration-only, reading vehicle state from
+          <URL>/ and its participant/session ids AND the status-bridge address
+          from <URL>/session. Runs the 180 s baseline, stores it under the
+          participant id the bridge reports, and exits by itself -- which is
+          also what ends the drive on the other machine. Nothing is written to
+          raw_data.jsonl.
+    --experiment-data-collection-provoice-remote [URL]
+        = ProVoice with --data-collection, same id handling. Records
+          raw_data.jsonl only: no decision engine, no interventions, and the
+          participant's stored baseline is reused rather than re-measured.
+          Its first logged frame is what opens the LoA windows over there.
+
+    Neither ProVoice-machine preset starts a bridge of its own: both bridges
+    live on the CARLA machine (see above), so this machine needs no inbound
+    port and no address beyond the one URL given here.
+
+SPLIT ACROSS TWO MACHINES (--remote): the CARLA machine also prints a full
+ProVoice command line for the other machine. The presets above are the short
+way in; that printed line is the long way, and still worth pasting when the run
+needs a flag the presets do not set (a different --modeltype, --environment,
+--w-fcd, ...), since it carries every one of them already filled in.
+
+Either way the session id and the participant id do NOT have to be retyped: the
+vehicle-state bridge publishes both at <url>/session and ProVoice adopts them
+from the URL it is already given. Supplying them anyway is fine -- ProVoice
+checks them against the bridge and REFUSES TO START if they disagree, which is
+the whole point: a mistyped participant id is otherwise invisible until the
+data is analysed.
 """
 
 import html
@@ -339,11 +401,16 @@ def build_drive_cmd(session, args):
         # Drive owns the draw: it is the process that shows the popups, so the
         # pool lives there and only the switch is forwarded.
         *(["--random-function"] if args.random_function else []),
+        # Only under --remote: locally Drive reads both facts itself (the log
+        # for the start, this launcher for the end), and pointing it at a
+        # status file nothing writes would just add a file to ignore.
+        *(["--provoice-status-file", args.status_file] if args.remote else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
 
-def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
+def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
+                       ids_from_bridge=False):
     """Command line for ProVoice.
 
     ``remote_url`` (--remote) is the one case where the result is PRINTED for a
@@ -351,13 +418,22 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
     this same function on purpose: a separately hand-written command line is
     how the two ends end up disagreeing about the session id, the participant
     or the model, and every one of those mismatches only shows up in the data.
+
+    ``ids_from_bridge`` is the ProVoice-machine presets: this launcher is
+    running on the machine that has neither CARLA nor Drive, so it knows
+    NEITHER id. Omitting them is what makes ProVoice adopt the pair the bridge
+    publishes at <url>/session; passing this machine's defaults instead
+    (participantid="001", a session id minted here) would look authoritative
+    and be wrong. ``session`` and ``vehicle_id`` are ignored in that mode.
     """
     return [
         sys.executable,
         "src/ProVoice/main.py",
-        f"session_id={session}",
-        f"vehicle_id={vehicle_id}",
-        f"participantid={args.participantid}",
+        *([] if ids_from_bridge else [
+            f"session_id={session}",
+            f"vehicle_id={vehicle_id}",
+            f"participantid={args.participantid}",
+        ]),
         f"environment={args.environment}",
         f"secondary_task={args.secondary_task}",
         # Under --random-function this is the fallback default, not what the
@@ -397,7 +473,15 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
         *([f"vehicle_state_url={remote_url}",
            f"state_poll_hz={args.bridge_poll_hz}"]
           if remote_url else []),
-        *([f"vehicle_state_url=http://127.0.0.1:{_DEAD_PORT}"]
+        # status_url is deliberately NOT passed here: ProVoice adopts it from
+        # the vehicle bridge's /session along with the two ids, so the printed
+        # command stays about what this run IS rather than how its machines are
+        # wired. Pass status_url=... by hand only to override it (a tunnel).
+        # bridge_session_timeout=0: the dead port has no /session either, and
+        # ProVoice would otherwise spend its startup retrying a URL that exists
+        # to be unreachable. Both ids are on this command line already.
+        *([f"vehicle_state_url=http://127.0.0.1:{_DEAD_PORT}",
+           "bridge_session_timeout=0"]
           if args.provoice_no_carla and not args.vehicle_bridge else []),
         # Bare flags, not key=value: ProVoice parses these with store_true, which
         # rejects an explicit "=value". _normalize_argv passes "-"-prefixed
@@ -411,6 +495,156 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
         # same device -- exactly the failure the restart delay below exists for.
         *(["--webcam"] if args.webcam else []),
     ]
+
+
+# =========================
+# EXPERIMENT PRESETS
+# =========================
+#
+# One flag per phase of the study protocol, because the protocol is what the
+# operator is following at 9am with a participant waiting -- not a flag
+# combination. Each preset does nothing but SET the flags it is documented as
+# setting (see the table in the module docstring), so everything downstream --
+# every conflict check, every warning -- sees exactly what a hand-typed command
+# line would have produced. Nothing here has behaviour of its own.
+#
+# The two CARLA-machine presets and the two ProVoice-machine ones are different
+# in kind: the first pair configures the normal CARLA+Drive(+bridge) run, the
+# second pair runs ProVoice ALONE against a bridge on the other machine, which
+# is a mode this launcher did not have before.
+
+_CARLA_PRESETS = {
+    # attribute name -> {flag: value} applied to the parsed args
+    "experiment_popup": {"test_popup": True, "fullscreen": True},
+    "experiment_adaptation": {"test_drive": True, "no_popup": True,
+                              "fullscreen": True},
+    "experiment_calibration_carla_remote": {
+        "fixed": True, "remote": True, "no_popup": True, "fullscreen": True},
+    "experiment_data_collection_carla_remote": {
+        "remote": True, "data_collection": True, "random_function": True,
+        "fullscreen": True},
+}
+
+_PROVOICE_PRESETS = {
+    # attribute name -> flags for the ProVoice this machine will start alone
+    "experiment_calibration_provoice_remote": {"calibration_only": True},
+    "experiment_data_collection_provoice_remote": {"data_collection": True},
+}
+
+
+def normalize_bridge_url(value: str, default_port: int) -> str:
+    """Accept a bare IP, IP:PORT or a full URL and return a full URL.
+
+    The operator on the ProVoice machine knows one thing about the other
+    machine: its address. Requiring "http://" and the port around it is a
+    typo surface for no information gain, so all three spellings are accepted
+    and normalized here rather than in three places downstream.
+    """
+    v = value.strip().rstrip("/")
+    if "://" in v:
+        # Fully specified: left exactly as given, port included. Appending the
+        # LAN default to an https tunnel URL (which means 443) would break a
+        # URL the operator got right.
+        return v
+    if ":" not in v:
+        v = f"{v}:{default_port}"
+    return "http://" + v
+
+
+def apply_experiment_presets(parser, args) -> None:
+    """Expand any --experiment-* preset into the plain flags it stands for.
+
+    Runs BEFORE every validation and warning in main(), so a preset cannot
+    smuggle a combination past a check that a hand-typed equivalent would hit.
+    Two presets at once is an error rather than a silent merge: they describe
+    different phases of the session, and merging them would produce a run that
+    is neither.
+    """
+    chosen = [name for name in (*_CARLA_PRESETS, *_PROVOICE_PRESETS)
+              if getattr(args, name, None) not in (None, False)]
+    if len(chosen) > 1:
+        parser.error("only one --experiment-* preset at a time; got: "
+                     + ", ".join("--" + n.replace("_", "-") for n in chosen))
+
+    args.provoice_only = False
+    args.bridge_url = None
+    if not chosen:
+        return
+    name = chosen[0]
+
+    if name in _CARLA_PRESETS:
+        overrides = _CARLA_PRESETS[name]
+    else:
+        overrides = _PROVOICE_PRESETS[name]
+        args.provoice_only = True
+        # nargs="?" leaves "" when the flag was given without a value; the
+        # environment variable is the "I run this ten times a day on the same
+        # pair of machines" path.
+        raw = getattr(args, name) or os.environ.get("PV_BRIDGE_URL", "")
+        if not raw:
+            parser.error(
+                "--%s needs the address of the CARLA machine's vehicle-state "
+                "bridge: the participant id, the session id and the vehicle "
+                "state all come from there. Pass it as a bare IP "
+                "(--%s 192.168.1.50), an IP:PORT, or a full URL, or set "
+                "PV_BRIDGE_URL in this shell."
+                % (name.replace("_", "-"), name.replace("_", "-")))
+        args.bridge_url = normalize_bridge_url(raw, args.remote_port)
+
+    for flag, value in overrides.items():
+        setattr(args, flag, value)
+    print("[PRESET] --%s = %s" % (
+        name.replace("_", "-"),
+        " ".join("--" + f.replace("_", "-") for f in overrides)))
+
+
+def run_provoice_only(args) -> None:
+    """ProVoice alone, against a bridge on the machine running CARLA.
+
+    This machine has no CARLA server, no traffic and no Drive, so none of the
+    startup sequence in main() applies: there is no vehicle id to wait for, no
+    session id to mint (the bridge publishes the one Drive is already using)
+    and no local vehicle-state bridge to supervise.
+
+    ProVoice is NOT restarted if it dies. A calibration run restarted halfway
+    would splice two partial baselines, which is why --restart-provoice already
+    refuses to combine with --calibration-only; a data-collection run restarted
+    here would silently re-adopt the ids and keep recording, hiding a crash
+    that the operator needs to see, since the other machine keeps collecting
+    labels either way.
+    """
+    mode = "calibration" if args.calibration_only else "data collection"
+    print(f"[PROVOICE-ONLY] {mode} run; bridge at {args.bridge_url}")
+    print(f"[PROVOICE-ONLY] participant and session ids come from "
+          f"{args.bridge_url}/session — nothing is typed twice.")
+    if args.calibration_only:
+        # Worth stating up front: the baseline is filed under the participant
+        # id, and ProVoice refuses to start without one for exactly this
+        # reason (a 180 s measurement that lands nowhere).
+        print("[PROVOICE-ONLY] ProVoice exits by itself once the baseline is "
+              "stored; nothing is written to raw_data.jsonl during calibration.")
+
+    pm = ProcessManager()
+    cmd = build_provoice_cmd(None, args, None, remote_url=args.bridge_url,
+                             ids_from_bridge=True)
+    try:
+        proc = pm.start(cmd, "PROVOICE", below_normal=True)
+        while True:
+            code = proc.poll()
+            if code is None:
+                time.sleep(1)
+                continue
+            if code == 0:
+                print("[DONE] ProVoice finished cleanly"
+                      + (" — baseline stored" if args.calibration_only else ""))
+                raise SystemExit(0)
+            print(f"[CRASH] PROVOICE exited with code {describe_exit_code(code)}")
+            raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("\n[EXIT] stopping ProVoice...")
+    finally:
+        pm.stop_all()
+        print("[EXIT] experiment stopped")
 
 
 # =========================
@@ -769,6 +1003,18 @@ def main():
                         help="Interface the vehicle-state server binds (--remote). "
                              "0.0.0.0 accepts from the LAN, which is the point; "
                              "127.0.0.1 would only serve a tunnel running here.")
+    parser.add_argument("--status-port", dest="status_port", type=int, default=8081,
+                        help="Port the REVERSE bridge listens on (--remote): "
+                             "scripts/provoice_status_server.py, which receives "
+                             "the remote ProVoice's started/ended signals. Its "
+                             "URL is handed to ProVoice through the vehicle "
+                             "bridge's /session, so it is never typed by hand. "
+                             "Needs the same inbound firewall allowance as "
+                             "--remote-port.")
+    parser.add_argument("--status-file", dest="status_file",
+                        default="provoice_status.json",
+                        help="File the reverse bridge publishes into and Drive "
+                             "polls for those signals. Written atomically.")
     parser.add_argument("--remote-sample-hz", dest="remote_sample_hz", type=float,
                         default=20.0,
                         help="Rate at which the vehicle-state server samples CARLA "
@@ -814,8 +1060,10 @@ def main():
     parser.add_argument("--test-popup", dest="test_popup", action="store_true",
                         help="Teaching mode: open the simulator UI and show LoA "
                              "selection popups straight away, so the participant can "
-                             "practise the control. No traffic, no ProVoice, and the "
-                             "practice selections are not logged.")
+                             "practise the control. Each practice window holds the "
+                             "same TWO consecutive prompts about two different "
+                             "functions as a real one. No traffic, no ProVoice, and "
+                             "the practice selections are not logged.")
     parser.add_argument("--no-popup", dest="no_popup", action="store_true",
                         help="Suppress Drive's LoA selection popups for the whole "
                              "session: no scene freezes and no user labels. ProVoice "
@@ -859,7 +1107,64 @@ def main():
                              "the rPPG sampling rate, so switching mid-study changes "
                              "the HR/RR scale.")
 
+    # --- Protocol presets (see the table in the module docstring) ------------
+    presets = parser.add_argument_group(
+        "experiment presets",
+        "One flag per phase of the study protocol. Each is exactly equivalent "
+        "to the flags listed in its help text, applied before every check "
+        "below, and any other flag can still be added alongside.")
+    presets.add_argument("--experiment-popup", dest="experiment_popup",
+                         action="store_true",
+                         help="Phase 0, teaching the LoA control. "
+                              "= --test-popup --fullscreen")
+    presets.add_argument("--experiment-adaptation", dest="experiment_adaptation",
+                         action="store_true",
+                         help="Phase 1, driver adaptation. "
+                              "= --test-drive --no-popup --fullscreen")
+    presets.add_argument("--experiment-calibration-carla-remote",
+                         dest="experiment_calibration_carla_remote",
+                         action="store_true",
+                         help="Phase 2 on the CARLA machine. = --fixed --remote "
+                              "--no-popup --fullscreen. Give --participantid "
+                              "here; the ProVoice machine reads it off the "
+                              "bridge.")
+    presets.add_argument("--experiment-data-collection-carla-remote",
+                         dest="experiment_data_collection_carla_remote",
+                         action="store_true",
+                         help="Phase 3 on the CARLA machine. = --remote "
+                              "--data-collection --random-function --fullscreen. "
+                              "Give --participantid here.")
+    presets.add_argument("--experiment-calibration-provoice-remote",
+                         dest="experiment_calibration_provoice_remote",
+                         nargs="?", const="", default=None, metavar="BRIDGE",
+                         help="Phase 2 on the ProVoice machine: start ProVoice "
+                              "ALONE in --calibration-only mode against the "
+                              "bridge at BRIDGE (bare IP, IP:PORT or URL; "
+                              "PV_BRIDGE_URL is used when omitted). Participant "
+                              "and session ids come from BRIDGE/session.")
+    presets.add_argument("--experiment-data-collection-provoice-remote",
+                         dest="experiment_data_collection_provoice_remote",
+                         nargs="?", const="", default=None, metavar="BRIDGE",
+                         help="Phase 3 on the ProVoice machine: start ProVoice "
+                              "ALONE in --data-collection mode against BRIDGE. "
+                              "Same id handling as the calibration preset.")
+
     args = parser.parse_args()
+
+    # Expanded first, so every check and warning below judges the flags the
+    # preset stands for rather than the preset itself.
+    apply_experiment_presets(parser, args)
+
+    if args.provoice_only:
+        # Nothing else in main() applies on the ProVoice machine: no CARLA
+        # server to wait for, no Drive, no vehicle id, no local bridge. The
+        # checks below are all about that machinery, so they are not merely
+        # unnecessary here, they would be reasoning about processes that do not
+        # exist.
+        if args.functionname is None:
+            args.functionname = DEFAULT_FUNCTIONNAME
+        run_provoice_only(args)
+        return
 
     if args.calibration_only and args.data_collection:
         parser.error("--calibration-only and --data-collection are mutually exclusive.")
@@ -884,11 +1189,17 @@ def main():
         parser.error("--provoice-no-carla only affects a ProVoice started here, "
                      "and --remote starts none. Pass the diagnostic on the "
                      "ProVoice machine instead.")
-    if args.remote and (args.test_drive or args.test_popup):
-        parser.error("--remote and %s contradict each other: %s exists to run "
-                     "without ProVoice at all, --remote to run it elsewhere."
-                     % (("--test-drive",) * 2 if args.test_drive
-                        else ("--test-popup",) * 2))
+    if args.remote and args.test_popup:
+        parser.error("--remote and --test-popup contradict each other: "
+                     "--test-popup exists to run without ProVoice at all "
+                     "(and without traffic), --remote to run it elsewhere.")
+    # --remote --test-drive is REDUNDANT, not contradictory: both say "no
+    # ProVoice on this machine". Accepted rather than rejected because an
+    # operator mid-session should get their run, not a usage error, over a
+    # flag that changes nothing.
+    if args.remote and args.test_drive:
+        print("[NOTE] --test-drive with --remote does nothing: --remote already "
+              "starts no ProVoice on this machine.")
     if args.restart_provoice and not args.vehicle_bridge:
         # Allowed, because the alternative is losing the session outright, but
         # the odds are poor and the user should not discover that afterwards.
@@ -933,11 +1244,18 @@ def main():
     if args.test_popup and args.calibration_only:
         parser.error("--test-popup and --calibration-only are separate modes: the "
                      "first teaches the control, the second records a baseline.")
-    if args.no_popup and not (args.calibration_only or args.test_drive):
+    if args.no_popup and not (args.calibration_only or args.test_drive
+                              or args.remote):
         # A normal session exists to collect the labels, so suppressing the
         # popups there would produce a run with nothing to show for it.
-        parser.error("--no-popup requires --calibration-only or --test-drive: a normal "
-                     "session has to collect the LoA labels.")
+        #
+        # --remote counts because the calibration phase of a two-machine run is
+        # exactly this: Drive here with no popups, ProVoice measuring the
+        # baseline over there. --calibration-only is a statement about a
+        # ProVoice this launcher starts, and under --remote it starts none, so
+        # it is not available to say it with.
+        parser.error("--no-popup requires --calibration-only, --test-drive or "
+                     "--remote: a normal session has to collect the LoA labels.")
     if args.calibration_only and not args.no_popup:
         # The popup freezes the scene for as long as the driver deliberates, and
         # a baseline recorded while they stare at a menu is not a driving
@@ -975,30 +1293,32 @@ def main():
 
     # Drive decides ProVoice is up by watching data/raw_data.jsonl for a row
     # tagged with this session id. Under --remote that file is written on the
-    # OTHER machine, so the watcher can only ever run out its timeout — three
-    # silent minutes with the participant driving and no windows opening. Skip
-    # the wait by default there, and if a value was asked for explicitly, say
-    # what it will actually do rather than quietly overriding it.
+    # OTHER machine — so the wait used to be skipped there, because a watcher
+    # on a file nobody writes can only run out its timeout.
+    #
+    # The status bridge is what changed that: the remote ProVoice now POSTs
+    # collection_started, Drive reads it out of the status file, and the wait
+    # means the same thing on both sides again. So --remote takes the SAME
+    # default as a local run.
     if args.popup_wait_timeout is None:
-        args.popup_wait_timeout = 0.0 if args.remote else DEFAULT_POPUP_WAIT_TIMEOUT
-    elif args.remote and args.popup_wait_timeout > 0:
-        print("[WARN] --popup-wait-timeout %.0f with --remote: Drive watches a "
-              "LOCAL data/raw_data.jsonl that the remote ProVoice never writes, "
-              "so the first LoA window will simply open %.0f s late. Start "
-              "ProVoice on the other machine BEFORE driving instead."
-              % (args.popup_wait_timeout, args.popup_wait_timeout))
+        args.popup_wait_timeout = DEFAULT_POPUP_WAIT_TIMEOUT
     if args.remote and args.no_popup:
-        print("[WARN] --remote with --no-popup: this machine's only job besides "
-              "serving vehicle state is collecting the LoA labels, and there "
-              "will be none.")
+        # Deliberately stated as a fact with both readings rather than as a
+        # warning: this launcher cannot tell them apart. Whether ProVoice on
+        # the other machine is calibrating (where a label-free drive is the
+        # whole point) or collecting data (where this would waste the session)
+        # is decided over there, by a flag this process never sees.
+        print("[NOTE] --remote with --no-popup: no LoA labels will be recorded "
+              "here. That is the calibration phase; for a data-collection run "
+              "it means the session collects nothing, so drop --no-popup.")
     if args.remote and args.calibration_only:
-        # Locally this launcher watches for ProVoice's clean exit and shuts the
-        # session down; with ProVoice on the other machine there is nothing to
-        # watch, so say who ends the run.
-        print("[WARN] --remote --calibration-only: the remote ProVoice exits by "
-              "itself once the baseline is stored, but this launcher cannot see "
-              "that happen. Stop it with Ctrl-C when the other machine says it "
-              "is done.")
+        # The status bridge reports the remote ProVoice's exit to DRIVE, which
+        # ends the drive and shows the end screen. This launcher process still
+        # keeps CARLA, the traffic and the bridges up, so it is the operator
+        # who decides the phase is over.
+        print("[NOTE] --remote --calibration-only: the remote ProVoice exits by "
+              "itself once the baseline is stored, and Drive will end the drive "
+              "when it reports that. Stop this launcher with Ctrl-C afterwards.")
 
     root = Path.cwd()
 
@@ -1034,6 +1354,36 @@ def main():
             )
 
             time.sleep(6)
+
+        # =========================
+        # START THE REVERSE (STATUS) BRIDGE
+        # =========================
+        # Before Drive, because Drive polls the file this publishes and should
+        # find a fresh record for THIS session there from its first tick.
+        # Scoped to the session id for the same reason the file is republished
+        # empty: a status file left by the previous participant must not be
+        # able to end this drive. Supervised — the signals are one-shot, so a
+        # bridge that died and stayed dead would silently cost the end screen.
+        status_url = None
+        if args.remote:
+            try:
+                Path(args.status_file).unlink()
+                print(f"[CLEANUP] removed stale {args.status_file}")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"[WARN] could not remove {args.status_file}: {e}")
+
+            status_cmd = [
+                sys.executable,
+                "scripts/provoice_status_server.py",
+                "--bind", args.remote_bind,
+                "--port", str(args.status_port),
+                "--out", args.status_file,
+                "--session-id", session,
+            ]
+            pm.start(status_cmd, "STATUS_SERVER", restart=True)
+            status_url = f"http://{outbound_ip()}:{args.status_port}"
 
         # =========================
         # START DRIVE
@@ -1104,6 +1454,17 @@ def main():
                 "--carla-host", args.host,
                 "--carla-port", str(args.port),
                 "--vehicle-id", str(vehicle_id),
+                # Published at /session so the ProVoice on the other machine can
+                # adopt this session's identity from the URL it already has,
+                # instead of depending on a human retyping it. The printed
+                # command below still carries both, and ProVoice cross-checks
+                # them against these — a disagreement is an operator error that
+                # must surface at startup, not in the logs afterwards.
+                "--session-id", session,
+                "--participantid", args.participantid,
+                # And the address of the reverse bridge, so the whole pairing
+                # follows from the ONE url the ProVoice machine is given.
+                *(["--status-url", status_url] if status_url else []),
             ]
             pm.start(server_cmd, "VEHICLE_SERVER", restart=True)
             # It connects to CARLA and caches the map before the first sample
@@ -1125,6 +1486,10 @@ def main():
             print("=" * 72)
             print(f"[REMOTE] vehicle state is served at {remote_url}/")
             print(f"[REMOTE] health/keep-alive counters: {remote_url}/health")
+            print(f"[REMOTE] ProVoice's start/end signals come back to "
+                  f"{status_url}/ (status: {status_url}/status), and Drive here "
+                  f"acts on them: the LoA windows wait for the first, the drive "
+                  f"ends on the second.")
             print("[REMOTE] ProVoice is NOT started here. On the OTHER machine, "
                   "in the project root, run:")
             print()
@@ -1132,11 +1497,18 @@ def main():
             print()
             print("[REMOTE] (drop the 'uv run' if that machine's venv is already "
                   "activated)")
-            print("[REMOTE] The session id above must match; it is what ties "
-                  "this machine's LoA labels to that machine's raw_data.jsonl.")
+            print(f"[REMOTE] session_id={session} participantid="
+                  f"{args.participantid or '(unset)'} are also published at "
+                  f"{remote_url}/session, and ProVoice adopts them from there "
+                  f"when they are absent from its command line. Pasting the line "
+                  f"above is still the safe path — it also pins the model, the "
+                  f"environment and the function, which the bridge does not "
+                  f"carry. What the bridge removes is the failure where those two "
+                  f"ids are retyped and quietly disagree.")
             print("[REMOTE] If the poll never connects, it is almost always the "
                   "Windows firewall on THIS machine: inbound TCP "
-                  f"{args.remote_port} has to be allowed.")
+                  f"{args.remote_port} AND {args.status_port} have to be "
+                  f"allowed (state out, signals back).")
             print("=" * 72)
             print()
         elif args.test_drive or args.test_popup:
@@ -1185,6 +1557,14 @@ def main():
                     if name == "VEHICLE_BRIDGE":
                         print("       Vehicle state is FROZEN at its last values "
                               "until the bridge is back; the run continues.")
+                    elif name == "STATUS_SERVER":
+                        print("       ProVoice's start/end signals cannot arrive "
+                              "until it is back. Signals already received "
+                              "survive (the restarted server reloads the status "
+                              "file for this session), but one SENT during the "
+                              "gap is lost: the sender retries for seconds, not "
+                              "minutes. If ProVoice ends in that window, end the "
+                              "drive here by hand.")
                     elif name == "VEHICLE_SERVER":
                         print("       The remote ProVoice's polls will fail until "
                               "the server is back; it holds its last values and "

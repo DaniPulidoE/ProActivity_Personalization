@@ -9,9 +9,11 @@ LoA Popups:
     (default)    : Periodic LoA selection popups; labels are written to
                    data/user_loa_labels.csv
     --no-popup   : Plain drive, no popups and no labels
-    --test-popup : Practice mode. The first popup opens immediately and they
-                   repeat quickly, so the driver can learn the control. Nothing
-                   is written to data/user_loa_labels.csv
+    --test-popup : Practice mode. The first window opens immediately and they
+                   repeat quickly, so the driver can learn the control. Each
+                   window holds two consecutive prompts about two different
+                   functions, exactly like a real one. Nothing is written to
+                   data/user_loa_labels.csv
 
 LoA Popup Function:
     (default)        : Every popup asks about --functionname, one popup per window
@@ -366,7 +368,30 @@ def _normalize_csv_value(value):
     return value
 
 
+# Set once at startup by --test-popup (see main()). Practice answers teach the
+# control and are not data: a participant's first attempts at a UI they have
+# never seen would otherwise enter the training set as if they were considered
+# preferences, and nothing downstream could tell them apart -- the rows carry no
+# marker for "this was practice", and by design should not gain one.
+#
+# The guard lives HERE, in the only function that writes the file, rather than
+# only at the call site: "these answers are never logged" is the entire promise
+# of the mode, and a promise enforced by every caller remembering to check is
+# one restatement of the popup loop away from being broken.
+_USER_LOA_LOGGING_DISABLED_REASON = None
+
+
+def disable_user_loa_logging(reason):
+    """Turn off ALL writes to data/user_loa_labels.csv for this process."""
+    global _USER_LOA_LOGGING_DISABLED_REASON
+    _USER_LOA_LOGGING_DISABLED_REASON = reason
+
+
 def append_user_loa_selection(selection_row):
+    if _USER_LOA_LOGGING_DISABLED_REASON:
+        print('[INFO] LoA selection NOT written to data/user_loa_labels.csv (%s)'
+              % _USER_LOA_LOGGING_DISABLED_REASON)
+        return
     cwd = os.getcwd()
     labels_path = os.path.join(cwd, 'data', 'user_loa_labels.csv')
     source_headers = _read_csv_headers(labels_path)
@@ -538,13 +563,64 @@ def _last_logged_session_id(path, tail_bytes=65536):
     return None
 
 
-class ProVoiceReadyWatcher(object):
-    """Polls the raw log until ProVoice starts writing frames for this session."""
+# --- The same two facts, when ProVoice runs on another machine ----------------
+# raw_data.jsonl is written on the ProVoice machine, so neither "it started
+# logging" nor "it finished" can be READ here. scripts/provoice_status_server.py
+# receives both as signals and publishes them into this file; the two watchers
+# below read it instead of the log. A file rather than an HTTP poll on purpose:
+# this runs inside a 60 Hz render loop, where a blocking socket read is a
+# dropped frame for the participant.
+PROVOICE_STATUS_FILE = 'provoice_status.json'
 
-    def __init__(self, session_id, timeout_s, poll_s=1.0, path=None):
+
+def _read_status_file(path):
+    """The published status record, or None while there is nothing to read.
+
+    Every failure mode collapses to None -- missing (the server has not started
+    yet), unparseable (a read that raced the atomic replace, which os.replace
+    makes vanishingly unlikely but not impossible on Windows), or unreadable.
+    None always means "no signal yet", never "signal lost", so a bad read costs
+    one poll rather than the channel.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _status_event_ts(path, session_id, key):
+    """Timestamp of `key` in the status file, if it is for THIS session.
+
+    The session check is what stops a status file left by the previous
+    participant from ending this drive the moment it starts. The server scopes
+    itself the same way; this is the second half of that guard, on the side
+    that acts on it.
+    """
+    record = _read_status_file(path)
+    if not record:
+        return None
+    if session_id and (record.get('session_id') or '').strip() != session_id:
+        return None
+    return record.get(key)
+
+
+class ProVoiceReadyWatcher(object):
+    """Polls until ProVoice starts recording for this session.
+
+    Two sources, one meaning. Locally that is the first line of raw_data.jsonl;
+    with ``status_path`` (a --remote run) it is the collection_started signal
+    the ProVoice machine posted. Same poll cadence, same 'ready'/'timeout'
+    contract, so the game loop does not know which one it is waiting on.
+    """
+
+    def __init__(self, session_id, timeout_s, poll_s=1.0, path=None,
+                 status_path=None):
         self.session_id = (session_id or '').strip()
         self.timeout_ms = max(0.0, float(timeout_s)) * 1000.0
         self.poll_ms = poll_s * 1000.0
+        self.status_path = status_path
         self.path = path or os.path.join(os.getcwd(), PROVOICE_RAW_LOG)
         self.started_ms = None
         self._next_poll_ms = 0
@@ -556,16 +632,57 @@ class ProVoiceReadyWatcher(object):
     def waited_s(self, now_ms):
         return 0.0 if self.started_ms is None else (now_ms - self.started_ms) / 1000.0
 
+    def _is_recording(self):
+        if self.status_path:
+            return _status_event_ts(self.status_path, self.session_id,
+                                    'collection_started_ts') is not None
+        return bool(self.session_id) and \
+            _last_logged_session_id(self.path) == self.session_id
+
     def poll(self, now_ms):
         """'waiting' | 'ready' | 'timeout'. Cheap between polls."""
         if self.started_ms is None or now_ms < self._next_poll_ms:
             return 'waiting'
         self._next_poll_ms = now_ms + self.poll_ms
-        if self.session_id and _last_logged_session_id(self.path) == self.session_id:
+        if self._is_recording():
             return 'ready'
         if self.timeout_ms and (now_ms - self.started_ms) >= self.timeout_ms:
             return 'timeout'
         return 'waiting'
+
+
+class ProVoiceEndWatcher(object):
+    """Polls the status file for 'ProVoice has exited' (--remote runs only).
+
+    Local runs need nothing like this: start_experiment.py sees ProVoice's own
+    process end and stops the session. Across two machines that exit is
+    invisible here, and the participant would otherwise keep driving -- and
+    keep answering LoA popups -- with nothing recording the frames those labels
+    describe.
+
+    Polled the whole session, not just at the end: ProVoice ending EARLY (a
+    crash, an operator stop) is exactly the case worth catching, and it is the
+    one that looks normal from the driver's seat.
+    """
+
+    def __init__(self, session_id, status_path, poll_s=1.0):
+        self.session_id = (session_id or '').strip()
+        self.status_path = status_path
+        self.poll_ms = poll_s * 1000.0
+        self._next_poll_ms = 0
+        self.ended = False
+
+    def poll(self, now_ms):
+        if self.ended or not self.status_path or now_ms < self._next_poll_ms:
+            return self.ended
+        self._next_poll_ms = now_ms + self.poll_ms
+        self.ended = _status_event_ts(self.status_path, self.session_id,
+                                      'ended_ts') is not None
+        return self.ended
+
+    def reason(self):
+        record = _read_status_file(self.status_path) or {}
+        return (record.get('ended_reason') or '').strip()
 
 
 # --- Practice popups (--test-popup) -------------------------------------------
@@ -919,6 +1036,61 @@ class StartScreenOverlay(object):
         label = self._button_font.render('START', True, (255, 255, 255))
         label_rect = label.get_rect(center=button_rect.center)
         display.blit(label, label_rect)
+
+
+class SessionEndedOverlay(object):
+    """Terminal screen: ProVoice has stopped recording, so the drive is over.
+
+    ANY wheel button exits, not a specific one -- the participant has just been
+    told the session is finished and should not have to hunt for the right
+    control, and unlike the LoA popup there is no second action to confuse it
+    with. Any key and a mouse click do the same, because a session can end on a
+    machine with no wheel bound (a --keyboard-input run, or a wheel that failed
+    to initialise), and an exit screen that cannot be dismissed would leave the
+    participant staring at a frozen simulator.
+    """
+
+    def __init__(self, width, height, reason=''):
+        self.width = width
+        self.height = height
+        self.reason = (reason or '').strip()
+        self._title_font = pygame.font.Font(pygame.font.get_default_font(), 44)
+        self._text_font = pygame.font.Font(pygame.font.get_default_font(), 26)
+        self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            return 'quit'
+        if event.type in (pygame.JOYBUTTONDOWN, pygame.KEYDOWN,
+                          pygame.MOUSEBUTTONDOWN):
+            return 'quit'
+        return None
+
+    def render(self, display):
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(200)
+        overlay.fill((0, 0, 0))
+        display.blit(overlay, (0, 0))
+
+        title = self._title_font.render('Experiment session ended', True,
+                                        (255, 255, 255))
+        display.blit(title, title.get_rect(
+            center=(self.width // 2, int(self.height * 0.38))))
+
+        hint = self._text_font.render(
+            'Press any button on the steering wheel to exit.', True,
+            (235, 235, 235))
+        display.blit(hint, hint.get_rect(
+            center=(self.width // 2, int(self.height * 0.50))))
+
+        alt = self._small_font.render('(any key also works)', True, (170, 170, 170))
+        display.blit(alt, alt.get_rect(
+            center=(self.width // 2, int(self.height * 0.56))))
+
+        if self.reason:
+            why = self._small_font.render(self.reason, True, (140, 140, 140))
+            display.blit(why, why.get_rect(
+                center=(self.width // 2, int(self.height * 0.63))))
 
 
 def find_weather_presets():
@@ -2329,7 +2501,16 @@ def game_loop(args):
             open_immediately=args.test_popup,
             input_mode=popup_input,
             function_name=getattr(args, 'functionname', ''),
-            function_pool=RANDOM_FUNCTION_POOL if args.random_function else ())
+            # --test-popup gets the pool too, so practice reproduces the shape of
+            # a real window: TWO consecutive prompts about two different
+            # functions, scene frozen across both. Practising a single prompt
+            # would leave the participant meeting the second one for the first
+            # time during data collection, which is the one moment the control
+            # has to be automatic. The pool costs nothing here — practice
+            # answers are never logged (see disable_user_loa_logging), so the
+            # function they were about is not recorded either way.
+            function_pool=(RANDOM_FUNCTION_POOL
+                           if (args.random_function or args.test_popup) else ()))
         start_overlay = StartScreenOverlay(args.width, args.height)
         started = False
         wait_for_provoice = _should_wait_for_provoice(args)
@@ -2338,7 +2519,13 @@ def game_loop(args):
         # Same id the labels are written under, which is exactly what has to be
         # matched in ProVoice's log — a second _current_session_id() call would
         # mint a different one whenever no id was passed in.
-        provoice_watcher = ProVoiceReadyWatcher(session_id, args.popup_wait_timeout)
+        status_path = getattr(args, 'provoice_status_file', None) or None
+        if status_path:
+            status_path = os.path.abspath(status_path)
+        provoice_watcher = ProVoiceReadyWatcher(session_id, args.popup_wait_timeout,
+                                                status_path=status_path)
+        end_watcher = ProVoiceEndWatcher(session_id, status_path)
+        end_overlay = None
         label_context = {
             'session_id': session_id,
             'participantid': getattr(args, 'participantid', ''),
@@ -2358,6 +2545,10 @@ def game_loop(args):
                   f"selections are NOT logged")
         else:
             print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
+        if status_path:
+            print("[INFO] Remote ProVoice signals read from %s: the LoA windows "
+                  "start on collection_started, and the drive ends on "
+                  "provoice_ended." % status_path)
         if not args.no_popup:
             print("[INFO] LoA popup input: %s" % (
                 'steering wheel (paddles move, front button ticks, CONFIRM submits)'
@@ -2369,7 +2560,11 @@ def game_loop(args):
                       % (loa_popup.prompts_per_window, ', '.join(RANDOM_FUNCTION_POOL)))
             else:
                 print("[INFO] 1 prompt per window about '%s'" % loa_popup.function_name)
-            if wait_for_provoice:
+            if wait_for_provoice and status_path:
+                print("[INFO] The first window waits for the remote ProVoice's "
+                      "collection_started signal via %s (giving up after %.0f s)"
+                      % (status_path, args.popup_wait_timeout))
+            elif wait_for_provoice:
                 print("[INFO] The first window waits for ProVoice's first logged frame "
                       "(giving up after %.0f s)" % args.popup_wait_timeout)
             elif not args.test_popup:
@@ -2386,6 +2581,40 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             now_ms = pygame.time.get_ticks()
             events = pygame.event.get()
+
+            # ProVoice on the other machine has exited: from here the drive is
+            # over. Checked BEFORE everything else in the tick so no popup
+            # opens, no label is taken and no input is applied for a stretch of
+            # driving that nothing is recording. Once entered, this state is
+            # terminal -- the only way out is quitting.
+            if end_overlay is None and end_watcher.poll(now_ms):
+                reason = end_watcher.reason()
+                print("[INFO] Remote ProVoice reported it has ended%s — stopping "
+                      "the vehicle and closing the session."
+                      % (" (%s)" % reason if reason else ""))
+                end_overlay = SessionEndedOverlay(args.width, args.height, reason)
+                if loa_popup.active:
+                    # A prompt open at this moment is about a window ProVoice
+                    # already stopped recording; closing it unanswered is
+                    # correct, and _set_world_frozen below keeps the car still
+                    # either way.
+                    loa_popup.close(now_ms)
+                _set_world_frozen(world, True)
+
+            if end_overlay is not None:
+                if isinstance(world.player, carla.Vehicle):
+                    stop_control = carla.VehicleControl()
+                    stop_control.throttle = 0.0
+                    stop_control.brake = 1.0
+                    stop_control.hand_brake = True
+                    world.player.apply_control(stop_control)
+                for event in events:
+                    if end_overlay.handle_event(event) == 'quit':
+                        return
+                world.render(display)
+                end_overlay.render(display)
+                pygame.display.flip()
+                continue
 
             if not started:
                 if isinstance(world.player, carla.Vehicle):
@@ -2607,9 +2836,12 @@ def main():
              'used, deterministically.' % FIXED_SPAWN_POINT_INDEX)
     argparser.add_argument(
         '--test-popup', dest='test_popup', action='store_true',
-        help='Practice mode for teaching the LoA control: the first popup opens as '
-             'soon as the session starts and they repeat every %d s. Selections are '
-             'NOT written to data/user_loa_labels.csv.' % TEST_POPUP_INTERVAL_S)
+        help='Practice mode for teaching the LoA control: the first window opens as '
+             'soon as the session starts and they repeat every %d s. Each window '
+             'holds the same %d consecutive prompts about %d different functions as a '
+             'real one, so the pair is what gets practised. Selections are NOT '
+             'written to data/user_loa_labels.csv.'
+             % (TEST_POPUP_INTERVAL_S, PROMPTS_PER_WINDOW, PROMPTS_PER_WINDOW))
     argparser.add_argument(
         '--no-popup', dest='no_popup', action='store_true',
         help='Suppress the LoA selection popups for the whole session. By default '
@@ -2626,6 +2858,16 @@ def main():
              'does, so the popup one interval later covers a fully logged 20 s. '
              'Driving is not held up, only the windows. 0 disables the wait; ignored '
              'with --test-popup, which runs without ProVoice.')
+    argparser.add_argument(
+        '--provoice-status-file', dest='provoice_status_file', default=None,
+        help='File published by scripts/provoice_status_server.py, for runs where '
+             'ProVoice is on ANOTHER machine (default: %s under --remote). It '
+             'carries the two facts this process cannot observe from here: when '
+             'the remote ProVoice started recording (the LoA windows wait for it, '
+             'exactly as they wait for the first line of raw_data.jsonl locally) '
+             'and when it ended (the vehicle is stopped and the end-of-session '
+             'screen is shown). Unset = single-machine run, both read from the '
+             'log and from the launcher.' % PROVOICE_STATUS_FILE)
     argparser.add_argument(
         '--random-function', dest='random_function', action='store_true',
         help='Draw the function each popup asks about at random from the %d study '
@@ -2656,6 +2898,12 @@ def main():
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '
                         'nothing but popups, the other suppresses them.')
+    if args.test_popup:
+        # Before anything can run, so no ordering inside game_loop can leave a
+        # window where a practice answer reaches the file.
+        disable_user_loa_logging('--test-popup practice mode')
+        print('[INFO] --test-popup: user LoA label logging is DISABLED for this '
+              'process; data/user_loa_labels.csv is not written or created.')
     if args.popup_input == POPUP_INPUT_WHEEL and args.no_wheel:
         argparser.error('--wheel-input needs the steering wheel that --no-wheel '
                         'disables. Drop one of the two.')

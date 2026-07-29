@@ -6,6 +6,10 @@ import time
 import os
 import uuid
 import argparse as ap
+import json
+import threading
+import urllib.error
+import urllib.request
 
 # ── CPU thread budget ────────────────────────────────────────────────────────
 # Must run BEFORE numpy/torch/cv2 are imported: the OpenMP/MKL runtimes size
@@ -291,6 +295,20 @@ def _build_parser() -> ap.ArgumentParser:
                         "Like --vehicle-state-url it means THIS process makes no "
                         "CARLA calls at all, but it reads a file instead of a "
                         "socket, keeping the network stack out of the loop.")
+    p.add_argument("--status-url", dest="status_url", default=None,
+                   help="Reverse bridge on the CARLA machine "
+                        "(scripts/provoice_status_server.py): this process posts "
+                        "'collection_started' at its first logged frame and "
+                        "'provoice_ended' when it exits, so Drive over there "
+                        "knows when to open its LoA windows and when to stop the "
+                        "car. Normally left unset and adopted from the vehicle "
+                        "bridge's /session.")
+    p.add_argument("--bridge-session-timeout", dest="bridge_session_timeout",
+                   type=float, default=15.0,
+                   help="How long to wait for the remote bridge's /session "
+                        "endpoint at startup. Only used with vehicle_state_url. "
+                        "0 skips the fetch entirely, leaving session_id and "
+                        "participantid exactly as given here.")
     p.add_argument("--state-poll-hz", dest="state_poll_hz", type=float, default=2.0,
                    help="How often to poll vehicle_state_url. The 2 Hz default "
                         "is the historical one; start_experiment.py --vehicle-bridge "
@@ -362,6 +380,164 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
     return None
 
 
+def fetch_bridge_session(url: str, timeout: float = 15.0,
+                         request_timeout: float = 3.0) -> dict | None:
+    """Read {session_id, participantid} from the remote bridge's /session.
+
+    In a --remote run the launcher on the CARLA machine mints the session id and
+    holds the participant id, and THIS process has to agree with both or the
+    session's LoA labels and raw frames end up filed under different names. The
+    bridge publishes them; this reads them back, so neither id depends on a
+    human retyping it into a second terminal.
+
+    Retries until ``timeout`` because the two machines are started by hand and
+    in either order: a ProVoice launched first would otherwise get one refused
+    connection and fall back for the rest of the session. This runs ONCE, at
+    startup, so a plain urlopen is right here — the keep-alive machinery in
+    DataCollector exists for the 2 Hz state poll, not for one request.
+
+    Returns None when the bridge never answered, or answered with something
+    unusable (a bridge predating this route 404s). None means "no information",
+    never "no session": the caller keeps whatever it already had.
+    """
+    endpoint = url.rstrip("/") + "/session"
+    deadline = time.monotonic() + max(0.0, timeout)
+    attempt = 0
+    last_err: str | None = None
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(endpoint, timeout=request_timeout) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                info = json.loads(resp.read())
+            if not isinstance(info, dict):
+                raise ValueError(f"expected an object, got {type(info).__name__}")
+            return {
+                # Normalize "" to None here so the caller has one "unknown".
+                "session_id": (info.get("session_id") or None),
+                "participantid": (info.get("participantid") or None),
+                "status_url": (info.get("status_url") or None),
+            }
+        except urllib.error.HTTPError as e:
+            # A routed answer, just not this route: the bridge is older than
+            # this feature. Retrying cannot change that, so stop immediately.
+            print(f"[bridge] {endpoint} -> HTTP {e.code}; this bridge does not "
+                  f"publish session identity. Using the local command line.")
+            return None
+        except Exception as e:  # noqa: BLE001 — startup convenience, never fatal
+            last_err = f"{type(e).__name__}: {e}"
+        if time.monotonic() >= deadline:
+            break
+        if attempt == 1:
+            print(f"[bridge] waiting for {endpoint} ({last_err}) ...")
+        time.sleep(1.0)
+    print(f"[bridge] {endpoint} did not answer within {timeout:.0f}s "
+          f"({last_err}). Using the local command line.")
+    return None
+
+
+def post_status_event(status_url: str, event: str, session_id: str,
+                      participantid: str, reason: str = "",
+                      timeout: float = 3.0, attempts: int = 2) -> bool:
+    """Tell the CARLA machine that collection started, or that we are done.
+
+    The receiver is scripts/provoice_status_server.py; Drive on that machine
+    polls the file it publishes. Both signals are ONE-SHOT and nothing replays
+    them, so each is retried briefly -- but never for long, because both are
+    sent from paths that must not stall: the first from the collection loop,
+    the second from process shutdown.
+
+    Returns whether the server acknowledged. Failure is logged and swallowed:
+    ProVoice's job is to record this participant's data, and it must not lose a
+    session because the other machine's status port was unreachable. The visible
+    cost of a lost signal is on the other end -- Drive falls back to its timeout
+    for the start, and to the operator for the end.
+    """
+    if not status_url:
+        return False
+    endpoint = status_url.rstrip("/") + "/event"
+    body = json.dumps({
+        "event": event,
+        "session_id": session_id or "",
+        "participantid": participantid or "",
+        "reason": reason,
+        "ts": time.time(),
+    }).encode("utf-8")
+    last = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            req = urllib.request.Request(
+                endpoint, data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    resp.read()
+                    print(f"[status] {event} acknowledged by {endpoint}")
+                    return True
+                last = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            # 409 is the server telling us we are the wrong session. Retrying
+            # cannot fix that, and it is worth saying loudly: it means two
+            # sessions are live and one of them is talking to the wrong machine.
+            detail = e.read().decode("utf-8", "replace")[:200]
+            print(f"[status] {event} REJECTED by {endpoint}: HTTP {e.code} {detail}")
+            return False
+        except Exception as e:  # noqa: BLE001 — never fatal, see the docstring
+            last = f"{type(e).__name__}: {e}"
+        if attempt < attempts:
+            time.sleep(0.5)
+    print(f"[status] could not deliver {event} to {endpoint} ({last}). "
+          + ("Drive will fall back to its popup-wait timeout."
+             if event == "collection_started"
+             else "The other machine will NOT show the end-of-session screen; "
+                  "stop the drive there by hand."))
+    return False
+
+
+def resolve_session_identity(session_id_local: str | None,
+                             participantid_local: str | None,
+                             bridge: dict | None) -> tuple[str | None, str | None]:
+    """Reconcile this machine's ids with the ones the bridge publishes.
+
+    Rules, and why:
+
+    * bridge value, nothing local  -> adopt it. This is the point of the whole
+      exercise: `vehicle_state_url=...` alone is enough to join the session.
+    * local value, no bridge value -> keep it. An unreachable or older bridge
+      must not take a run down; that is the same isolation contract the state
+      poller works under (see DataCollector._poll_vehicle_state).
+    * both, and they AGREE         -> fine, and say so, since "the two machines
+      agree" is exactly what the operator wants confirmed.
+    * both, and they DISAGREE      -> raise. Not a bridge failure but an
+      operator error, with two authoritative-looking answers and no way to pick
+      one. Continuing writes this session's data under a name that does not
+      match the LoA labels on the other machine, and nothing downstream would
+      notice. Stopping costs seconds; the alternative costs the session.
+    """
+    resolved = []
+    for field, local in (("session_id", session_id_local),
+                         ("participantid", participantid_local)):
+        remote = (bridge or {}).get(field)
+        local = local or None
+        if remote and local and remote != local:
+            raise SystemExit(
+                f"[FATAL] {field} mismatch: this command line says {local!r}, the "
+                f"vehicle-state bridge says {remote!r}. Those are two different "
+                f"sessions and only one of them matches the LoA labels being "
+                f"recorded on the CARLA machine. Fix the command line, or drop "
+                f"{field} from it and let the bridge supply it "
+                f"(bridge_session_timeout=0 skips the check entirely).")
+        if remote and not local:
+            print(f"[bridge] adopting {field}={remote!r} from the bridge.")
+            resolved.append(remote)
+        else:
+            if remote and local:
+                print(f"[bridge] {field}={local!r} confirmed by the bridge.")
+            resolved.append(local)
+    return resolved[0], resolved[1]
+
+
 def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 2000, timeout: float = 2.0, retries: int = 5):
     """
     Connect to CARLA and return the actor (or None).
@@ -413,7 +589,13 @@ def main():
     modeltype = args.modeltype.lower()  # fcd | state | combined | collection
     state_model = args.state_model.lower()
     w_fcd = args.w_fcd
-    session_id = args.session_id or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    # Everything the operator supplied HERE, before any fallback. PV_SESSION_ID
+    # counts as supplied: on this machine only start_experiment.py sets it, and
+    # it is just as authoritative (and just as wrong, if it disagrees with the
+    # other machine) as the flag. The generated id, by contrast, must not be
+    # invented until the bridge has had its say, or the adoption below could
+    # never happen.
+    session_id = args.session_id or os.getenv("PV_SESSION_ID") or None
     window_sz = args.window  # frame-count cap on the model input (safety bound)
     # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
     # window the checkpoint was trained with (falling back to 20 s for legacy
@@ -429,6 +611,51 @@ def main():
     carla_timeout = args.carla_timeout
     vehicle_state_url = args.vehicle_state_url  # e.g. http://0.tcp.ngrok.io:PORT
     vehicle_state_file = args.vehicle_state_file  # local file bridge (preferred)
+
+    # --- Session identity, from the remote bridge when there is one ----------
+    # Only the HTTP bridge: it is the one that spans two machines, and so the
+    # only one where the ids can drift apart. The file bridge runs beside a
+    # launcher that already sets both.
+    status_url = args.status_url
+    if vehicle_state_url and args.bridge_session_timeout > 0:
+        bridge = fetch_bridge_session(vehicle_state_url,
+                                      timeout=args.bridge_session_timeout)
+        session_id, participantid = resolve_session_identity(
+            session_id, participantid, bridge)
+        # The reverse channel is an ADDRESS, not an identity: two spellings of
+        # the same endpoint are not a session mismatch, so this adopts rather
+        # than reconciling. An explicit --status-url still wins, which is what
+        # makes a tunnel in front of the status server possible.
+        if not status_url and (bridge or {}).get("status_url"):
+            status_url = bridge["status_url"]
+            print(f"[status] adopting status_url={status_url!r} from the bridge.")
+
+    # Last resort, after the bridge has had its chance: a local run, or a bridge
+    # that published nothing. A generated id keeps this session's rows
+    # self-consistent even though nothing else shares it.
+    if not session_id:
+        session_id = f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        if vehicle_state_url:
+            print(f"[WARN] No session id from the command line or the bridge; "
+                  f"generated {session_id}. This machine's raw_data.jsonl will "
+                  f"NOT share a session id with the LoA labels recorded on the "
+                  f"CARLA machine — they can still be joined on timestamps, but "
+                  f"check this is what you meant before driving.")
+    participantid = participantid or ""
+    if args.calibration_only and not participantid:
+        # The baseline is filed as calibration_<participantid>.json, so with no
+        # id DataCollector.save_calibration() finds no path and drops it with a
+        # warning — after the full 180 s measurement. Refuse up front instead:
+        # the whole run would otherwise produce nothing, and the operator would
+        # only learn that at the end of it.
+        raise SystemExit(
+            "[FATAL] --calibration-only with no participant id: the baseline is "
+            "stored per participant, so this run would measure for 180 s and "
+            "then have nowhere to save. Pass participantid=..., or point "
+            "vehicle_state_url at a bridge that publishes one at /session.")
+    if vehicle_state_url and not participantid:
+        print("[WARN] No participant id from the command line or the bridge: "
+              "this session's rows will be recorded with an empty participantid.")
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
     xlstm_log = args.log_path  # e.g. "state_data.log"; empty/unset = disabled
@@ -668,6 +895,29 @@ def main():
             server.should_exit = True
         data_collector.on_calibration_complete = _calibration_finished
 
+    # --- Reverse channel to the CARLA machine --------------------------------
+    # Locally, Drive watches raw_data.jsonl for this session's first line and
+    # starts its LoA windows on it. Split across two machines that file is on
+    # THIS side, so the same fact has to be sent rather than observed.
+    if status_url:
+        print(f"[status] reverse bridge: {status_url} "
+              f"(collection_started at the first logged frame, provoice_ended "
+              f"on exit)")
+
+        def _first_frame():
+            # Off the collection loop: this posts over the network, and that
+            # loop is the one holding the perception cadence. A blocked tick
+            # here would show up as a gap in the very data being announced.
+            threading.Thread(
+                target=post_status_event,
+                args=(status_url, "collection_started", session_id, participantid),
+                name="status-started", daemon=True).start()
+        data_collector.on_first_frame_logged = _first_frame
+    elif vehicle_state_url:
+        print("[status] no reverse bridge (no status_url from the command line "
+              "or the bridge): Drive on the other machine will fall back to its "
+              "popup-wait timeout and will not be told when this run ends.")
+
     data_collector.start()
 
     def handle_exit(_, __):
@@ -696,6 +946,17 @@ def main():
         server.run()
     finally:
         data_collector.stop()
+        # Sent from the finally, so it covers EVERY way this process ends that
+        # leaves Python running: a clean exit, Ctrl-C, the launcher's
+        # CTRL_BREAK, an exception out of server.run(), and the calibration
+        # callback's own shutdown. It cannot cover a hard native fault
+        # (0xC0000005 and friends) -- nothing in this process can -- so the
+        # other machine also keeps its manual stop.
+        if status_url:
+            post_status_event(
+                status_url, "provoice_ended", session_id, participantid,
+                reason=("calibration complete" if args.calibration_only
+                        else "data collection ended"))
         logger.close()
         for _s in (state_engine, fcd_engine, strategy):
             if hasattr(_s, "close"):

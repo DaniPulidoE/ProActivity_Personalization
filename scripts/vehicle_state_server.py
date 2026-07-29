@@ -65,6 +65,26 @@ measured on THIS machine with a monotonic clock. The reader uses that header
 rather than the record's wall-clock "ts" to detect a stalled feed, because the
 two machines' wall clocks do not agree and a few seconds of skew would
 otherwise make a perfectly fresh feed look stale.
+
+--------------------------------------------------------------------------
+SESSION IDENTITY (/session)
+--------------------------------------------------------------------------
+The launcher on THIS machine mints the session id and knows the participant
+id; the ProVoice on the other machine has to end up with the same two strings
+or the session's logs are split between two names and only post-hoc analysis
+notices. Passing them on the command line means a human retypes them, so
+--session-id/--participantid are published here at /session and ProVoice reads
+them from the URL it is already pointed at.
+
+/session also carries --status-url, the address of the REVERSE bridge on this
+machine (scripts/provoice_status_server.py, which carries ProVoice's
+started/ended signals back here). Same reasoning one level up: the ProVoice
+machine is given ONE address, and everything else about the pairing follows
+from it.
+
+Deliberately NOT part of the state record: that record is sampled at --hz and
+its field set is shared verbatim with the file bridge (see the import below),
+whereas this is static, per-process metadata read exactly once at startup.
 """
 
 import argparse
@@ -317,6 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_state()
         elif route in ("/health", "/healthz"):
             self._serve_health()
+        elif route == "/session":
+            self._serve_session()
         else:
             self._respond(404, b'{"error": "not found"}')
 
@@ -335,6 +357,12 @@ class Handler(BaseHTTPRequestHandler):
         self.server.stats.request_served()
         self._respond(200, payload, extra={"X-State-Age": f"{age:.3f}"})
 
+    def _serve_session(self):
+        # Always 200, even when the launcher passed neither id: null means "this
+        # bridge does not know", which the reader can act on, where a 404 would
+        # be indistinguishable from a bridge too old to have this route at all.
+        self._respond(200, json.dumps(self.server.session).encode("utf-8"))
+
     def _serve_health(self):
         sampler = self.server.sampler
         payload, age = sampler.snapshot()
@@ -342,6 +370,10 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({
             "ok": payload is not None and sampler.errors == 0,
             "vehicle_id": sampler.vehicle_id,
+            # Repeated here purely so one curl shows the whole picture; /session
+            # is the endpoint ProVoice reads.
+            "session_id": self.server.session["session_id"],
+            "participantid": self.server.session["participantid"],
             "state_age_s": round(age, 3) if payload is not None else None,
             "samples": sampler.samples,
             "consecutive_errors": sampler.errors,
@@ -392,10 +424,13 @@ class BridgeServer(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 32
 
-    def __init__(self, addr, handler_cls, sampler: VehicleStateSampler, stats: Stats):
+    def __init__(self, addr, handler_cls, sampler: VehicleStateSampler, stats: Stats,
+                 session: dict):
         super().__init__(addr, handler_cls)
         self.sampler = sampler
         self.stats = stats
+        # Fixed for the process lifetime; handler threads only read it, so no lock.
+        self.session = session
 
 
 def main() -> None:
@@ -418,6 +453,21 @@ def main() -> None:
                         help="Skip vehicle_id.txt discovery and pin this actor. "
                              "The launcher passes it, having already read and "
                              "validated the id.")
+    parser.add_argument("--session-id", dest="session_id", default=None,
+                        help="Session id to publish at /session, so the ProVoice "
+                             "on the other machine tags its logs with the SAME id "
+                             "as Drive here instead of minting its own. The "
+                             "launcher passes the id it generated.")
+    parser.add_argument("--participantid", default=None,
+                        help="Participant id to publish at /session. Same reason: "
+                             "retyping it on the other machine is how a session "
+                             "ends up half-labelled.")
+    parser.add_argument("--status-url", dest="status_url", default=None,
+                        help="URL of the REVERSE bridge on this machine "
+                             "(scripts/provoice_status_server.py), published at "
+                             "/session so ProVoice learns where to post its "
+                             "started/ended signals. One address is typed on the "
+                             "ProVoice machine, not two.")
     parser.add_argument("--connect-timeout", type=float, default=60.0,
                         help="How long to wait for vehicle_id.txt when --vehicle-id "
                              "is not given.")
@@ -445,7 +495,15 @@ def main() -> None:
     sampler = VehicleStateSampler(args, stats)
     Handler.timeout = args.idle_timeout
 
-    httpd = BridgeServer((args.bind, args.port), Handler, sampler, stats)
+    # Empty strings normalize to None: an unset id and an id set to "" mean the
+    # same thing to the reader, and only one of them should have to be handled.
+    session = {
+        "session_id": args.session_id or None,
+        "participantid": args.participantid or None,
+        "status_url": args.status_url or None,
+    }
+
+    httpd = BridgeServer((args.bind, args.port), Handler, sampler, stats, session)
     server_thread = threading.Thread(
         target=httpd.serve_forever, kwargs={"poll_interval": 0.5},
         name="http-server", daemon=True)
@@ -454,7 +512,15 @@ def main() -> None:
     server_thread.start()
     print(f"[httpbridge] serving on http://{args.bind}:{args.port}/ "
           f"(HTTP/1.1 keep-alive, sampling CARLA at {args.hz:.1f} Hz)", flush=True)
-    print(f"[httpbridge] endpoints: / (state), /health", flush=True)
+    print(f"[httpbridge] endpoints: / (state), /health, /session", flush=True)
+    if any(session.values()):
+        print(f"[httpbridge] /session publishes session_id={session['session_id']} "
+              f"participantid={session['participantid']} "
+              f"status_url={session['status_url']}", flush=True)
+    else:
+        print("[httpbridge] /session has nothing to publish (no --session-id / "
+              "--participantid given); the ProVoice end will fall back to its own "
+              "command line.", flush=True)
 
     rc = 0
     try:

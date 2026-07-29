@@ -544,6 +544,13 @@ class DataCollector:
         # cannot shut the process down itself (main.py owns the uvicorn server),
         # so the owner installs a callback that does.
         self.on_calibration_complete: Optional[Any] = None
+        # Invoked ONCE, right after the first frame reaches raw_data.jsonl.
+        # Same hand-off as above: this class knows when logging starts, and the
+        # owner decides what that means. In a two-machine run main.py uses it to
+        # tell Drive on the OTHER machine that its LoA windows can begin --
+        # locally Drive watches this same first line in the file itself.
+        self.on_first_frame_logged: Optional[Any] = None
+        self._first_frame_logged = False
         # Transient camera-read failures (warm-up frames, momentary USB glitches)
         # must NOT abort calibration; only give up after this many seconds of
         # UNBROKEN failures. Resets on any successful read.
@@ -1781,6 +1788,19 @@ class DataCollector:
                                 raw_with_decision.pop('bpm_history', None)
                                 raw_with_decision.pop('rr_history', None)
                                 self.logger.log_raw(raw_with_decision)
+                            if not self._first_frame_logged:
+                                # AFTER the write, so the signal can never
+                                # precede the data it announces: a Drive that
+                                # started its windows on this signal would
+                                # otherwise label a window whose first frames
+                                # are not in the file yet.
+                                self._first_frame_logged = True
+                                if self.on_first_frame_logged is not None:
+                                    try:
+                                        self.on_first_frame_logged()
+                                    except Exception as e:  # noqa: BLE001
+                                        print("[DataCollector] first-frame "
+                                              f"callback failed: {e}")
 
             except Exception as e:
                 import traceback; traceback.print_exc()
