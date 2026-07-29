@@ -401,8 +401,10 @@ class BridgeServer(ThreadingHTTPServer):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--bind", default="localhost",
-                        help="ngrok connected to localhost.")
+    parser.add_argument("--bind", default="0.0.0.0",
+                        help="Interface to listen on. 0.0.0.0 accepts from the "
+                             "LAN, which is the point of this bridge; 127.0.0.1 "
+                             "restricts it to this machine.")
     parser.add_argument("--hz", type=float, default=20.0,
                         help="Rate at which CARLA is sampled, independent of how "
                              "often clients poll. Should match the collection "

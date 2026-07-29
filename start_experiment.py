@@ -35,6 +35,21 @@ EXPERIMENT SETUP:
 2. Calibration: --fixed --no-popup --calibration-only --fullscreen --participantid
 3. Inference: --data-collection --participantid --random-function --fullscreen
 
+EXPERIMENT SETUP (remote):
+0. Teaching the LoA control: 
+    CARLA MACHINE:  uv run python start_experiment.py --test-popup --fullscreen
+1. Driver adaptation phase: 
+    CARLA MACHINE:  uv run python start_experiment.py --test-drive --no-popup --fullscreen
+2. Calibration: 
+    CARLA MACHINE:  uv run python start_experiment.py --fixed --test-drive --no-popup --fullscreen --participantid
+    PROVOICE MACHINE: uv run python start_experiment.py --calibration-provoice
+3. Data collection:
+    CARLA MACHINE: uv run python start_experiment.py --remote --data-collection --random-function --participantid 001
+    PROVOICE MACHINE: uv run provoice --data-collection vehicle_state_url= 
+
+
+
+
 SPLIT ACROSS TWO MACHINES (--remote): run 2. and 3. as above plus --remote on
 the CARLA machine, then paste the printed command on the ProVoice machine.
 """
