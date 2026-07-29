@@ -12,6 +12,9 @@ MAIN OPTIONS:
 --data-collection: don't perform calibration, jump directly to data collection, no inference
 --test-drive: don't launch provoice
 --test-popup: teaching mode, simulator UI + immediate LoA popups, nothing logged
+--remote: CARLA + traffic + Drive (with the LoA popups) run HERE and vehicle
+    state is served over HTTP; ProVoice runs on ANOTHER machine and is started
+    there by hand, with the command line this launcher prints
 
 LoA POPUP INTERFACE (pick one; default = wheel if one is attached, else keyboard):
 --wheel-input: paddles move the cursor, front button ticks, CONFIRM row submits
@@ -29,11 +32,15 @@ EXPERIMENT SETUP:
 1. Driver adaptation phase: --test-drive --no-popup --fullscreen
 2. Calibration: --fixed --no-popup --calibration-only --fullscreen --participantid
 3. Inference: --data-collection --participantid --random-function --fullscreen
+
+SPLIT ACROSS TWO MACHINES (--remote): run 2. and 3. as above plus --remote on
+the CARLA machine, then paste the printed command on the ProVoice machine.
 """
 
 import html
 import os
 import re
+import socket
 import sys
 import uuid
 import time
@@ -55,6 +62,46 @@ DEFAULT_FUNCTIONNAME = "Adjust seat positioning"
 # never bound in practice, so connections fail instantly with ECONNREFUSED
 # rather than hanging until a timeout.
 _DEAD_PORT = 1
+
+# Drive's default wait for ProVoice's first logged frame. Resolved late (the
+# flag defaults to None) so "the user asked for this" can be told apart from
+# "nobody said", which --remote needs: there ProVoice logs on a DIFFERENT
+# machine and the wait can only ever time out.
+DEFAULT_POPUP_WAIT_TIMEOUT = 180.0
+
+
+def outbound_ip() -> str:
+    """This machine's LAN address, as the other machine would reach it.
+
+    Connecting a UDP socket sends no packets — it only makes the OS pick the
+    interface it would route through, which is exactly the address to print.
+    gethostname() is not a substitute: on a machine with Hyper-V or several
+    NICs (this one has both) it regularly resolves to a virtual adapter the
+    other machine cannot reach.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def shell_quote(cmd) -> str:
+    """Render a command list so it can be PASTED into a shell and survive.
+
+    Only quoting matters here, and only for spaces: without it
+    `functionname=Adjust seat positioning` arrives as three arguments, ProVoice
+    reports two "unrecognized" tokens, and the run silently proceeds under the
+    default function. Double quotes behave identically in bash, PowerShell and
+    cmd for these values, and none of them contain a quote of their own.
+    """
+    return " ".join(f'"{t}"' if " " in str(t) else str(t) for t in cmd)
 
 
 # =========================
@@ -279,7 +326,15 @@ def build_drive_cmd(session, args):
     ]
 
 
-def build_provoice_cmd(session, args, vehicle_id):
+def build_provoice_cmd(session, args, vehicle_id, remote_url=None):
+    """Command line for ProVoice.
+
+    ``remote_url`` (--remote) is the one case where the result is PRINTED for a
+    human to run on another machine rather than spawned here. It is built by
+    this same function on purpose: a separately hand-written command line is
+    how the two ends end up disagreeing about the session id, the participant
+    or the model, and every one of those mismatches only shows up in the data.
+    """
     return [
         sys.executable,
         "src/ProVoice/main.py",
@@ -319,6 +374,12 @@ def build_provoice_cmd(session, args, vehicle_id):
         *([f"vehicle_state_file={args.bridge_file}",
            f"state_poll_hz={args.bridge_poll_hz}"]
           if args.vehicle_bridge else []),
+        # --remote: the same "no carla.Client in this process" contract as the
+        # file bridge, but the state crosses a network instead of a file, so
+        # THIS process is the one on the other machine.
+        *([f"vehicle_state_url={remote_url}",
+           f"state_poll_hz={args.bridge_poll_hz}"]
+          if remote_url else []),
         *([f"vehicle_state_url=http://127.0.0.1:{_DEAD_PORT}"]
           if args.provoice_no_carla and not args.vehicle_bridge else []),
         # Bare flags, not key=value: ProVoice parses these with store_true, which
@@ -408,11 +469,11 @@ class ProcessManager:
     def restart_supervised(self, name):
         """Relaunch a supervised child that exited. Returns True if relaunched.
 
-        Used for the vehicle-state bridge: it is the only process whose death
-        should not end the session. It holds nothing but a CARLA client and an
-        HTTP server, so a fresh one recovers the vehicle feed within a second,
-        and the alternative -- tearing down a live participant run because a
-        read-only side channel died -- is far worse.
+        Used for the vehicle-state bridge and the --remote HTTP server: those
+        are the processes whose death should not end the session. They hold
+        nothing but a CARLA client and a publisher, so a fresh one recovers the
+        vehicle feed within a second, and the alternative -- tearing down a live
+        participant run because a read-only side channel died -- is far worse.
         """
         info = self.supervised.get(name)
         if info is None or info["gave_up"]:
@@ -656,11 +717,41 @@ def main():
                              "never sees a partial record.")
     parser.add_argument("--bridge-poll-hz", dest="bridge_poll_hz", type=float,
                         default=20.0,
-                        help="How often ProVoice polls the bridge. Defaults to "
+                        help="How often ProVoice polls the vehicle state, for "
+                             "--vehicle-bridge and for the command --remote "
+                             "prints. Defaults to "
                              "20 Hz to match the collection loop; ProVoice's own "
                              "built-in default is 2 Hz, which would sample "
                              "steer/brake ten times slower than a direct CARLA "
                              "read and visibly degrade those features.")
+    parser.add_argument("--remote", action="store_true",
+                        help="TWO-MACHINE setup. This machine runs CARLA, the "
+                             "NPC traffic and Drive with the LoA popups, and "
+                             "publishes vehicle state over HTTP from "
+                             "scripts/vehicle_state_server.py. ProVoice is NOT "
+                             "started here: it runs on the other machine, which "
+                             "polls that URL and holds no CARLA client (the same "
+                             "contract as --vehicle-bridge, over a network "
+                             "instead of a file). The launcher prints the exact "
+                             "ProVoice command line to paste there, with this "
+                             "run's session id already filled in. The server is "
+                             "supervised and restarted if it dies. NOTE: the two "
+                             "halves log to their own machines — the LoA labels "
+                             "land here in data/user_loa_labels.csv, ProVoice's "
+                             "raw_data.jsonl lands there — so the files have to "
+                             "be brought together before the dataset is built.")
+    parser.add_argument("--remote-port", dest="remote_port", type=int, default=8080,
+                        help="Port the vehicle-state server listens on (--remote).")
+    parser.add_argument("--remote-bind", dest="remote_bind", default="0.0.0.0",
+                        help="Interface the vehicle-state server binds (--remote). "
+                             "0.0.0.0 accepts from the LAN, which is the point; "
+                             "127.0.0.1 would only serve a tunnel running here.")
+    parser.add_argument("--remote-sample-hz", dest="remote_sample_hz", type=float,
+                        default=20.0,
+                        help="Rate at which the vehicle-state server samples CARLA "
+                             "(--remote). Independent of how often ProVoice polls: "
+                             "requests are served from the last sample, so CARLA's "
+                             "load no longer depends on the client.")
     parser.add_argument("--restart-provoice", dest="restart_provoice",
                         action="store_true",
                         help="Relaunch ProVoice if it crashes instead of ending "
@@ -721,14 +812,17 @@ def main():
                                   "still steers. Default when no wheel is attached.")
     parser.set_defaults(popup_input=None)
     parser.add_argument("--popup-wait-timeout", dest="popup_wait_timeout",
-                        type=float, default=180.0,
+                        type=float, default=None,
                         help="Seconds Drive waits for ProVoice's first logged frame "
                              "before opening the first LoA window anyway. ProVoice "
                              "needs the better part of a minute to load its models, "
                              "and a window opened before it logs has no driver-state "
                              "data behind it, so its labels are dropped when the "
                              "dataset is built. Driving starts immediately either "
-                             "way; only the windows wait. 0 disables the wait.")
+                             "way; only the windows wait. 0 disables the wait. "
+                             "Default: %.0f, or 0 with --remote, where ProVoice "
+                             "logs on the other machine and the wait could only "
+                             "ever time out." % DEFAULT_POPUP_WAIT_TIMEOUT)
     parser.add_argument("--vehicle-id-timeout", type=float, default=120.0,
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
@@ -744,10 +838,25 @@ def main():
                      "incompatible: a baseline assembled from two partial "
                      "180 s measurements either side of a crash is not a "
                      "baseline. Re-run the calibration instead.")
-    if args.restart_provoice and (args.test_drive or args.test_popup):
+    if args.restart_provoice and (args.test_drive or args.test_popup or args.remote):
         parser.error("--restart-provoice has nothing to restart: %s does not "
                      "start ProVoice." % ("--test-drive" if args.test_drive
-                                          else "--test-popup"))
+                                          else "--test-popup" if args.test_popup
+                                          else "--remote"))
+    if args.remote and args.vehicle_bridge:
+        parser.error("--remote and --vehicle-bridge both publish the vehicle "
+                     "state, for different readers: the bridge feeds a ProVoice "
+                     "on THIS machine, which --remote does not start. Pick the "
+                     "one that matches where ProVoice runs.")
+    if args.remote and args.provoice_no_carla:
+        parser.error("--provoice-no-carla only affects a ProVoice started here, "
+                     "and --remote starts none. Pass the diagnostic on the "
+                     "ProVoice machine instead.")
+    if args.remote and (args.test_drive or args.test_popup):
+        parser.error("--remote and %s contradict each other: %s exists to run "
+                     "without ProVoice at all, --remote to run it elsewhere."
+                     % (("--test-drive",) * 2 if args.test_drive
+                        else ("--test-popup",) * 2))
     if args.restart_provoice and not args.vehicle_bridge:
         # Allowed, because the alternative is losing the session outright, but
         # the odds are poor and the user should not discover that afterwards.
@@ -828,6 +937,33 @@ def main():
     # whether --functionname was actually given.
     if args.functionname is None:
         args.functionname = DEFAULT_FUNCTIONNAME
+
+    # Drive decides ProVoice is up by watching data/raw_data.jsonl for a row
+    # tagged with this session id. Under --remote that file is written on the
+    # OTHER machine, so the watcher can only ever run out its timeout — three
+    # silent minutes with the participant driving and no windows opening. Skip
+    # the wait by default there, and if a value was asked for explicitly, say
+    # what it will actually do rather than quietly overriding it.
+    if args.popup_wait_timeout is None:
+        args.popup_wait_timeout = 0.0 if args.remote else DEFAULT_POPUP_WAIT_TIMEOUT
+    elif args.remote and args.popup_wait_timeout > 0:
+        print("[WARN] --popup-wait-timeout %.0f with --remote: Drive watches a "
+              "LOCAL data/raw_data.jsonl that the remote ProVoice never writes, "
+              "so the first LoA window will simply open %.0f s late. Start "
+              "ProVoice on the other machine BEFORE driving instead."
+              % (args.popup_wait_timeout, args.popup_wait_timeout))
+    if args.remote and args.no_popup:
+        print("[WARN] --remote with --no-popup: this machine's only job besides "
+              "serving vehicle state is collecting the LoA labels, and there "
+              "will be none.")
+    if args.remote and args.calibration_only:
+        # Locally this launcher watches for ProVoice's clean exit and shuts the
+        # session down; with ProVoice on the other machine there is nothing to
+        # watch, so say who ends the run.
+        print("[WARN] --remote --calibration-only: the remote ProVoice exits by "
+              "itself once the baseline is stored, but this launcher cannot see "
+              "that happen. Stop it with Ctrl-C when the other machine says it "
+              "is done.")
 
     root = Path.cwd()
 
@@ -916,9 +1052,59 @@ def main():
             time.sleep(2)
 
         # =========================
+        # START THE REMOTE VEHICLE-STATE SERVER
+        # =========================
+        # Same role as the file bridge — one process owning the CARLA client so
+        # ProVoice never holds one — but the reader is on another machine, so it
+        # is reached over HTTP instead of a file. Supervised for the same
+        # reason: it carries a read-only side channel, and its death must cost a
+        # gap in the vehicle columns rather than the participant's session.
+        if args.remote:
+            server_cmd = [
+                sys.executable,
+                "scripts/vehicle_state_server.py",
+                "--bind", args.remote_bind,
+                "--port", str(args.remote_port),
+                "--hz", str(args.remote_sample_hz),
+                "--carla-host", args.host,
+                "--carla-port", str(args.port),
+                "--vehicle-id", str(vehicle_id),
+            ]
+            pm.start(server_cmd, "VEHICLE_SERVER", restart=True)
+            # It connects to CARLA and caches the map before the first sample
+            # is available; a head start keeps the remote poller from opening
+            # onto a run of 503s.
+            time.sleep(2)
+
+        # =========================
         # START PROVOICE
         # =========================
-        if args.test_drive or args.test_popup:
+        if args.remote:
+            remote_url = f"http://{outbound_ip()}:{args.remote_port}"
+            remote_cmd = build_provoice_cmd(session, args, vehicle_id,
+                                            remote_url=remote_url)
+            # "uv run python", not this machine's interpreter path, which means
+            # nothing on the other machine.
+            remote_cmd[0:1] = ["uv", "run", "python"]
+            print()
+            print("=" * 72)
+            print(f"[REMOTE] vehicle state is served at {remote_url}/")
+            print(f"[REMOTE] health/keep-alive counters: {remote_url}/health")
+            print("[REMOTE] ProVoice is NOT started here. On the OTHER machine, "
+                  "in the project root, run:")
+            print()
+            print("    " + shell_quote(remote_cmd))
+            print()
+            print("[REMOTE] (drop the 'uv run' if that machine's venv is already "
+                  "activated)")
+            print("[REMOTE] The session id above must match; it is what ties "
+                  "this machine's LoA labels to that machine's raw_data.jsonl.")
+            print("[REMOTE] If the poll never connects, it is almost always the "
+                  "Windows firewall on THIS machine: inbound TCP "
+                  f"{args.remote_port} has to be allowed.")
+            print("=" * 72)
+            print()
+        elif args.test_drive or args.test_popup:
             # Drive (+ traffic) only. The vehicle id was still waited for above:
             # it is the signal that Drive finished initialising, and nothing else
             # would catch a Drive that dies during startup.
@@ -964,6 +1150,12 @@ def main():
                     if name == "VEHICLE_BRIDGE":
                         print("       Vehicle state is FROZEN at its last values "
                               "until the bridge is back; the run continues.")
+                    elif name == "VEHICLE_SERVER":
+                        print("       The remote ProVoice's polls will fail until "
+                              "the server is back; it holds its last values and "
+                              "keeps recording everything else. Its persistent "
+                              "connection dies with the process, so it will "
+                              "reconnect on the next poll.")
                     elif name == "PROVOICE":
                         # Worth stating plainly: this is a real hole in the
                         # participant's record, not a hiccup. Reloading torch,

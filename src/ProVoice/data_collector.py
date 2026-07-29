@@ -6,7 +6,9 @@ import os
 import re
 import threading
 import time
+import http.client
 import urllib.request
+import urllib.parse
 import json
 from typing import Any, Dict, Optional, Tuple
 from collections import deque
@@ -288,6 +290,19 @@ class DataCollector:
         # when the bridge is in use — it should track the collection rate, not
         # sit at the old 2 Hz default.
         self._state_poll_interval = 1.0 / max(1e-3, float(state_poll_hz))
+        # ONE HTTP connection, reused for every poll of the remote bridge (see
+        # _http_get_state). urllib.request.urlopen, which this used to call,
+        # opens and tears down a TCP connection per request: at 20 Hz that is
+        # ~36,000 connect/teardown cycles in a 30-minute session, and that
+        # kernel churn is the suspected trigger of the 2026-07-28 machine
+        # bugchecks. Held here rather than in the poller's locals so stop()
+        # can be sure it is closed.
+        self._http_conn = None
+        self._http_path = "/"
+        # Comfortably longer than one poll interval, short enough that a dead
+        # bridge is noticed within a couple of frames rather than stalling the
+        # thread for the default socket timeout.
+        self._state_http_timeout = max(2.0, 3.0 * self._state_poll_interval)
         self._cached_speed: int = 0
         self._cached_steer: int = 0
         self._cached_brake: int = 0
@@ -2232,6 +2247,83 @@ class DataCollector:
                 self._yolo_dets = list(dets or [])
         print("[DataCollector] YOLO distraction worker stopped.")
 
+    def _close_state_connection(self) -> None:
+        """Drop the pooled HTTP connection; the next poll opens a fresh one."""
+        conn, self._http_conn = self._http_conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — already-dead socket
+                pass
+
+    def _http_get_state(self) -> "Tuple[Dict[str, Any], Optional[float]]":
+        """One GET from the remote bridge over a PERSISTENT connection.
+
+        Returns (record, age_seconds). The age comes from the bridge's
+        X-State-Age header, NOT from the record's "ts": ts is the wall clock of
+        the machine running CARLA, and between two machines those clocks
+        disagree by seconds, which would make a perfectly fresh feed look stale
+        (or a frozen one look current). X-State-Age is measured entirely on the
+        bridge with a monotonic clock, so it survives both skew and an NTP
+        step. None means the bridge did not send it (an older server), in which
+        case the caller simply does not staleness-check.
+
+        The connection is kept open across polls, so the steady state is one
+        request on one socket. A bridge restart or an idle timeout closes it
+        from the far end; that failure only shows up on the next use, so a
+        connection we had already used is retried ONCE on a fresh socket rather
+        than being reported as an outage.
+        """
+        last_err = None
+        for _attempt in (0, 1):
+            reused = self._http_conn is not None
+            try:
+                if self._http_conn is None:
+                    parts = urllib.parse.urlsplit(self.vehicle_state_url)
+                    path = parts.path or "/"
+                    if parts.query:
+                        path = f"{path}?{parts.query}"
+                    self._http_path = path
+                    cls = (http.client.HTTPSConnection if parts.scheme == "https"
+                           else http.client.HTTPConnection)
+                    self._http_conn = cls(parts.hostname,
+                                          parts.port,
+                                          timeout=self._state_http_timeout)
+                self._http_conn.request(
+                    "GET", self._http_path,
+                    headers={"Accept": "application/json",
+                             # Explicit, though it is HTTP/1.1's default: this
+                             # header is the whole point of the exercise.
+                             "Connection": "keep-alive"})
+                resp = self._http_conn.getresponse()
+                # Draining the body is what makes the connection reusable — an
+                # unread response leaves the socket mid-message and the next
+                # request would raise ResponseNotReady.
+                body = resp.read()
+                if resp.status != 200:
+                    raise ValueError(f"bridge returned HTTP {resp.status} {resp.reason}")
+                age_hdr = resp.getheader("X-State-Age")
+                age = None
+                if age_hdr is not None:
+                    try:
+                        age = float(age_hdr)
+                    except ValueError:
+                        age = None
+                return json.loads(body), age
+            except ValueError:
+                # A well-formed answer we do not like (503 while the bridge is
+                # still connecting, or unparseable JSON). The connection itself
+                # is fine and retrying immediately would not help.
+                raise
+            except (OSError, http.client.HTTPException) as e:
+                last_err = e
+                self._close_state_connection()
+                if not reused:
+                    # A brand-new connection failing is a real outage, not a
+                    # stale pooled socket: report it instead of hammering.
+                    raise
+        raise last_err  # pragma: no cover — the loop above always returns or raises
+
     def _poll_vehicle_state(self, interval: Optional[float] = None) -> None:
         """Background thread: fetch vehicle state from the bridge.
 
@@ -2257,6 +2349,7 @@ class DataCollector:
         # the vehicle state silently for the rest of the session.
         while self._running:
             try:
+                age = None
                 if self.vehicle_state_path:
                     # read() takes the same advisory lock the bridge holds while
                     # writing, so a half-written record cannot be observed. A
@@ -2267,23 +2360,29 @@ class DataCollector:
                     state = _channel.read()
                     _ts = state.get("ts")
                     if _ts is not None:
+                        # Writer and reader share this machine's clock, so the
+                        # record's own wall-clock stamp gives the true age.
                         age = time.time() - float(_ts)
-                        # Stale means the bridge stopped updating: the fields
-                        # below are then frozen history being written into rows
-                        # as if current, so it has to be said out loud.
-                        if age > max(2.0, 10.0 * interval):
-                            if _stale_since == 0.0:
-                                _stale_since = time.time()
-                            if _fail_streak == 0:
-                                print(f"[DataCollector] Vehicle state is STALE "
-                                      f"({age:.1f}s old) — the bridge has stopped "
-                                      f"publishing; values are frozen.")
-                                _fail_streak = 1
-                            raise ValueError(f"stale vehicle state ({age:.1f}s)")
-                        _stale_since = 0.0
                 else:
-                    with urllib.request.urlopen(self.vehicle_state_url, timeout=2.0) as resp:
-                        state = json.loads(resp.read())
+                    # Remote bridge: ONE connection reused across polls, and an
+                    # age the bridge measured itself — the two machines' wall
+                    # clocks disagree, so "ts" cannot be used here.
+                    state, age = self._http_get_state()
+
+                # Stale means the bridge stopped updating: the fields below are
+                # then frozen history being written into rows as if current, so
+                # it has to be said out loud.
+                if age is not None and age > max(2.0, 10.0 * interval):
+                    if _stale_since == 0.0:
+                        _stale_since = time.time()
+                    if _fail_streak == 0:
+                        print(f"[DataCollector] Vehicle state is STALE "
+                              f"({age:.1f}s old) — the bridge has stopped "
+                              f"publishing; values are frozen.")
+                        _fail_streak = 1
+                    raise ValueError(f"stale vehicle state ({age:.1f}s)")
+                _stale_since = 0.0
+
                 self._cached_speed               = int(state.get("speed_kmh", self._cached_speed))
                 self._cached_brake               = float(state.get("brake", self._cached_brake))
                 self._cached_steer               = float(state.get("steer", self._cached_steer))
@@ -2320,6 +2419,14 @@ class DataCollector:
                 # Drop the cached handle so the next tick reopens. The launcher
                 # restarts a dead bridge, and a stale handle must not stop us
                 # picking the new one up.
+                #
+                # The HTTP connection is deliberately NOT dropped here:
+                # _http_get_state() already closes it for every failure that
+                # implicates the socket, and the failures that reach this point
+                # with a healthy connection (a 503 while the bridge is still
+                # connecting to CARLA, a stale record) would otherwise force a
+                # reconnect per tick — recreating exactly the connection churn
+                # the keep-alive path exists to remove.
                 if _channel is not None:
                     try:
                         _channel.close()
@@ -2335,7 +2442,20 @@ class DataCollector:
                 print(f"[DataCollector] Vehicle-state poller: unexpected "
                       f"{type(e).__name__}: {e} — continuing with cached values.")
                 _channel = None
+                # Unknown failure: the connection's state is unknown too, so
+                # start over rather than reuse something possibly mid-message.
+                self._close_state_connection()
             time.sleep(interval)
+
+        # Owning thread closes what it opened, so the socket and the file handle
+        # are released at stop() rather than at interpreter teardown.
+        self._close_state_connection()
+        if _channel is not None:
+            try:
+                _channel.close()
+            except Exception:  # noqa: BLE001
+                pass
+        print("[DataCollector] Vehicle-state poller stopped.")
 
     def start(self) -> None:
         if self._running:
@@ -2373,7 +2493,8 @@ class DataCollector:
         if self.vehicle_state_url or self.vehicle_state_path:
             self._state_poll_thread = threading.Thread(target=self._poll_vehicle_state, daemon=True)
             self._state_poll_thread.start()
-            print(f"[DataCollector] Vehicle state polling started → {self.vehicle_state_url}")
+            print(f"[DataCollector] Vehicle state polling started → "
+                  f"{self.vehicle_state_path or self.vehicle_state_url}")
 
     def stop(self) -> None:
         # main.py calls stop() from the SIGINT handler and again from its
