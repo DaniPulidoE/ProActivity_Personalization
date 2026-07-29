@@ -25,6 +25,11 @@ LoA Popup Input (which interface answers the popup):
                        under it, CONFIRM submits. Default when a wheel is bound.
     --keyboard-input : Number keys 0-4 tick a level, the same number again unticks
                        it, ENTER confirms. Default when no wheel is bound.
+    Either mode      : the last row, NO INPUT (or the N key), dismisses a prompt
+                       WITHOUT writing a label -- the failsafe for a window the
+                       driver cannot answer honestly. A missing label is data
+                       the analysis simply does not have; a guessed one is data
+                       it cannot tell from a real answer.
 
 Basic Controls (available in both modes):
     W            : throttle
@@ -487,6 +492,20 @@ LOA_LABELS = (
 # the cursor on a dedicated row separates the two without a second button.
 CONFIRM_ROW = len(LOA_LABELS)
 
+# ...and of the "no input" row below it: dismiss this prompt WITHOUT writing a
+# label. The failsafe for a window the driver cannot honestly answer -- they
+# were mid-manoeuvre when the scene froze, they missed what happened, the
+# prompt caught them looking away. The alternative is not "no data": it is a
+# guessed label, indistinguishable from a considered one in
+# user_loa_labels.csv and quietly wrong in the training set. A dropped window
+# costs ~20 s of one session; a fabricated label is in the data forever.
+#
+# LAST in the cursor order on purpose. It sits past CONFIRM, so reaching it is
+# deliberate -- the driver who overshoots CONFIRM lands here and can paddle
+# straight back, where an entry BEFORE the LoA rows would be one stray paddle
+# press away from discarding a real answer.
+NO_INPUT_ROW = CONFIRM_ROW + 1
+
 
 # --- Which interface answers the popup ----------------------------------------
 # The two are experiment conditions, not a preference: 'wheel' keeps the hands on
@@ -806,17 +825,20 @@ class LoASelectionPopup(object):
     def _move(self, direction):
         """Move the cursor, entering the list from whichever end was pressed.
 
-        The cursor spans the five LoA rows plus a trailing CONFIRM row, because
-        the wheel only has one free front button: it toggles the LoA under the
-        cursor, and submits when the cursor is parked on CONFIRM.
+        The cursor spans the five LoA rows plus the trailing CONFIRM and NO
+        INPUT rows, because the wheel only has one free front button: it
+        toggles the LoA under the cursor, and acts when the cursor is parked on
+        one of the two trailing rows.
         """
         if self.selected is None:
             # Enter on an actual LoA row from either end. Landing on CONFIRM
             # first would put the cursor on a row that does nothing until
-            # something is ticked, which reads as an unresponsive control.
+            # something is ticked, which reads as an unresponsive control —
+            # and entering on NO INPUT would put the discard under the very
+            # first press.
             self.selected = 0 if direction > 0 else len(LOA_LABELS) - 1
         else:
-            self.selected = max(0, min(CONFIRM_ROW, self.selected + direction))
+            self.selected = max(0, min(NO_INPUT_ROW, self.selected + direction))
 
     def _toggle(self, loa):
         if loa in self.chosen:
@@ -825,12 +847,23 @@ class LoASelectionPopup(object):
             self.chosen.add(loa)
 
     def _activate(self):
-        """Act on the cursor row. Returns the submitted LoAs, or None."""
+        """Act on the cursor row.
+
+        Returns the (action, payload) pair handle_event hands back, or None
+        when the press only changed state (ticking a level, or a CONFIRM with
+        nothing ticked).
+        """
         if self.selected is None:
             return None
+        if self.selected == NO_INPUT_ROW:
+            # Discard: whatever was ticked goes with it, deliberately. Half an
+            # answer from a window the driver could not follow is exactly the
+            # thing this row exists to keep out of the data.
+            return 'skip', None
         if self.selected == CONFIRM_ROW:
             # Submitting nothing would write an empty label, so it is a no-op.
-            return sorted(self.chosen) if self.chosen else None
+            # NO INPUT is the way to answer nothing on purpose, and it says so.
+            return ('select', sorted(self.chosen)) if self.chosen else None
         self._toggle(self.selected)
         return None
 
@@ -856,6 +889,11 @@ class LoASelectionPopup(object):
                 if self.chosen:
                     return 'select', sorted(self.chosen)
                 return None, None
+            if event.key == K_n:
+                # Live in BOTH modes, like the number keys above: the wheel can
+                # be unmapped or drop out mid-session, and a failsafe reachable
+                # only through the control that failed is not a failsafe.
+                return 'skip', None
             if self.input_mode == POPUP_INPUT_KEYBOARD:
                 # Numbers and ENTER are the entire interface here; the cursor
                 # exists only to give the wheel's single button something to
@@ -866,9 +904,9 @@ class LoASelectionPopup(object):
             elif event.key in (K_RIGHT, K_d):
                 self._move(1)
             elif event.key == K_SPACE:
-                submitted = self._activate()
-                if submitted:
-                    return 'select', submitted
+                acted = self._activate()
+                if acted:
+                    return acted
             return None, None
 
         # Quitting from the rim works in both modes, exactly as it does on the
@@ -895,9 +933,9 @@ class LoASelectionPopup(object):
                 self._move(1)           # right paddle -> higher LoA
             elif (LOA_WHEEL_BUTTON_CONFIRM is not None
                     and event.button == LOA_WHEEL_BUTTON_CONFIRM):
-                submitted = self._activate()
-                if submitted:
-                    return 'select', submitted
+                acted = self._activate()
+                if acted:
+                    return acted
 
         return None, None
 
@@ -908,14 +946,16 @@ class LoASelectionPopup(object):
         display.blit(overlay, (0, 0))
 
         if self.input_mode != POPUP_INPUT_WHEEL:
-            hint = 'Number keys 0-4 tick a level (same key again unticks)  -  ENTER confirms'
+            hint = ('Number keys 0-4 tick a level (same key again unticks)  -  '
+                    'ENTER confirms  -  N = no input')
         elif self.wheel_mapped:
-            hint = 'Paddles move  -  front button ticks a level  -  then pick CONFIRM'
+            hint = ('Paddles move  -  front button ticks a level  -  '
+                    'then pick CONFIRM (or NO INPUT)')
         else:
             # Unmapped buttons would make the whole wheel feel dead; say so
             # rather than leaving the driver pressing an inert control.
             hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
-                    'Use number keys 0-4 for now.')
+                    'Use number keys 0-4 and ENTER, or N for no input.')
 
         header = [
             (self._title_font, 'Level of Proactivity Selection Required', (255, 255, 255)),
@@ -986,11 +1026,33 @@ class LoASelectionPopup(object):
         rect = surface.get_rect(center=(self.width // 2, y + 12))
         display.blit(surface, rect)
 
+        # The failsafe row. Muted grey unless the cursor is on it: it has to be
+        # findable when it is needed and unremarkable the rest of the time,
+        # because a discard that looks as inviting as CONFIRM is one a tired
+        # participant will start reaching for.
+        no_input_label = ('NO INPUT - discard this question, nothing is saved'
+                          if self.input_mode == POPUP_INPUT_WHEEL
+                          else 'Press N for no input - discard this question, '
+                               'nothing is saved')
+        if self.selected == NO_INPUT_ROW:
+            no_input_label = '> %s <' % no_input_label
+            no_input_colour = (255, 170, 90)
+        else:
+            no_input_colour = (140, 140, 140)
+        surface = self._small_font.render(no_input_label, True, no_input_colour)
+        rect = surface.get_rect(center=(self.width // 2, y + 52))
+        display.blit(surface, rect)
+
 
 class StartScreenOverlay(object):
-    def __init__(self, width, height):
+    def __init__(self, width, height, has_wheel=False):
         self.width = width
         self.height = height
+        # Only used to word the hint. The CONFIRM button is accepted either
+        # way -- an unbound wheel simply never sends the event -- so this
+        # decides what the screen PROMISES, and promising a control that is
+        # not attached is worse than not mentioning it.
+        self.has_wheel = has_wheel
         self._title_font = pygame.font.Font(pygame.font.get_default_font(), 40)
         self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
         self._button_font = pygame.font.Font(pygame.font.get_default_font(), 28)
@@ -1005,10 +1067,21 @@ class StartScreenOverlay(object):
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             return 'quit'
-        if (event.type == pygame.JOYBUTTONDOWN
-                and WHEEL_BUTTON_QUIT is not None
-                and event.button == WHEEL_BUTTON_QUIT):
-            return 'quit'
+        if event.type == pygame.JOYBUTTONDOWN:
+            # QUIT first: the two are distinct buttons, but checking the
+            # destructive one first means a future remap that collides can
+            # only ever fail safe.
+            if (WHEEL_BUTTON_QUIT is not None
+                    and event.button == WHEEL_BUTTON_QUIT):
+                return 'quit'
+            # The same button that submits an LoA prompt also starts the drive.
+            # One button for "confirm", wherever the participant meets it: they
+            # are taught it in the practice phase and then use it every 20 s all
+            # session, so requiring the mouse for the one screen that comes
+            # first is the odd case, not this.
+            if (LOA_WHEEL_BUTTON_CONFIRM is not None
+                    and event.button == LOA_WHEEL_BUTTON_CONFIRM):
+                return 'start'
         if event.type == pygame.KEYDOWN and event.key == K_ESCAPE:
             return 'quit'
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -1026,7 +1099,10 @@ class StartScreenOverlay(object):
         title_rect = title.get_rect(center=(self.width // 2, int(self.height * 0.35)))
         display.blit(title, title_rect)
 
-        hint = self._text_font.render('Click Start to begin driving.', True, (220, 220, 220))
+        hint = self._text_font.render(
+            'Press the CONFIRM button on the wheel, or click Start, to begin driving.'
+            if self.has_wheel else 'Click Start to begin driving.',
+            True, (220, 220, 220))
         hint_rect = hint.get_rect(center=(self.width // 2, int(self.height * 0.45)))
         display.blit(hint, hint_rect)
 
@@ -2511,7 +2587,8 @@ def game_loop(args):
             # function they were about is not recorded either way.
             function_pool=(RANDOM_FUNCTION_POOL
                            if (args.random_function or args.test_popup) else ()))
-        start_overlay = StartScreenOverlay(args.width, args.height)
+        start_overlay = StartScreenOverlay(args.width, args.height,
+                                           has_wheel=controller.has_wheel)
         started = False
         wait_for_provoice = _should_wait_for_provoice(args)
         popups_armed = False
@@ -2526,6 +2603,7 @@ def game_loop(args):
                                                 status_path=status_path)
         end_watcher = ProVoiceEndWatcher(session_id, status_path)
         end_overlay = None
+        skipped_prompts = 0
         label_context = {
             'session_id': session_id,
             'participantid': getattr(args, 'participantid', ''),
@@ -2678,6 +2756,22 @@ def game_loop(args):
                     action, selected_loa = loa_popup.handle_event(event)
                     if action == 'quit':
                         return
+                    if action == 'skip':
+                        # NO INPUT: the driver could not answer this window
+                        # honestly. Nothing is appended -- that is the whole
+                        # point -- so the window simply leaves no label, exactly
+                        # as if the prompt had never opened. Counted and printed
+                        # because a participant who starts skipping repeatedly
+                        # is telling the experimenter something.
+                        skipped_prompts += 1
+                        print("[INFO] NO INPUT for window %d prompt %d ('%s') "
+                              "- no label written (%d skipped so far)"
+                              % (loa_popup.window_idx, loa_popup.prompt_in_window,
+                                 loa_popup.function_name, skipped_prompts))
+                        world.hud.notification('No input recorded for that question',
+                                               seconds=3.0)
+                        _advance_or_close(loa_popup, world, now_ms)
+                        break
                     if action == 'select':
                         if args.test_popup:
                             # Practice answers teach the control, they are not
@@ -2883,15 +2977,17 @@ def main():
         const=POPUP_INPUT_WHEEL,
         help='Answer the LoA popups from the steering wheel: the paddles move the '
              'cursor, the front button ticks the level under it, and the CONFIRM row '
-             'submits. Default when a wheel is bound. The number keys stay live as a '
-             'fallback in case the rim buttons are unmapped.')
+             'submits. The row below it, NO INPUT, dismisses the prompt without '
+             'writing a label. Default when a wheel is bound. The number keys (and N '
+             'for no input) stay live as a fallback in case the rim buttons are '
+             'unmapped.')
     popup_input_group.add_argument(
         '--keyboard-input', dest='popup_input', action='store_const',
         const=POPUP_INPUT_KEYBOARD,
         help='Answer the LoA popups from the keyboard: number keys 0-4 tick a level, '
-             'pressing the same number again unticks it, ENTER confirms. The popup '
-             'ignores the wheel in this mode (it still steers). Default when no wheel '
-             'is bound.')
+             'pressing the same number again unticks it, ENTER confirms, and N '
+             'dismisses the prompt without writing a label. The popup ignores the '
+             'wheel in this mode (it still steers). Default when no wheel is bound.')
     argparser.set_defaults(popup_input=POPUP_INPUT_AUTO)
     args = argparser.parse_args()
 
