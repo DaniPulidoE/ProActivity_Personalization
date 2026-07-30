@@ -1437,10 +1437,27 @@ class World(object):
         # blueprint = random.choice(blueprint_list)
         # for vehicle_model in blueprint_list:
         #     print(vehicle_model)
-        # Use a fixed vehicle blueprint -- vehicle.dodge.charger
-        blueprint = self.world.get_blueprint_library().find('vehicle.dodge.charger')
-        if blueprint is None:
-            raise ValueError("Couldn't find blueprint 'vehicle.dodge.charger'")
+        # Use a fixed vehicle blueprint -- the Lincoln MKZ.
+        #
+        # Chosen for its brakes. Braking strength is baked into each blueprint's
+        # wheel asset and cannot be changed at runtime: on CARLA 0.10 the
+        # per-wheel fields of VehiclePhysicsControl are effectively read-only
+        # (apply_physics_control accepts the write, ticks, and leaves the wheels
+        # array unchanged -- verified with scripts/check_braking.py probe). So
+        # the blueprint IS the setting. Measured stock peak deceleration across
+        # the whole fleet (scripts/check_braking.py blueprints):
+        #     vehicle.dodge.charger   5.7 m/s^2  (0.58 g)  -- previous car
+        #     vehicle.lincoln.mkz*    6.6 m/s^2  (0.68 g)  -- best sedan
+        # Same vehicle class, so sight lines and body size are unchanged. Still
+        # short of the 8-10 m/s^2 a real car does; that gap is not closable by
+        # blueprint choice.
+        #
+        # Matched by prefix because the id carries a year suffix that differs
+        # between CARLA releases (mkz_2017 / mkz_2020).
+        mkz = self.world.get_blueprint_library().filter('vehicle.lincoln.mkz*')
+        if not mkz:
+            raise ValueError("Couldn't find a 'vehicle.lincoln.mkz*' blueprint")
+        blueprint = mkz[0]
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('terramechanics'):
             blueprint.set_attribute('terramechanics', 'true')
