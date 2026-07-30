@@ -388,6 +388,112 @@ def probe_writes(vehicle, ticker, client):
 
 
 # ==============================================================================
+# -- blueprint scan ------------------------------------------------------------
+# ==============================================================================
+
+
+def implied_decel(pc):
+    """Peak deceleration the stock brake torque allows, m/s^2.
+
+    Sum of per-wheel braking force (torque / radius) over the wheels the brake
+    actually acts on, divided by mass. wheel_radius is centimetres in 0.10.
+    """
+    force = 0.0
+    braked = 0
+    for w in pc.wheels:
+        r = w.wheel_radius / 100.0
+        if r > 0 and w.affected_by_brake:
+            force += w.max_brake_torque / r
+            braked += 1
+    return (force / pc.mass if pc.mass > 0 else 0.0), braked
+
+
+def scan_blueprints(world, ticker, args):
+    """Stock brake torque of every vehicle blueprint, since it cannot be written.
+
+    Each blueprint is spawned, measured and destroyed. Slow but it is the only
+    way to read physics -- get_physics_control is an actor method, and the
+    blueprint carries no brake attributes.
+    """
+    bps = sorted(world.get_blueprint_library().filter('vehicle.*'),
+                 key=lambda b: b.id)
+    spawn_points = world.get_map().get_spawn_points()
+    if not spawn_points:
+        print("[FAIL] Map has no spawn points.")
+        return None
+    print("Spawning %d vehicle blueprints one at a time to read stock physics.\n"
+          % len(bps))
+
+    rows = []
+    for i, bp in enumerate(bps):
+        vehicle = None
+        for k in range(min(len(spawn_points), 12)):
+            sp = spawn_points[(args.spawn_index + i + k) % len(spawn_points)]
+            vehicle = world.try_spawn_actor(bp, sp)
+            if vehicle is not None:
+                break
+        if vehicle is None:
+            print("  [skip] %-40s could not spawn" % bp.id)
+            continue
+        try:
+            ticker.step()
+            pc = vehicle.get_physics_control()
+            a, braked = implied_decel(pc)
+            w0 = pc.wheels[0] if pc.wheels else None
+            rows.append({
+                'id': bp.id,
+                'a': a,
+                'mass': pc.mass,
+                'wheels': len(pc.wheels),
+                'braked': braked,
+                'torque': w0.max_brake_torque if w0 else 0.0,
+                'radius': w0.wheel_radius if w0 else 0.0,
+            })
+        except Exception as e:
+            print("  [skip] %-40s %s" % (bp.id, e))
+        finally:
+            vehicle.destroy()
+            ticker.step()
+
+    if not rows:
+        print("[FAIL] Nothing could be measured.")
+        return None
+
+    rows.sort(key=lambda r: -r['a'])
+    print("%-42s %7s %8s %7s %6s %7s" %
+          ("blueprint", "decel", "torque", "mass", "wheels", "radius"))
+    print("%-42s %7s %8s %7s %6s %7s" %
+          ("", "m/s^2", "Nm", "kg", "brk/all", "cm"))
+    print("-" * 82)
+    for r in rows:
+        mark = "  <-- usable" if 7.5 <= r['a'] <= 11.0 else ""
+        star = " *" if r['id'] == VEHICLE_BP else ""
+        print("%-42s %7.2f %8.0f %7.0f  %d/%-4d %6.1f%s%s"
+              % (r['id'], r['a'], r['torque'], r['mass'],
+                 r['braked'], r['wheels'], r['radius'], mark, star))
+    print("-" * 82)
+    print("* = the car the study currently uses")
+    print()
+
+    usable = [r for r in rows if 7.5 <= r['a'] <= 11.0 and r['wheels'] == 4]
+    if usable:
+        print("[ OK ] %d four-wheeled blueprint(s) brake like a real car. Best fit:"
+              % len(usable))
+        for r in usable[:5]:
+            print("         %-40s %.2f m/s^2" % (r['id'], r['a']))
+        print()
+        print("       Switching the study car to one of these is a one-line change")
+        print("       in World.restart(). Do it now, during pilot, and freeze it.")
+    else:
+        best = rows[0]
+        print("[FAIL] No blueprint brakes in the 7.5-11 m/s^2 band. The strongest")
+        print("       is %s at %.2f m/s^2." % (best['id'], best['a']))
+        print("       Changing the car cannot fix this; the supplementary braking")
+        print("       force is the remaining option.")
+    return rows
+
+
+# ==============================================================================
 # -- physics -------------------------------------------------------------------
 # ==============================================================================
 
@@ -619,7 +725,7 @@ def _report_trace(trace, t_first_drop, v0, args):
     return mean_a
 
 
-def run_carla_modes(args, do_physics, do_test, do_probe=False):
+def run_carla_modes(args, do_physics, do_test, do_probe=False, do_scan=False):
     try:
         client = connect(args)
     except Exception as e:
@@ -635,6 +741,10 @@ def run_carla_modes(args, do_physics, do_test, do_probe=False):
     print()
 
     ticker = Ticker(world, self_tick=args.self_tick)
+
+    if do_scan:
+        return scan_blueprints(world, ticker, args)
+
     spawned = None
     try:
         vehicle = find_hero(world) if args.use_hero else None
@@ -700,7 +810,8 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', nargs='?', default='all',
-                   choices=['all', 'pedal', 'physics', 'test', 'probe'],
+                   choices=['all', 'pedal', 'physics', 'test', 'probe',
+                            'blueprints'],
                    help='which check to run (default: all)')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=2000)
@@ -739,14 +850,15 @@ def main():
         run_pedal(args)
         print()
 
-    if args.mode in ('all', 'physics', 'test', 'probe'):
+    if args.mode in ('all', 'physics', 'test', 'probe', 'blueprints'):
         print("=" * 68)
         print("CARLA  -- what the simulator does with the brake input")
         print("=" * 68)
         run_carla_modes(args,
                         do_physics=args.mode in ('all', 'physics', 'test', 'probe'),
                         do_test=args.mode in ('all', 'test'),
-                        do_probe=args.mode == 'probe')
+                        do_probe=args.mode == 'probe',
+                        do_scan=args.mode == 'blueprints')
 
 
 if __name__ == '__main__':
