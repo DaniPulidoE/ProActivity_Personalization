@@ -12,7 +12,8 @@ MAIN OPTIONS:
 --data-collection: don't perform calibration, jump directly to data collection, no inference
 --test-drive: don't launch provoice
 --webcam: use the external USB webcam instead of the laptop's built-in camera
-    (ProVoice probes indices 0-4 and takes the lowest that opens above 0)
+    (ProVoice uses camera index 1 and refuses to start if nothing is there;
+     index 0 is the built-in one)
 --test-popup: teaching mode, simulator UI + immediate LoA popups, nothing logged
 --remote: CARLA + traffic + Drive (with the LoA popups) run HERE and vehicle
     state is served over HTTP; ProVoice runs on ANOTHER machine and is started
@@ -1216,10 +1217,10 @@ def main():
                         help="How long to wait for Drive to spawn the vehicle and write "
                              "vehicle_id.txt before giving up.")
     parser.add_argument("--webcam", action="store_true",
-                        help="Tell ProVoice to probe camera indices 0-4 and use the "
-                             "lowest that opens above 0 — the external webcam on a "
-                             "laptop, where index 0 is the built-in one. Without it "
-                             "ProVoice always takes index 0. Keep this setting FIXED "
+                        help="Tell ProVoice to use camera index 1 — the external USB "
+                             "webcam, where index 0 is the built-in one. ProVoice "
+                             "refuses to start if index 1 delivers no frame. Without "
+                             "it ProVoice always takes index 0. Keep this setting FIXED "
                              "across all participants: the two cameras differ in "
                              "framing and frame rate, and the achieved frame rate is "
                              "the rPPG sampling rate, so switching mid-study changes "
