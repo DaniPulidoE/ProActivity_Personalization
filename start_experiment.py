@@ -176,6 +176,21 @@ def outbound_ip() -> str:
         s.close()
 
 
+def advertised_host(args) -> str:
+    """The address to hand the other machine: --remote-host, else the guess.
+
+    Worth pinning whenever the two machines are joined by a dedicated link.
+    outbound_ip() answers "which interface reaches the internet", and on a rig
+    with Wi-Fi for the internet and Ethernet for the pairing, that is precisely
+    the wrong one -- the URLs would name an address the other machine may not
+    route to at all, and the symptom is a POST that TIMES OUT rather than
+    anything that names the cause.
+    """
+    if args.remote_host:
+        return args.remote_host.strip()
+    return outbound_ip()
+
+
 def shell_quote(cmd) -> str:
     """Render a command list so it can be PASTED into a shell and survive.
 
@@ -1035,6 +1050,15 @@ def main():
                              "bridge's /session, so it is never typed by hand. "
                              "Needs the same inbound firewall allowance as "
                              "--remote-port.")
+    parser.add_argument("--remote-host", dest="remote_host", default=None,
+                        help="This machine's address AS THE OTHER MACHINE SEES "
+                             "IT, for the URLs published to it (--remote). "
+                             "Default: whichever interface routes to the "
+                             "internet — which is the WRONG one as soon as the "
+                             "two machines are joined by a dedicated link: that "
+                             "guess returns the Wi-Fi address while the pairing "
+                             "runs over Ethernet. Set it to this machine's "
+                             "Ethernet IP for a direct-cable setup.")
     parser.add_argument("--status-url", dest="status_url", default=None,
                         help="Address the ProVoice machine should post its "
                              "signals to, when this machine cannot work it out: "
@@ -1432,7 +1456,8 @@ def main():
             # this before trusting it and falls back to the host it actually
             # reached the vehicle bridge on, so a wrong guess costs a line in
             # its log rather than the end-of-session signal.
-            status_url = args.status_url or f"http://{outbound_ip()}:{args.status_port}"
+            status_url = (args.status_url
+                          or f"http://{advertised_host(args)}:{args.status_port}")
 
         # =========================
         # START DRIVE
@@ -1525,7 +1550,7 @@ def main():
         # START PROVOICE
         # =========================
         if args.remote:
-            remote_url = f"http://{outbound_ip()}:{args.remote_port}"
+            remote_url = f"http://{advertised_host(args)}:{args.remote_port}"
             remote_cmd = build_provoice_cmd(session, args, vehicle_id,
                                             remote_url=remote_url)
             # "uv run python", not this machine's interpreter path, which means
