@@ -317,12 +317,13 @@ def report_physics(vehicle):
     return pc
 
 
-def apply_overrides(vehicle, args):
+def apply_overrides(vehicle, ticker, args):
     """Runtime-only physics changes, so a candidate fix can be felt immediately.
 
-    The write is read back and verified: Chaos silently ignores parts of a
-    physics-control write in some builds, and an override that never landed
-    looks exactly like an override that made no difference.
+    The write is read back and verified, because an override that never landed
+    looks exactly like an override that made no difference. The readback has to
+    come AFTER a tick: apply_physics_control is documented as taking effect "for
+    the next tick", so reading immediately always returns the old values.
     """
     if (args.set_brake_torque is None and args.set_abs is None
             and args.set_friction is None):
@@ -343,6 +344,11 @@ def apply_overrides(vehicle, args):
           "(this process only, reverts when the actor is respawned)"
           % (args.set_brake_torque, args.set_abs, args.set_friction))
 
+    ticked = all(ticker.step() is not None for _ in range(3))
+    if not ticked:
+        print("[WARN] The world did not tick, so the override cannot have been "
+              "applied yet and the readback below is stale. Start the clock "
+              "owner (or pass --self-tick) and run again.")
     back = vehicle.get_physics_control()
     landed = True
     for i, w in enumerate(back.wheels):
@@ -533,7 +539,7 @@ def run_carla_modes(args, do_physics, do_test):
             print("-" * 68)
             report_physics(vehicle)
             print()
-        apply_overrides(vehicle, args)
+        apply_overrides(vehicle, ticker, args)
 
         if do_test:
             if args.use_hero and spawned is None:
