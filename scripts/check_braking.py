@@ -19,11 +19,22 @@ so each is measured separately:
              the brake, and reports deceleration, stopping time and stopping
              distance against real-car references. Needs CARLA.
 
-Run with no mode to do all three (pedal first, then whichever need CARLA):
+Three more modes exist for deciding what to do about a car that brakes badly:
+
+    probe        Which VehiclePhysicsControl fields can actually be written on
+                 this build. On CARLA 0.10 the per-wheel ones are dropped
+                 silently, which is why brake torque cannot simply be raised.
+    blueprints   Stock brake torque of every vehicle blueprint, since that is
+                 the only remaining lever once per-wheel writes are ruled out.
+    accel        Full-throttle 0-50 / 0-100 km/h comparison between blueprints,
+                 for judging what a vehicle swap costs on the throttle side.
+
+Run with no mode to do the first three (pedal, then whichever need CARLA):
 
     uv run python scripts/check_braking.py
     uv run python scripts/check_braking.py pedal
     uv run python scripts/check_braking.py test --speed 50 --trace
+    uv run python scripts/check_braking.py accel
 
 The pedal mapping constants are imported from src/drive/drive_improved.py, not
 copied, so this cannot drift away from what the participant actually drives.
@@ -494,6 +505,149 @@ def scan_blueprints(world, ticker, args):
 
 
 # ==============================================================================
+# -- acceleration --------------------------------------------------------------
+# ==============================================================================
+
+ACCEL_MARKS_KMH = (50.0, 100.0)
+
+
+def measure_accel(world, vehicle, ticker, args):
+    """Full-throttle run from rest: times to 50/100 km/h, peak accel, top speed.
+
+    The point is comparability, not a benchmark: the same procedure on two
+    blueprints says which is quicker and by how much, which is what a vehicle
+    swap needs to be judged on.
+    """
+    collided = []
+    bp = world.get_blueprint_library().find('sensor.other.collision')
+    sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
+    sensor.listen(lambda e: collided.append(e))
+    try:
+        for _ in range(20):  # settle on the suspension, stationary
+            ticker.step()
+            vehicle.apply_control(carla.VehicleControl(
+                throttle=0.0, brake=1.0, hand_brake=True))
+
+        t0 = world.get_snapshot().timestamp.elapsed_seconds
+        marks = {}
+        peak_a = 0.0
+        v_max = 0.0
+        v_prev = 0.0
+        t_prev = 0.0
+        t = 0.0
+        wall_deadline = time.monotonic() + args.accel_timeout
+
+        while t <= args.accel_seconds:
+            snap = ticker.step()
+            if snap is None:
+                print("  [skip] world stopped ticking")
+                return None
+            vehicle.apply_control(carla.VehicleControl(
+                throttle=1.0, brake=0.0, steer=0.0, hand_brake=False))
+            t = snap.timestamp.elapsed_seconds - t0
+            v = speed_kmh(vehicle)
+            v_max = max(v_max, v)
+            dt = t - t_prev
+            if dt > 1e-4:
+                peak_a = max(peak_a, (v - v_prev) / 3.6 / dt)
+            v_prev, t_prev = v, t
+            for mark in ACCEL_MARKS_KMH:
+                if mark not in marks and v >= mark:
+                    marks[mark] = t
+            if collided:
+                break
+            if time.monotonic() > wall_deadline:
+                break
+        return {'marks': marks, 'peak_a': peak_a, 'v_max': v_max,
+                'collided': bool(collided), 'ran': t}
+    finally:
+        sensor.stop()
+        sensor.destroy()
+
+
+def run_accel_scan(world, ticker, args):
+    """Compare full-throttle acceleration across blueprints."""
+    patterns = [p.strip() for p in args.bp.split(',') if p.strip()]
+    spawn_points = world.get_map().get_spawn_points()
+    if not spawn_points:
+        print("[FAIL] Map has no spawn points.")
+        return None
+
+    print("Full-throttle run from rest, %.0f s each, on spawn point(s) from %d.\n"
+          % (args.accel_seconds, args.spawn_index))
+
+    rows = []
+    for i, pattern in enumerate(patterns):
+        bps = world.get_blueprint_library().filter(pattern)
+        if not bps:
+            print("  [skip] no blueprint matches %r" % pattern)
+            continue
+        bp = bps[0]
+        vehicle = None
+        for k in range(min(len(spawn_points), 12)):
+            sp = spawn_points[(args.spawn_index + i + k) % len(spawn_points)]
+            vehicle = world.try_spawn_actor(bp, sp)
+            if vehicle is not None:
+                break
+        if vehicle is None:
+            print("  [skip] %-40s could not spawn" % bp.id)
+            continue
+        print("  running %s ..." % bp.id)
+        try:
+            vehicle.set_autopilot(False)
+            res = measure_accel(world, vehicle, ticker, args)
+            if res is not None:
+                res['id'] = bp.id
+                rows.append(res)
+        finally:
+            vehicle.destroy()
+            ticker.step()
+
+    if not rows:
+        print("[FAIL] Nothing could be measured.")
+        return None
+
+    print()
+    print("%-42s %8s %8s %9s %9s" %
+          ("blueprint", "0-50", "0-100", "peak acc", "max speed"))
+    print("%-42s %8s %8s %9s %9s" %
+          ("", "s", "s", "m/s^2", "km/h"))
+    print("-" * 82)
+    for r in rows:
+        def fmt(mark):
+            return "%.2f" % r['marks'][mark] if mark in r['marks'] else "  --"
+        note = "  (collided)" if r['collided'] else ""
+        print("%-42s %8s %8s %9.2f %9.1f%s"
+              % (r['id'], fmt(50.0), fmt(100.0), r['peak_a'], r['v_max'], note))
+    print("-" * 82)
+    print("max speed = fastest reached in the run, NOT the vehicle's top speed;")
+    print("it is bounded by how much straight road the spawn point had.")
+    print("A '--' means the speed was never reached within %.0f s."
+          % args.accel_seconds)
+    print()
+    print("Reference: mainstream trims of both real cars do 0-100 km/h in")
+    print("           roughly 5-7 s. Under ~4.5 s is sports-car territory and")
+    print("           would not represent normal driving.")
+    print()
+
+    for r in rows:
+        t100 = r['marks'].get(100.0)
+        if r['collided']:
+            print("[WARN] %s hit something -- rerun with a different --spawn-index "
+                  "before trusting its numbers." % r['id'])
+        elif t100 is None:
+            print("[ OK ] %s never reached 100 km/h in %.0f s."
+                  % (r['id'], args.accel_seconds))
+        elif t100 < 4.5:
+            print("[WARN] %s does 0-100 in %.2f s -- unrealistically quick, and "
+                  "participants will drive it accordingly." % (r['id'], t100))
+        else:
+            print("[ OK ] %s does 0-100 in %.2f s, within the realistic range."
+                  % (r['id'], t100))
+    return rows
+
+
+# ==============================================================================
 # -- physics -------------------------------------------------------------------
 # ==============================================================================
 
@@ -725,7 +879,8 @@ def _report_trace(trace, t_first_drop, v0, args):
     return mean_a
 
 
-def run_carla_modes(args, do_physics, do_test, do_probe=False, do_scan=False):
+def run_carla_modes(args, do_physics, do_test, do_probe=False, do_scan=False,
+                    do_accel=False):
     try:
         client = connect(args)
     except Exception as e:
@@ -744,6 +899,9 @@ def run_carla_modes(args, do_physics, do_test, do_probe=False, do_scan=False):
 
     if do_scan:
         return scan_blueprints(world, ticker, args)
+
+    if do_accel:
+        return run_accel_scan(world, ticker, args)
 
     spawned = None
     try:
@@ -811,7 +969,7 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', nargs='?', default='all',
                    choices=['all', 'pedal', 'physics', 'test', 'probe',
-                            'blueprints'],
+                            'blueprints', 'accel'],
                    help='which check to run (default: all)')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=2000)
@@ -841,6 +999,11 @@ def main():
     p.add_argument('--set-friction', type=float, default=None,
                    help='override friction_force_multiplier on every wheel '
                         '(the tyre-grip ceiling) before testing')
+    p.add_argument('--bp', default='vehicle.lincoln.mkz*,vehicle.dodge.charger',
+                   help='accel: comma-separated blueprint patterns to compare '
+                        '(default: the new study car against the old one)')
+    p.add_argument('--accel-seconds', type=float, default=20.0,
+                   help='accel: simulated seconds of full throttle per run')
     args = p.parse_args()
 
     if args.mode in ('all', 'pedal'):
@@ -850,7 +1013,7 @@ def main():
         run_pedal(args)
         print()
 
-    if args.mode in ('all', 'physics', 'test', 'probe', 'blueprints'):
+    if args.mode in ('all', 'physics', 'test', 'probe', 'blueprints', 'accel'):
         print("=" * 68)
         print("CARLA  -- what the simulator does with the brake input")
         print("=" * 68)
@@ -858,7 +1021,8 @@ def main():
                         do_physics=args.mode in ('all', 'physics', 'test', 'probe'),
                         do_test=args.mode in ('all', 'test'),
                         do_probe=args.mode == 'probe',
-                        do_scan=args.mode == 'blueprints')
+                        do_scan=args.mode == 'blueprints',
+                        do_accel=args.mode == 'accel')
 
 
 if __name__ == '__main__':
