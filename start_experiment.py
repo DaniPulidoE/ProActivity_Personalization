@@ -1221,6 +1221,16 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--num-vehicles", dest="num_vehicles", type=int, default=0,
+                        help="Spawn only the first N NPC vehicles (0 = all 11). A "
+                             "DIAGNOSTIC for --sync slow motion: this rig spends "
+                             "~1.17 s of server work per SIMULATED second, which no "
+                             "tick rate can outrun. Run once with --num-vehicles 3 "
+                             "and compare the [SYNC] sim speed -- a big jump means "
+                             "vehicle physics is the cost and the fleet size is the "
+                             "knob; no change rules it out. If you end up keeping a "
+                             "reduced fleet, fix it across all participants: the "
+                             "amount of traffic is part of the driving task.")
     parser.add_argument("--substep-delta", dest="substep_delta", type=float,
                         default=0.01,
                         help="Maximum physics substep in seconds (default 0.01, "
@@ -1648,6 +1658,8 @@ def main():
                 [sys.executable, "-m", "src.drive.fixed_npc_traffic",
                  "--host", args.host, "--port", str(args.port),
                  "--tm-port", str(TM_PORT),
+                 *(["--num-vehicles", str(args.num_vehicles)]
+                   if args.num_vehicles else []),
                  # This child owns the simulation clock under --sync. It is
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.

@@ -176,6 +176,20 @@ def main():
                              "[SYNC] report now measures and prints; only raise "
                              "--delta if it shows real headroom. Must stay <= "
                              "max_substep_delta_time * max_substeps.")
+    parser.add_argument("--num-vehicles", type=int, default=0,
+                        help="Spawn only the first N of the configured NPCs (0 = "
+                             "all of them). THE DIAGNOSTIC FOR SLOW MOTION, and "
+                             "currently the only physics lever that is reachable "
+                             "from the Python API: measurements on this rig show "
+                             "the server spending ~1.17 s of work per SIMULATED "
+                             "second, which no tick rate can outrun, and CARLA "
+                             "0.10's --substep-delta provably does not move it "
+                             "(1 substep per tick performed exactly like 5). If "
+                             "that cost is vehicle physics, halving the fleet "
+                             "should roughly halve it. Run once with --num-vehicles "
+                             "3 and compare the [SYNC] sim speed: a big jump "
+                             "confirms vehicle physics, no change rules it out "
+                             "and points at the map or the render path instead.")
     parser.add_argument("--substep-delta", type=float,
                         default=DEFAULT_SUBSTEP_DELTA_TIME,
                         help="Maximum physics substep in seconds (default 0.01, "
@@ -435,9 +449,15 @@ def main():
     # which exists only so the cleanup handler can destroy everything.
     spawned = []
 
+    wanted = VEHICLE_CONFIGS
+    if args.num_vehicles and args.num_vehicles < len(VEHICLE_CONFIGS):
+        wanted = VEHICLE_CONFIGS[:args.num_vehicles]
+        print("Spawning only %d of %d configured NPCs (--num-vehicles)."
+              % (len(wanted), len(VEHICLE_CONFIGS)))
+
     print("Spawning fixed NPC vehicles...")
 
-    for spawn_index, blueprint_id in VEHICLE_CONFIGS:
+    for spawn_index, blueprint_id in wanted:
 
         if spawn_index >= len(spawn_points):
             print(f"Spawn point {spawn_index} not available")
@@ -723,31 +743,29 @@ def main():
                           "PARTICIPANT DATA. ***"
                           % (sim_speed * 100.0))
                     if duty >= 80.0:
-                        # Server-bound: the tick rate simply cannot exceed
-                        # 1/tick_cost, so the only honest options are a cheaper
-                        # frame or a target the server can actually meet. Note
-                        # this suggests a --delta, which the physics-bound advice
-                        # this block used to carry explicitly told you NOT to do;
-                        # that advice assumed substepping dominated, and on this
-                        # rig it measurably does not.
-                        suggested = 1.0 / max(1.0, ceiling * 0.9)
-                        print("[SYNC]     Server-bound: %.0f%% of wall time is "
-                              "inside world.tick(), which needs %.0f ms per "
-                              "frame. No tick rate above ~%.0f Hz is reachable "
-                              "until that frame gets cheaper (--render-scale on "
-                              "Drive, CARLA -RenderOffScreen / -quality-level=Low). "
-                              "Otherwise set --delta %.4f (~%.0f Hz) and the run "
-                              "is real-time again."
-                              % (duty, mean_cost * 1000.0, ceiling, suggested,
-                                 1.0 / suggested))
+                        # Deliberately does NOT suggest a --delta. Measured on
+                        # this rig, the server's cost is dominated by a term
+                        # proportional to SIMULATED time (~1.17 s of work per
+                        # simulated second), not to frames: 20 Hz asked gave 15,
+                        # 10 Hz asked gave 8, a near-constant ratio. Fitting
+                        # cost = A + B*delta puts A at ~8 ms/frame and B at ~1.17,
+                        # so sim speed tends to 1/B = 0.86x as delta grows and
+                        # NEVER reaches 1.0. Recommending "lower the tick rate"
+                        # here was wrong once already; the work has to shrink.
+                        print("[SYNC]     %.0f%% of wall time is inside "
+                              "world.tick() (%.0f ms/frame). If lowering --delta "
+                              "did NOT improve sim speed, the cost scales with "
+                              "SIMULATED time, not frames -- no tick rate can fix "
+                              "that, only less work per simulated second. Try "
+                              "--num-vehicles 3 to test whether it is vehicle "
+                              "physics; --render-scale 0.5 on Drive and CARLA "
+                              "-RenderOffScreen to test the render path."
+                              % (duty, mean_cost * 1000.0))
                     else:
-                        suggested_sub = args.substep_delta / max(0.05, sim_speed)
-                        print("[SYNC]     Not server-bound (duty %.0f%%). If "
-                              "physics substepping is the cost, try "
-                              "--substep-delta %.4f (%.0f substeps/s); the server "
-                              "runs 1/substep-delta substeps per SIMULATED second "
-                              "at any tick rate."
-                              % (duty, suggested_sub, 1.0 / suggested_sub))
+                        print("[SYNC]     Not server-bound (duty %.0f%%): the "
+                              "loop is idle yet still missing the target, which "
+                              "points at this script rather than at CARLA."
+                              % duty)
                 elif lagged_ticks:
                     print("[SYNC] %d/%d ticks late, worst %.0f ms -- holding real "
                           "time, but with little headroom."
