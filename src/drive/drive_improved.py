@@ -1368,6 +1368,7 @@ class World(object):
         self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
+        self._render_scale = getattr(args, 'render_scale', 1.0)
         self._fixed_spawn = args.fixed
         self.restart()
         self.world.on_tick(hud.on_world_tick)
@@ -1473,7 +1474,8 @@ class World(object):
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud, self.control_mode)
         self.gnss_sensor = GnssSensor(self.player)
         self.imu_sensor = IMUSensor(self.player)
-        self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
+        self.camera_manager = CameraManager(self.player, self.hud, self._gamma,
+                                            render_scale=self._render_scale)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
@@ -2504,12 +2506,35 @@ class RadarSensor(object):
 
 
 class CameraManager(object):
-    def __init__(self, parent_actor, hud, gamma_correction):
+    def __init__(self, parent_actor, hud, gamma_correction, render_scale=1.0):
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
         self.recording = False
+
+        # Camera resolution, decoupled from the window it is shown in.
+        #
+        # This is the main lever on how fast the SERVER can produce a frame, and
+        # under --sync the server's frame rate is the ceiling on the whole
+        # simulation: ask for ticks faster than it can render and simulated time
+        # falls behind real time, which the participant sees as everything moving
+        # in slow motion. At fullscreen the camera was rendering 1920x1080 twice
+        # over -- once for the spectator window and once for this sensor -- and
+        # then _parse_image copied that 6 MB buffer several times per frame in
+        # numpy (reshape, channel reversal, swapaxes, make_surface). Both costs
+        # fall roughly with the pixel count, so halving the scale is close to a
+        # 4x saving on each.
+        #
+        # The image is scaled back up at blit time, so the view still fills the
+        # window; it is softer, and on a driving task that is a far better trade
+        # than slow motion. 1.0 keeps the previous behaviour exactly.
+        self.render_scale = max(0.1, min(1.0, float(render_scale)))
+        self.render_dim = (max(64, int(hud.dim[0] * self.render_scale)),
+                           max(64, int(hud.dim[1] * self.render_scale)))
+        # Reused across frames so the upscale does not allocate a new surface 20
+        # times a second.
+        self._scaled = None
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
@@ -2565,8 +2590,8 @@ class CameraManager(object):
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
-                bp.set_attribute('image_size_x', str(hud.dim[0]))
-                bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('image_size_x', str(self.render_dim[0]))
+                bp.set_attribute('image_size_y', str(self.render_dim[1]))
                 if bp.has_attribute('gamma'):
                     bp.set_attribute('gamma', str(gamma_correction))
                 for attr_name, attr_value in item[3].items():
@@ -2615,8 +2640,19 @@ class CameraManager(object):
         self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
 
     def render(self, display):
-        if self.surface is not None:
+        if self.surface is None:
+            return
+        if self.surface.get_size() == display.get_size():
             display.blit(self.surface, (0, 0))
+            return
+        # Upscale a reduced-resolution camera frame to fill the window.
+        # transform.scale is a C blit, unlike smoothscale, which is markedly
+        # slower and whose softening buys nothing on a moving driving scene. The
+        # destination surface is reused rather than reallocated each frame.
+        if self._scaled is None or self._scaled.get_size() != display.get_size():
+            self._scaled = pygame.Surface(display.get_size()).convert()
+        pygame.transform.scale(self.surface, display.get_size(), self._scaled)
+        display.blit(self._scaled, (0, 0))
 
     @staticmethod
     def _parse_image(weak_self, image):
@@ -3257,6 +3293,16 @@ def main():
              'does, so the popup one interval later covers a fully logged 20 s. '
              'Driving is not held up, only the windows. 0 disables the wait; ignored '
              'with --test-popup, which runs without ProVoice.')
+    argparser.add_argument(
+        '--render-scale', dest='render_scale', default=1.0, type=float,
+        help='Render the drive camera at this fraction of the window size and '
+             'upscale it to fill the screen (default: 1.0 = unchanged). This is '
+             'the main lever on the CARLA server frame rate, which under --sync '
+             'is the ceiling on the whole simulation: if the server cannot render '
+             'as fast as the clock ticks, simulated time falls behind and '
+             'everything runs in slow motion. 0.7 renders about half the pixels, '
+             '0.5 about a quarter. The view gets softer, not smaller. Check the '
+             'effect in the [SYNC] ceiling line from fixed_npc_traffic.py.')
     argparser.add_argument(
         '--speed', action='store_true',
         help='Show the vehicle speed in km/h in the bottom-right corner. Unlike '

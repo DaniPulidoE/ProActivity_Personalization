@@ -67,9 +67,20 @@ def _pause_requested(path):
 #     fixed_delta_seconds <= max_substep_delta_time * max_substeps
 # and violating it silently degrades the physics the budget exists to protect,
 # so --delta is checked against it at parse time.
-MAX_SUBSTEP_DELTA_TIME = 0.01
-MAX_SUBSTEPS = 24
-SUBSTEP_BUDGET_S = MAX_SUBSTEP_DELTA_TIME * MAX_SUBSTEPS
+#
+# THE COUNTER-INTUITIVE PART, and the reason --substep-delta is exposed at all:
+# the server runs ceil(delta / substep_delta) physics substeps per tick, and
+# 1/delta ticks per simulated second. Multiply them and the delta cancels --
+#
+#     substeps per simulated second = 1 / substep_delta
+#
+# -- so the physics cost of one second of simulated time is FIXED, no matter what
+# tick rate is asked for. Lowering the tick rate does not buy real time: it makes
+# each tick proportionally more expensive. That is why this rig achieved ~0.8x at
+# a 20 Hz target and ~0.8x again at 10 Hz, a constant ratio rather than a ceiling.
+# Only substep_delta (or cheaper physics) moves that number.
+DEFAULT_SUBSTEP_DELTA_TIME = 0.01
+DEFAULT_MAX_SUBSTEPS = 24
 
 # How long to let the scene settle after destroying the previous fleet, and again
 # after spawning the new one before handing it to the traffic manager.
@@ -165,6 +176,22 @@ def main():
                              "[SYNC] report now measures and prints; only raise "
                              "--delta if it shows real headroom. Must stay <= "
                              "max_substep_delta_time * max_substeps.")
+    parser.add_argument("--substep-delta", type=float,
+                        default=DEFAULT_SUBSTEP_DELTA_TIME,
+                        help="Maximum physics substep in seconds (default 0.01, "
+                             "which is also CARLA's). THE MAIN LEVER ON SIMULATION "
+                             "SPEED, because 1/this is the number of physics "
+                             "substeps the server must run per simulated second "
+                             "REGARDLESS of --delta -- so if the run is in slow "
+                             "motion, lowering the tick rate will not help and this "
+                             "will. 0.02 halves the physics work. The cost is "
+                             "coarser integration, which is what made NPCs spin "
+                             "out in the first place, so raise it a step at a time "
+                             "and watch the traffic as well as the [SYNC] line.")
+    parser.add_argument("--max-substeps", type=int, default=DEFAULT_MAX_SUBSTEPS,
+                        help="Cap on physics substeps per tick (default 24). Only "
+                             "binds when --delta is large; it is the substep SIZE "
+                             "above, not this cap, that sets the cost.")
     parser.add_argument("--pause-file", default="",
                         help="Path Drive uses to ask for the clock to be held "
                              "(--sync only). While the file exists this process "
@@ -177,14 +204,21 @@ def main():
 
     # Before connecting, so a bad --delta fails instantly instead of after a
     # CARLA connection attempt.
-    if args.sync and args.delta > SUBSTEP_BUDGET_S:
+    if args.sync and args.substep_delta <= 0:
+        parser.error("--substep-delta must be positive; got %.4f."
+                     % args.substep_delta)
+    if args.sync and args.max_substeps < 1:
+        parser.error("--max-substeps must be at least 1; got %d."
+                     % args.max_substeps)
+    substep_budget = args.substep_delta * args.max_substeps
+    if args.sync and args.delta > substep_budget:
         parser.error(
             "--delta %.4f exceeds the physics substep budget %.4f "
-            "(max_substep_delta_time %.4f * max_substeps %d). CARLA would "
-            "quietly integrate physics at a coarser step than requested, which "
-            "is the failure --sync exists to remove."
-            % (args.delta, SUBSTEP_BUDGET_S, MAX_SUBSTEP_DELTA_TIME,
-               MAX_SUBSTEPS))
+            "(--substep-delta %.4f * --max-substeps %d). CARLA would quietly "
+            "integrate physics at a coarser step than requested, which is the "
+            "failure --sync exists to remove."
+            % (args.delta, substep_budget, args.substep_delta,
+               args.max_substeps))
     if args.sync and args.delta <= 0:
         parser.error("--delta must be positive; got %.4f." % args.delta)
 
@@ -279,22 +313,29 @@ def main():
     # it at a coarse delta is exactly what produces "took the corner too fast,
     # now it is drifting": the slip solve diverges, not the driving logic.
     #
-    # 24 * 0.01 keeps substeps at or under 0.01 s down to ~4 FPS. Cost is CPU on
-    # the server's physics thread, and with 11 vehicles that is negligible --
-    # rendering is the bottleneck here, not vehicle dynamics.
+    # A cap of 24 keeps substeps at or under --substep-delta down to ~4 FPS.
     #
-    # Under --sync this stops being a mitigation and becomes exact: a fixed step
-    # always divides into the same whole number of substeps of at most 0.01 s
-    # (three at the 0.025 s default), so the tire solve never sees a coarse delta
-    # no matter what the machine is doing. Raising the tick rate only makes this
-    # safer -- a smaller step needs FEWER substeps, so the budget is never the
-    # thing that limits how high --delta can go.
+    # CORRECTION, measured on this rig: an earlier version of this comment said
+    # the CPU cost was "negligible with 11 vehicles -- rendering is the
+    # bottleneck here, not vehicle dynamics". That was a guess and it was wrong.
+    # Fitting the achieved rate at two different tick rates (20 Hz target -> ~15
+    # Hz, 10 Hz target -> 8 Hz) separates the two costs: about 8 ms per frame of
+    # rendering against about 12 ms per physics SUBSTEP. At 100 substeps per
+    # simulated second that is roughly 1.2 s of physics for every 1.0 s of
+    # simulated time, against 0.17 s of rendering -- physics is ~88% of the bill
+    # and rendering is close to noise.
+    #
+    # Under --sync the substep count per tick is exact and constant, which is
+    # what removes the async spin-outs. What it does NOT do is get cheaper at a
+    # lower tick rate: see the header above DEFAULT_SUBSTEP_DELTA_TIME for why
+    # the delta cancels out. --substep-delta is the only knob here that changes
+    # the total.
     settings.substepping = True
-    settings.max_substep_delta_time = MAX_SUBSTEP_DELTA_TIME
-    settings.max_substeps = MAX_SUBSTEPS
+    settings.max_substep_delta_time = args.substep_delta
+    settings.max_substeps = args.max_substeps
 
     if SYNC_MODE:
-        # --delta was already checked against SUBSTEP_BUDGET_S at parse time.
+        # --delta was already checked against the substep budget at parse time.
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
     else:
@@ -646,25 +687,35 @@ def main():
                 # Everything moving in slow motion, ego included, looks nothing
                 # like a clock problem from the driver's seat; it looks like the
                 # cars are slow. That misread cost a debugging cycle.
+                # substeps/s is printed because it, not the tick rate, is what
+                # predicts sim speed -- and it stays put when --delta changes,
+                # which is the whole counter-intuitive point.
                 print("[SYNC] %.1f Hz of %.1f Hz target | sim speed %.2fx | "
-                      "server frame %.0f ms mean, %.0f ms worst (ceiling ~%.0f Hz)"
+                      "server frame %.0f ms mean, %.0f ms worst (ceiling ~%.0f "
+                      "Hz) | %.0f physics substeps/s"
                       % (achieved, target, sim_speed, mean_cost * 1000.0,
-                         worst_tick_cost * 1000.0, ceiling))
+                         worst_tick_cost * 1000.0, ceiling,
+                         1.0 / args.substep_delta))
 
                 if sim_speed < 0.95:
-                    # Actionable, with the number to use: the ceiling is measured,
-                    # so the right --delta is arithmetic rather than guesswork.
-                    suggested = 1.0 / max(1.0, ceiling * 0.9)
+                    # The advice deliberately does NOT say "lower --delta". That
+                    # is the intuitive fix and it does not work: substeps per
+                    # simulated second are 1/substep_delta whatever the tick rate,
+                    # so a lower tick rate buys nothing. Measured here as a
+                    # constant ~0.8x at both 20 Hz and 10 Hz targets.
+                    suggested_sub = args.substep_delta / max(0.05, sim_speed)
                     print("[SYNC] *** SLOW MOTION: the simulation is running at "
-                          "%.0f%% of real time. The server cannot render %.1f "
-                          "frames a second; it tops out near %.0f Hz. Everything "
-                          "the participant sees, their own car included, is "
-                          "correspondingly slow. Re-run with --delta %.4f (~%.0f "
-                          "Hz) or lower the render cost (camera resolution, CARLA "
-                          "-quality-level). THIS RUN IS NOT USABLE PARTICIPANT "
-                          "DATA. ***"
-                          % (sim_speed * 100.0, target, ceiling, suggested,
-                             1.0 / suggested))
+                          "%.0f%% of real time -- everything the participant "
+                          "sees, their own car included. THIS RUN IS NOT USABLE "
+                          "PARTICIPANT DATA. ***"
+                          % (sim_speed * 100.0))
+                    print("[SYNC]     Lowering --delta will NOT fix this: the "
+                          "server must run %.0f physics substeps per simulated "
+                          "second at ANY tick rate, because --substep-delta is "
+                          "%.4f. Try --substep-delta %.4f (%.0f substeps/s), or "
+                          "reduce physics cost another way."
+                          % (1.0 / args.substep_delta, args.substep_delta,
+                             suggested_sub, 1.0 / suggested_sub))
                 elif lagged_ticks:
                     print("[SYNC] %d/%d ticks late, worst %.0f ms -- holding real "
                           "time, but with little headroom."

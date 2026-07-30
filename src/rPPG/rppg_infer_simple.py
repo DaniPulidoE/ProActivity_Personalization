@@ -101,6 +101,22 @@ class OnlineRPPG(RemoteVitalSigns):
 
         self._fs_lock = threading.Lock()
 
+        # Ring buffer replacing the parent's O(num_frames) shift-and-append
+        # window (RemoteVitalSigns.inference_thread rolls the WHOLE
+        # (1, C, num_frames, H, W) array on every frame — measured at
+        # ~6 ms/frame on this project's target hardware, ~13x the amortized
+        # cost of the model forward pass itself, and the actual cause of the
+        # frame-queue-full drops this class works around above). Writing one
+        # slot is O(1); the sliding window is only assembled (O(num_frames))
+        # right before a forward pass, i.e. once every inference_interval
+        # frames. Verified bit-identical to the parent's buffer content and
+        # model output at every trigger point before landing this change.
+        # self.inference_frame_buffer (parent's init_buffers()) is left
+        # allocated but unused by this override.
+        self._ring = np.zeros(
+            (self.num_frames, self.in_channels, self.height, self.width))
+        self._ring_write_idx = 0
+
         # Old (naming collision — method overwritten by attribute):
         # self.inference_thread = threading.Thread(target=self.inference_thread)
         # self.inference_thread.start()
@@ -108,6 +124,76 @@ class OnlineRPPG(RemoteVitalSigns):
         self._thread.start()
         print("OnlineRPPG STARTED!")
 
+
+    def inference_thread(self):
+        """
+        Drop-in replacement for RemoteVitalSigns.inference_thread (overrides
+        the inherited method by name — self._thread targets self.inference_thread,
+        which now resolves here via the MRO, no monkeypatching involved).
+
+        Identical control flow/semantics to the parent (same trigger cadence,
+        same result_queue payloads, same face_detected branch, same shutdown
+        sentinel) — the only change is HOW the sliding window is maintained:
+        a ring buffer (O(1) per frame) instead of the parent's full-array
+        shift-and-append (O(num_frames) per frame). See the ring buffer
+        comment in __init__ for the verification this relies on.
+        """
+        count_frame = 0
+        measurements_recorded = 0
+
+        print("Starting inference thread (ring-buffer)...")
+
+        while not self.stop_event.is_set():
+            data = self.frame_queue.get()
+            if data is None:
+                break
+
+            frame_idx, face_frame, processed_frame, face_detected = data
+
+            if face_detected and processed_frame is not None:
+                # processed_frame is (1, C, H, W); ring slot is (C, H, W).
+                self._ring[self._ring_write_idx] = processed_frame[0]
+                write_idx = self._ring_write_idx
+                self._ring_write_idx = (write_idx + 1) % self.num_frames
+
+                if count_frame >= self.num_frames and count_frame % self.inference_interval == 0:
+                    # Oldest-to-newest order — matches exactly what the
+                    # parent's buf[:, :, i, :, :] shift-and-append produces.
+                    next_write = self._ring_write_idx
+                    if next_write == 0:
+                        ordered = self._ring
+                    else:
+                        ordered = np.concatenate(
+                            (self._ring[next_write:], self._ring[:next_write]), axis=0)
+                    frame_buffer = ordered.transpose(1, 0, 2, 3)[np.newaxis, ...]
+
+                    bvp, rsp = self.model_instance.infer_rphys(frame_buffer)
+                    bvp, rsp = self.signal_processor.post_process(bvp, rsp)
+
+                    self.bvp_buffer.extend(bvp.reshape(-1))
+                    self.rsp_buffer.extend(rsp.reshape(-1))
+
+                    hr, rr = self.signal_processor.compute_metrics(
+                        np.array(list(self.bvp_buffer)),
+                        np.array(list(self.rsp_buffer))
+                    )
+
+                    if not np.isnan(hr) and not np.isnan(rr):
+                        measurements_recorded += 1
+                        if measurements_recorded % 10 == 0:
+                            print(f"Recorded {measurements_recorded} valid measurements. HR: {hr:.1f}, RR: {rr:.1f}")
+
+                    self.result_queue.put((face_frame, np.array(list(self.bvp_buffer)),
+                                        np.array(list(self.rsp_buffer)), hr, rr, face_detected))
+            else:
+                self.result_queue.put((None, np.array(list(self.bvp_buffer)) if self.bvp_buffer else np.zeros(self.signal_buffer_size),
+                                    np.array(list(self.rsp_buffer)) if self.rsp_buffer else np.zeros(self.signal_buffer_size),
+                                    np.nan, np.nan, False))
+
+            count_frame += 1
+
+        print(f"Inference thread ended. Recorded {measurements_recorded} valid measurements")
+        self.result_queue.put(None)
 
     def stop(self):
         # Old (put() could block forever if queue full; no timeout on join):

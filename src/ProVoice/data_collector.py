@@ -73,9 +73,7 @@ class _Phase:
 
 _emotion_recognizer = None
 _EMOTIEFFLIB_MODEL = "enet_b0_8_best_afew"
-# EmotiEffLib emits 8 AffectNet classes; map to the pipeline's 7-class
-# EMOTION_VOCAB so D_IN stays 40 and existing xLSTM checkpoints keep loading.
-# 'contempt' has no FER2013 counterpart -> mapped to neutral (most conservative).
+# EmotiEffLib emits 8 AffectNet classes; map to the pipeline's 7-class EMOTION_VOCAB (map contempt -> neutral)
 _EMOTIEFFLIB_TO_VOCAB = {
     'anger': 'angry', 'contempt': 'neutral', 'disgust': 'disgust', 'fear': 'fear',
     'happiness': 'happy', 'neutral': 'neutral', 'sadness': 'sad', 'surprise': 'surprise',
@@ -121,46 +119,32 @@ def _resolve_face_landmarker_model() -> Optional[str]:
 
 
 # ── Per-driver calibration persistence ───────────────────────────────────────
-# Baselines are stable across sessions for the same driver, so a stored file
-# lets a returning participant skip the live routine. Loading is only allowed
-# when the file carries EVERY field the serving path reads — see
-# _validate_calibration(); anything missing/degenerate falls back to a live
-# calibration rather than silently serving zeros.
+# Store per-driver baselines after calibration - to be reused in other runs
 _CALIBRATION_DIR = os.path.join('.', 'data', 'calibration_data')
 # key -> required numeric fields (mirrors what compute_calibration() writes)
 _CALIBRATION_SCHEMA: Dict[str, Tuple[str, ...]] = {
     'gaze_score': ('mean', 'std', 'threshold'),
     'ear':        ('mean', 'std', 'threshold'),
     'mar':        ('mean', 'std', 'threshold'),
-    'bpm':        ('mean', 'std', 'threshold'),
-    'rr':         ('mean', 'std', 'threshold'),
+    'bpm':        ('mean', 'std'),
+    'rr':         ('mean', 'std'),
     'blink_rate': ('mean',),
     'perclos':    ('mean', 'std'),
 }
 
-# Anscombe transform of a zero count: 2*sqrt(0 + 3/8) = 1.224745. Subtracted in
-# _visual_process so the normalized yawn rate is 0.0 when no yawns have occurred
-# instead of resting at a constant 1.22 (Anscombe stabilizes variance, it does
-# not center). See the yawn-rate block there for the full rationale.
+# Anscombe transform of a zero count: 2*sqrt(0 + 3/8) = 1.224745.
+# The Anscombe transform is a variance-stabilizing transform for Poisson data, 
+# and the zero-count value is used to avoid taking the square root of zero.
 _YAWN_ANSCOMBE_ZERO = 2.0 * math.sqrt(3.0 / 8.0)
 
 # ── Robust baseline statistics for the rPPG signals ───────────────────────────
 # HR/RR readings contain occasional harmonic-lock outliers (see _hr_is_harmonic),
-# so the baseline uses median + MAD rather than mean + std. 1.4826*MAD is the
-# consistency constant that makes MAD estimate sigma for Gaussian data.
+# so the baseline uses median + MAD rather than mean + std.
+# This value approximates the std by the median
 _MAD_TO_SIGMA = 1.4826
-# Floors on the robust scale, same lesson as PERCLOS_MIN_SCALE: the dispersion of
-# a CALM baseline measures moment-to-moment noise (MAD ~1-3 bpm), not the driver's
-# dynamic range, so dividing by it turns hr_delta into a signal-to-noise ratio.
-# With a 2 bpm floor a perfectly ordinary 75 -> 95 bpm response normalized to
-# z = +10. These floors are instead the scale of change that MATTERS: ~10 bpm and
-# ~3 breaths/min, so a meaningful arousal response lands near z = 1-3.
-# In practice the floor almost always wins, which is the honest conclusion — the
-# per-driver LOCATION (median) is worth personalizing, the per-driver DISPERSION
-# is not estimable from a calm baseline. Switching _standardized_delta to
-# proportional change (HR - ref)/ref would drop the scale question entirely.
-# Units: bpm and breaths/min.
-_ROBUST_SCALE_FLOOR = {'bpm': 10.0, 'rr': 3.0}
+# Floor in dispersion for bpm and rr:
+
+#_ROBUST_SCALE_FLOOR = {'bpm': 5.0, 'rr': 2.0}
 
 # ── HR harmonic rejection ─────────────────────────────────────────────────────
 # Band, as a multiple of the running reference, in which a reading is treated as
@@ -916,7 +900,8 @@ class DataCollector:
                     # _standardized_delta divides hr_delta by it.
                     mean = float(np.median(values))
                     mad = float(np.median([abs(x - mean) for x in values]))
-                    std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
+                    #std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
+                    std = _MAD_TO_SIGMA * mad
                 else:
                     mean = sum(values) / len(values)
                     # Dispersion about the location estimate above. Not read at

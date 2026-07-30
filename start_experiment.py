@@ -37,14 +37,16 @@ EXPERIMENT SETUP:
 3. Inference: --data-collection --participantid --random-function --fullscreen
 
 EXPERIMENT SETUP (remote):
-0. Teaching the LoA control:
+0. Launch CARLA:
+    CARLA MACHINE: ./CarlaUnreal --RenderOffScreen 
+1. Teaching the LoA control:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-popup
-1. Driver adaptation phase:
+2. Driver adaptation phase:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-adaptation
-2. Calibration:
+3. Calibration:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-calibration-carla-remote --participantid <participantid>
     PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote
-3. Data collection:
+4. Data collection:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-data-collection-carla-remote --participantid <participantid>
     PROVOICE MACHINE: uv run python start_experiment.py --experiment-data-collection-provoice-remote
 
@@ -487,6 +489,8 @@ def build_drive_cmd(session, args):
         *(["--provoice-status-file", args.status_file] if args.remote else []),
         *(["--popup-immediate"] if args.test else []),
         *(["--speed"] if args.speed else []),
+        *(["--render-scale", str(args.render_scale)]
+          if args.render_scale != 1.0 else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1217,6 +1221,29 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--substep-delta", dest="substep_delta", type=float,
+                        default=0.01,
+                        help="Maximum physics substep in seconds (default 0.01, "
+                             "CARLA's own). THE LEVER ON SLOW MOTION under --sync, "
+                             "and the non-obvious one: the server runs 1/this many "
+                             "physics substeps per SIMULATED second no matter what "
+                             "--delta is, so lowering the tick rate cannot buy back "
+                             "real time but raising this can. 0.02 halves the "
+                             "physics work. It trades against integration accuracy "
+                             "-- coarse substeps are what made NPCs spin out -- so "
+                             "raise it one step at a time and watch both the [SYNC] "
+                             "sim-speed line and the traffic. Fix it across all "
+                             "participants once chosen. Ignored without --sync.")
+    parser.add_argument("--render-scale", dest="render_scale", type=float, default=1.0,
+                        help="Render the drive camera at this fraction of the screen "
+                             "size and upscale it (default 1.0 = unchanged). THE "
+                             "LEVER TO REACH A HIGHER --delta: the CARLA server's "
+                             "frame rate caps the whole simulation under --sync, and "
+                             "at fullscreen most of that frame is the drive camera. "
+                             "0.7 renders about half the pixels, 0.5 about a quarter. "
+                             "The image gets softer, not smaller. Read the effect off "
+                             "the [SYNC] 'ceiling ~N Hz' line, then set --delta to "
+                             "match. Fix it across all participants once chosen.")
     parser.add_argument("--speed", action="store_true",
                         help="Show the vehicle speed in km/h on screen, bottom-right. "
                              "A single large readout, not the F1 debug panel, so it "
@@ -1625,6 +1652,7 @@ def main():
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.
                  *(["--sync", "--delta", str(args.delta),
+                    "--substep-delta", str(args.substep_delta),
                     "--pause-file", CLOCK_PAUSE_FILE] if args.sync else [])],
                 "NPC_TRAFFIC"
             )
