@@ -1,8 +1,53 @@
+"""Spawn the fixed NPC fleet, and -- with --sync -- own the simulation clock.
+
+WHO TICKS THE WORLD is the whole design question in this file, so it is stated
+here rather than left to be rediscovered.
+
+CARLA's traffic manager is not a server-side service: it runs INSIDE the client
+process that created it (TrafficManagerLocal), computes controls there and
+applies them as batch commands. A traffic manager reached from another process
+via the same port is only a remote proxy. That is why the CARLA docs say the TM
+"must be set to synchronous mode too in the same client that does the tick" --
+the TM's synchronous step is chained to that process's own world.tick() call and
+cannot be driven by anyone else's.
+
+The consequence for this project: the process that manages the NPCs and the
+process that ticks have to be THE SAME PROCESS. This one manages the NPCs, so in
+synchronous mode this one ticks, and Drive (src/drive/drive_improved.py --sync)
+becomes a passive client that paces itself with world.wait_for_tick().
+
+A previous attempt put --sync on Drive alone. That set the world synchronous and
+synchronised Drive's own traffic manager on port 8000 -- which has no NPC
+registered to it -- while the traffic manager actually driving the eleven cars,
+on port 9000 here, was never ticked at all. Every NPC stopped dead. That episode
+is recorded as a "nonexistent sync mismatch" in start_experiment.py; it was a
+real mismatch, and it was this one.
+
+Second reason the clock lives here: the tick loop below is paced against the
+wall clock, so one second of simulated time takes one second of real time no
+matter how fast Drive is rendering. Tying the tick to Drive's render loop
+instead would make simulated time run at (Drive FPS x fixed_delta_seconds) --
+fast-forward on a good frame, slow motion on a bad one. Everything this
+experiment measures is wall-clock (the 20 s label window, ProVoice's frame
+timestamps, the 60 s calibration, rPPG heart rate off a real camera), so
+simulated time drifting against real time under machine load would put a
+variable, load-dependent amount of driving inside each label window.
+"""
+
 import carla
 import random
 import signal
 import time
 import argparse
+
+
+# Physics substep budget. CARLA's documented requirement is
+#     fixed_delta_seconds <= max_substep_delta_time * max_substeps
+# and violating it silently degrades the physics the budget exists to protect,
+# so --delta is checked against it at parse time.
+MAX_SUBSTEP_DELTA_TIME = 0.01
+MAX_SUBSTEPS = 24
+SUBSTEP_BUDGET_S = MAX_SUBSTEP_DELTA_TIME * MAX_SUBSTEPS
 
 
 def _install_graceful_stop():
@@ -44,19 +89,49 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
+    parser.add_argument("--tm-port", type=int, default=9000,
+                        help="Traffic manager port. This process becomes the "
+                             "TM-Server on it; Drive must NOT create its own on "
+                             "a different port while in --sync.")
+    parser.add_argument("--sync", action="store_true",
+                        help="Put the world in synchronous mode with a fixed "
+                             "time step and drive the clock from this process "
+                             "(see the module docstring for why it has to be "
+                             "this process). Drive must be launched with --sync "
+                             "too, so it waits on the clock instead of "
+                             "free-running. Without this flag the server "
+                             "free-runs exactly as before.")
+    parser.add_argument("--delta", type=float, default=0.05,
+                        help="Fixed time step in seconds for --sync (default "
+                             "0.05 = 20 Hz). Must stay <= max_substep_delta_time "
+                             "* max_substeps, enforced below.")
     args = parser.parse_args()
+
+    # Before connecting, so a bad --delta fails instantly instead of after a
+    # CARLA connection attempt.
+    if args.sync and args.delta > SUBSTEP_BUDGET_S:
+        parser.error(
+            "--delta %.4f exceeds the physics substep budget %.4f "
+            "(max_substep_delta_time %.4f * max_substeps %d). CARLA would "
+            "quietly integrate physics at a coarser step than requested, which "
+            "is the failure --sync exists to remove."
+            % (args.delta, SUBSTEP_BUDGET_S, MAX_SUBSTEP_DELTA_TIME,
+               MAX_SUBSTEPS))
+    if args.sync and args.delta <= 0:
+        parser.error("--delta must be positive; got %.4f." % args.delta)
+
     CARLA_HOST = args.host
     CARLA_PORT = args.port
 
-    TM_PORT = 9000
+    TM_PORT = args.tm_port
 
     SEED = 42
 
     NUM_VEHICLES = 50
 
-    SYNC_MODE = False
+    SYNC_MODE = args.sync
 
-    FIXED_DELTA_SECONDS = 0.05
+    FIXED_DELTA_SECONDS = args.delta
 
     # fixed npc vehicle config
     # (spawn_point_index, blueprint_id)
@@ -96,7 +171,12 @@ def main():
     # =========================
 
     client = carla.Client(CARLA_HOST, CARLA_PORT)
-    client.set_timeout(10.0)
+    # Longer under --sync: world.tick() blocks until the server finishes the
+    # frame, and this process is now the only thing advancing the simulation, so
+    # a timeout here does not just fail a call -- it stops the world for the
+    # participant and for Drive. A generous ceiling plus the retry in the tick
+    # loop below rides out a server hitch instead of ending the session over one.
+    client.set_timeout(60.0 if args.sync else 10.0)
 
     world = client.get_world()
 
@@ -104,13 +184,8 @@ def main():
     # SYNCHRONOUS MODE
     # =========================
 
+    original_settings = world.get_settings()
     settings = world.get_settings()
-
-    if SYNC_MODE:
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
-    else:
-        settings.synchronous_mode = False
 
     # Physics substep headroom -- this is why NPCs spin out and drift.
     #
@@ -127,9 +202,21 @@ def main():
     # 24 * 0.01 keeps substeps at or under 0.01 s down to ~4 FPS. Cost is CPU on
     # the server's physics thread, and with 11 vehicles that is negligible --
     # rendering is the bottleneck here, not vehicle dynamics.
+    #
+    # Under --sync this stops being a mitigation and becomes exact: a fixed
+    # 0.05 s step needs 5 substeps of 0.01 s, always, so the tire solve never
+    # sees a coarse delta no matter what the machine is doing.
     settings.substepping = True
-    settings.max_substep_delta_time = 0.01
-    settings.max_substeps = 24
+    settings.max_substep_delta_time = MAX_SUBSTEP_DELTA_TIME
+    settings.max_substeps = MAX_SUBSTEPS
+
+    if SYNC_MODE:
+        # --delta was already checked against SUBSTEP_BUDGET_S at parse time.
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
+    else:
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
 
     world.apply_settings(settings)
 
@@ -139,8 +226,16 @@ def main():
 
     tm = client.get_trafficmanager(TM_PORT)
 
+    # Deliberately right after apply_settings() and in the process that ticks --
+    # both are documented requirements, and this is the call the earlier failed
+    # attempt made from the wrong process. See the module docstring.
     tm.set_synchronous_mode(SYNC_MODE)
 
+    # Only meaningful under --sync. With a variable time step the traffic
+    # manager's own decisions are reproducible but the physics they act on is
+    # not, so seeding buys nothing: async traffic differs run to run, which for
+    # a between-participants study is an uncontrolled variable. Fixed step plus
+    # this seed is what makes the traffic the same for every participant.
     tm.set_random_device_seed(SEED)
 
     # Hybrid physics mode is OFF. It was True, and it is the leading suspect for
@@ -186,6 +281,15 @@ def main():
 
     for vehicle in old_vehicles:
         try:
+            # Never destroy the participant's car. In the normal launch order
+            # this process runs before Drive and there is no ego yet, so this
+            # guard is invisible -- but it makes restarting NPC traffic against
+            # a live session survivable instead of ending the drive, and it
+            # removes the ordering landmine from any future change that starts
+            # Drive first. 'hero' is drive_improved.py's default --rolename.
+            if vehicle.attributes.get('role_name') == 'hero':
+                print(f"Keeping ego vehicle {vehicle.id} (role_name=hero)")
+                continue
             vehicle.destroy()
         except:
             pass
@@ -228,18 +332,26 @@ def main():
             # autopilot
             vehicle.set_autopilot(True, TM_PORT)
 
-            # Lane changes OFF. The traffic manager decides to change lane from
-            # its own world snapshot, and in async mode that snapshot is up to a
-            # full frame stale -- at the frame times this rig actually hits, the
-            # gap it thought was there has moved. This is the source of the
-            # "drives into the car next to it" collisions; a vehicle that stays
-            # in lane has no such failure mode. Costs nothing the study needs:
-            # the NPCs exist to populate the scene, not to overtake.
+            # Lane changes OFF, and the reason is STUDY DESIGN, not the time
+            # step. --sync does remove one of the two things that made TM lane
+            # changes collide here (it acted on a snapshot up to a frame stale,
+            # so the gap it committed to had already moved), and if these
+            # comments only said that, a future reader running --sync would
+            # rightly turn them back on. The reason that survives: a lane change
+            # is the manoeuvre where the TM's gap check is weakest, an NPC
+            # collision in front of the participant is a confound in the LoA
+            # label for that window, and the NPCs are here to populate the scene
+            # rather than to overtake. Nothing the study measures is worse off
+            # without them. Worth re-testing under --sync only if the traffic
+            # ever needs to look livelier -- and then as a deliberate change
+            # fixed across all participants, never mid-run.
             tm.auto_lane_change(vehicle, False)
 
-            # 5 m was under a 0.4 s headway at urban speeds -- less than one
-            # decision frame of margin, so any leader braking became a rear-end
-            # hit. 8 m gives the controller room to respond to a stale snapshot.
+            # 8 m, likewise independent of the time step: 5 m is under a 0.4 s
+            # headway at urban speeds, where real following distances are 1-2 s,
+            # so any leader braking became a rear-end hit with or without exact
+            # physics. --sync makes the controller's reaction deterministic; it
+            # does not give it more room to react in.
             tm.distance_to_leading_vehicle(vehicle, 8.0)
 
             # Speed, and the reason the sign matters: in this API a NEGATIVE
@@ -251,6 +363,14 @@ def main():
             #
             # Positive values here put them back under the limit; heavy vehicles
             # get more, because their stable cornering speed is genuinely lower.
+            #
+            # Unaffected by --sync: a fixed time step integrates the dynamics
+            # exactly, it does not teach the TM's lateral controller to pick a
+            # corner entry speed a firetruck can actually hold. If --sync turns
+            # out to remove enough of the spin-outs that this looks over-cautious,
+            # relax it deliberately and re-measure -- and keep whatever value is
+            # chosen fixed across every participant and both study arms, for the
+            # same reason --decision-hz and --delta are fixed.
             if blueprint_id in HEAVY_BLUEPRINTS:
                 speed_penalty = random.uniform(35, 55)
             else:
@@ -272,21 +392,121 @@ def main():
     # MAIN LOOP
     # =========================
 
-    print("NPC traffic running...")
+    if SYNC_MODE:
+        print("NPC traffic running -- SYNCHRONOUS, this process owns the clock "
+              "(%.3f s step, %.1f Hz)."
+              % (FIXED_DELTA_SECONDS, 1.0 / FIXED_DELTA_SECONDS))
+    else:
+        print("NPC traffic running -- asynchronous, the server free-runs.")
 
     # for bp in world.get_blueprint_library().filter('vehicle'):
     #     print(bp.id)
 
     try:
 
-        while True:
-
-            if SYNC_MODE:
-                world.tick()
-            else:
+        if not SYNC_MODE:
+            while True:
                 world.wait_for_tick()
 
+        # Wall-clock-paced tick loop.
+        #
+        # Each world.tick() advances simulated time by exactly
+        # FIXED_DELTA_SECONDS, so the ONLY thing keeping simulated time equal to
+        # real time is the rate we call it at. The deadline is advanced by a
+        # fixed step rather than measured from "now" after each tick, so the
+        # small per-tick overshoots do not accumulate into a permanent lag.
+        #
+        # When the server cannot keep up, world.tick() itself blocks longer than
+        # the step and the loop falls behind. We do NOT try to catch up by
+        # ticking faster: that would make the sim jump, and the participant is
+        # driving it. We reset the deadline (dropping the debt) and report the
+        # lag, because a rig that cannot hold the step is running the study in
+        # slow motion and that is a finding, not something to hide. Time.sleep()
+        # is accurate to about a millisecond on Python 3.11+ on Windows, which
+        # is fine against a 50 ms step.
+        LAG_REPORT_EVERY_S = 30.0
+        next_tick = time.perf_counter()
+        ticks = 0
+        lagged_ticks = 0
+        worst_lag = 0.0
+        last_report = time.perf_counter()
+
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 3
+
+        while True:
+
+            try:
+                world.tick()
+                consecutive_failures = 0
+            except RuntimeError as e:
+                # A tick that times out or errors must not end this process by
+                # default: it is the clock, so exiting freezes the scene for a
+                # participant mid-drive. Retry a few times -- a server hitch or a
+                # brief RPC stall recovers -- and only give up once it is clearly
+                # not coming back, in which case the finally block restores
+                # asynchronous mode so the rig is left usable rather than stuck
+                # waiting for a tick nobody will send.
+                consecutive_failures += 1
+                print("[SYNC] tick failed (%d/%d): %s"
+                      % (consecutive_failures, MAX_CONSECUTIVE_FAILURES, e))
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print("[SYNC] giving up on the simulation clock.")
+                    raise
+                next_tick = time.perf_counter()
+                continue
+
+            ticks += 1
+
+            next_tick += FIXED_DELTA_SECONDS
+            slack = next_tick - time.perf_counter()
+
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                lagged_ticks += 1
+                worst_lag = max(worst_lag, -slack)
+                next_tick = time.perf_counter()
+
+            now = time.perf_counter()
+            if now - last_report >= LAG_REPORT_EVERY_S:
+                achieved = ticks / (now - last_report)
+                if lagged_ticks:
+                    print("[SYNC] %.1f Hz achieved of %.1f Hz target -- %d/%d "
+                          "ticks late, worst %.0f ms. Simulated time is running "
+                          "at %.2fx real time."
+                          % (achieved, 1.0 / FIXED_DELTA_SECONDS, lagged_ticks,
+                             ticks, worst_lag * 1000.0,
+                             achieved * FIXED_DELTA_SECONDS))
+                else:
+                    print("[SYNC] %.1f Hz achieved, on schedule." % achieved)
+                ticks = 0
+                lagged_ticks = 0
+                worst_lag = 0.0
+                last_report = now
+
     except KeyboardInterrupt:
+        pass
+
+    finally:
+        # This runs on ANY exit path, not just Ctrl-C/SIGBREAK, and that matters
+        # much more under --sync than it used to: a server left in synchronous
+        # mode with no client ticking it blocks every other client that connects
+        # to it, so an unhandled exception here would take out the whole rig and
+        # leave CARLA needing a restart. Restoring settings comes first for the
+        # same reason -- if destroying vehicles throws, sync mode is already off.
+        print("Restoring world settings...")
+
+        try:
+            world.apply_settings(original_settings)
+        except Exception as e:
+            print("[WARN] Could not restore world settings:", e)
+
+        if SYNC_MODE:
+            try:
+                tm.set_synchronous_mode(False)
+            except Exception as e:
+                print("[WARN] Could not desynchronise the traffic manager:", e)
 
         print("Cleaning up vehicles...")
 
@@ -295,13 +515,6 @@ def main():
                 vehicle.destroy()
             except:
                 pass
-
-        settings = world.get_settings()
-
-        settings.synchronous_mode = False
-        settings.fixed_delta_seconds = None
-
-        world.apply_settings(settings)
 
         print("Done.")
 

@@ -417,9 +417,13 @@ def append_user_loa_selection(selection_row):
 def _set_world_frozen(world, frozen):
     """Freeze/unfreeze the whole scene while the LoA popup is open.
 
-    The experiment runs in CARLA async mode, where the server free-runs and a
-    brake control only makes the ego *coast* to a stop while NPC traffic keeps
-    driving.
+    The server free-runs and a brake control only makes the ego *coast* to a stop
+    while NPC traffic keeps driving.
+
+    Still needed under --sync, for a non-obvious reason: Drive is not the clock
+    owner there (fixed_npc_traffic.py is), so it cannot pause the scene by simply
+    declining to tick. It has to hold the vehicles explicitly, exactly as in
+    async mode.
 
     We deliberately do NOT toggle ``set_simulate_physics`` here: disabling and
     re-enabling a vehicle's physics resets its drivetrain state, so the ego
@@ -487,6 +491,34 @@ def _set_world_frozen(world, frozen):
             except Exception:
                 pass
         world._frozen_velocities = {}
+
+
+# How long to wait for the world clock before deciding it has stalled. Generous
+# against a 0.05 s step (100 missed ticks) because the only thing that should
+# ever trip it is the clock owner dying, not a slow frame.
+SYNC_STALL_TIMEOUT_S = 5.0
+
+
+def _await_world_tick(sim_world, timeout_s=SYNC_STALL_TIMEOUT_S):
+    """Block until the world-clock owner advances the simulation. True if it did.
+
+    Under --sync Drive does not tick -- src/drive/fixed_npc_traffic.py does, and
+    that file's docstring explains why it has to be that process. Drive instead
+    paces itself to the clock here, which is what makes one loop iteration equal
+    one simulation step: exactly one control application per tick, and no frame
+    rendered twice from an unchanged world.
+
+    The wait is BOUNDED because the failure it guards against is total. If the
+    clock owner dies, an unbounded wait leaves the pygame window frozen and
+    unresponsive with a participant sitting in front of it, mid-study. On timeout
+    we return False and let the caller keep looping: input still works, the HUD
+    still draws, and the driver can end the session cleanly.
+    """
+    try:
+        sim_world.wait_for_tick(timeout_s)
+        return True
+    except RuntimeError:
+        return False
 
 
 # --- LoA selection via the steering wheel -------------------------------------
@@ -1251,6 +1283,9 @@ FIXED_SPAWN_POINT_INDEX = 152
 class World(object):
     def __init__(self, carla_world, hud, traffic_manager, args):
         self.world = carla_world
+        # Kept for reference by anything reading World, but no longer branched on:
+        # restart() waits for a tick either way now, because Drive never ticks in
+        # either mode (see _await_world_tick).
         self.sync = args.sync
         self.traffic_manager = traffic_manager
         self.actor_role_name = args.rolename
@@ -1388,10 +1423,16 @@ class World(object):
             self.hud.notification(actor_type)
         self.traffic_manager.update_vehicle_lights(self.player, True)
 
-        if self.sync:
-            self.world.tick()
-        else:
-            self.world.wait_for_tick()
+        # Wait for a tick either way -- under --sync the clock belongs to
+        # fixed_npc_traffic.py, so Drive waits here rather than ticking. Failing
+        # to get one is not fatal at this point (the sensors are attached and the
+        # ego exists), but it means nothing is driving the clock, so say so
+        # loudly instead of writing a vehicle id that ProVoice will act on.
+        if not _await_world_tick(self.world):
+            print("[WARN] No world tick within %.0fs while setting up the ego. "
+                  "If this is --sync, the clock owner "
+                  "(src/drive/fixed_npc_traffic.py --sync) is not running."
+                  % SYNC_STALL_TIMEOUT_S)
 
         # Write vehicle id AFTER the world tick so ProVoice only connects
         # once Drive is fully initialised (prevents CARLA race condition).
@@ -2582,16 +2623,32 @@ def game_loop(args):
         client.set_timeout(20.0)
 
         sim_world = client.get_world()
-        traffic_manager = client.get_trafficmanager()
-        if args.sync:
-            original_settings = sim_world.get_settings()
-            settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
-            sim_world.apply_settings(settings)
+        traffic_manager = client.get_trafficmanager(args.tm_port)
 
-            traffic_manager.set_synchronous_mode(True)
+        # --sync means "the world is synchronous and ANOTHER client owns the
+        # clock", not "I tick". Drive neither applies world settings nor calls
+        # world.tick() nor synchronises a traffic manager -- all three belong to
+        # src/drive/fixed_npc_traffic.py --sync, which is the process that owns
+        # the NPCs' traffic manager and therefore the only process CARLA lets
+        # drive it (that file's docstring has the mechanism).
+        #
+        # This is the inversion of what this block used to do. It used to set the
+        # world synchronous and synchronise the traffic manager on port 8000,
+        # which has no NPC registered to it, and then tick -- leaving the port
+        # 9000 traffic manager that drives the eleven cars unticked, so they all
+        # stopped dead.
+        if args.sync:
+            if not sim_world.get_settings().synchronous_mode:
+                print("[WARN] --sync was passed but the world is NOT in "
+                      "synchronous mode. Drive does not set it: launch "
+                      "src/drive/fixed_npc_traffic.py --sync (start_experiment.py "
+                      "--sync does both). Continuing, but this loop will wait on "
+                      "a clock nobody is driving and time out.")
+            else:
+                print("[INFO] --sync: pacing to the external world clock "
+                      "(fixed step %.3f s), TM port %d."
+                      % (sim_world.get_settings().fixed_delta_seconds or 0.0,
+                         args.tm_port))
 
         if args.autopilot and not sim_world.get_settings().synchronous_mode:
             print("WARNING: You are currently in asynchronous mode and could "
@@ -2697,12 +2754,12 @@ def game_loop(args):
                 print("[WARN] Not waiting for ProVoice (--popup-wait-timeout 0): windows "
                       "opened before it logs have no driver-state data behind them")
 
-        if args.sync:
-            sim_world.tick()
-        else:
-            sim_world.wait_for_tick()
+        _await_world_tick(sim_world)
 
         clock = pygame.time.Clock()
+        # True while the --sync world clock is not advancing, so the warning is
+        # printed on the transition instead of once per frame.
+        sync_stalled = False
         while True:
             clock.tick_busy_loop(60)
             now_ms = pygame.time.get_ticks()
@@ -2873,7 +2930,23 @@ def game_loop(args):
                 continue
 
             if args.sync:
-                sim_world.tick()
+                # Pace to the external clock rather than ticking. Placed exactly
+                # where the old sim_world.tick() was, so the ordering the rest of
+                # the loop assumes is unchanged: the world advances, then input
+                # is read and a control applied, which the next step consumes.
+                if _await_world_tick(sim_world):
+                    if sync_stalled:
+                        sync_stalled = False
+                        print("[INFO] World clock recovered.")
+                elif not sync_stalled:
+                    sync_stalled = True
+                    print("[WARN] No world tick for %.0fs. The clock owner "
+                          "(src/drive/fixed_npc_traffic.py --sync) has probably "
+                          "died; the scene is frozen but Drive stays responsive "
+                          "so the session can be ended cleanly."
+                          % SYNC_STALL_TIMEOUT_S)
+                    world.hud.notification('Simulation stalled - clock lost',
+                                           seconds=8.0)
             if controller.parse_events(client, world, clock, args.sync, events):
                 return
             world.tick(clock)
@@ -2882,6 +2955,12 @@ def game_loop(args):
 
     finally:
 
+        # Deliberately NOT restoring world settings. Drive no longer changes
+        # them -- under --sync the clock owner (fixed_npc_traffic.py) sets
+        # synchronous_mode and the fixed step, and restores both in its own
+        # finally. Two processes each restoring a snapshot they took at different
+        # moments is how a server ends up stuck in synchronous mode with nobody
+        # ticking it, which blocks every client that connects afterwards.
         if original_settings:
             sim_world.apply_settings(original_settings)
 
@@ -2960,7 +3039,17 @@ def main():
         help='shared session id for aligning logs')
     argparser.add_argument(
         '--sync', action='store_true',
-        help='Activate synchronous mode execution')
+        help='The world is in synchronous mode and ANOTHER client owns the '
+             'clock: pace this loop to it with wait_for_tick instead of '
+             'free-running. Drive does NOT set synchronous mode and does NOT '
+             'tick -- src/drive/fixed_npc_traffic.py --sync does both, because '
+             'CARLA only lets the process that owns the NPCs\' traffic manager '
+             'drive it. Launch both together (start_experiment.py --sync).')
+    argparser.add_argument(
+        '--tm-port', dest='tm_port', default=8000, type=int,
+        help='Traffic manager port (default: 8000). Under --sync this MUST '
+             'match the clock owner\'s --tm-port (9000 in this project), or '
+             'Drive holds a second traffic manager that nothing ticks.')
     argparser.add_argument(
         '--control',
         choices=['test', 'full'],

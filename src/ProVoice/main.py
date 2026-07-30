@@ -17,18 +17,22 @@ import urllib.request
 # their thread pools once, at load time, and ignore these variables afterwards.
 #
 # Why cap them at all: this process shares the machine with the CARLA server and
-# the Drive client. CARLA runs ASYNCHRONOUSLY — drive_improved.py only calls
-# sim_world.tick() under `if args.sync:`, `--sync` defaults to False, and
-# start_experiment.py never passes it, so Drive takes the wait_for_tick() branch
-# and the simulator advances on its own clock. That means an all-core burst here
-# does not stall a tick Drive owes the server; it starves CARLA's render and
-# physics threads and Drive's render loop directly, which the participant sees
-# as dropped frames and laggy steering. Either way the cap is what stops this
-# process from taking the whole machine.
+# the Drive client, and it holds NO tick of its own — the DataCollector only ever
+# reads (get_velocity, get_weather, a cached map), so it never owes the server
+# anything and is safe under either clock. An all-core burst here therefore does
+# not stall a tick; it starves CARLA's render and physics threads and Drive's
+# render loop directly, which the participant sees as dropped frames and laggy
+# steering. The cap is what stops this process from taking the whole machine.
 #
-# (An earlier version of this comment asserted synchronous mode with
-# fixed_delta_seconds=0.05. That was wrong — check the `--sync` flag before
-# relying on any claim about tick ownership.)
+# Under start_experiment.py --sync that cap matters MORE, not less. The clock is
+# then paced against the wall clock by src/drive/fixed_npc_traffic.py, and a
+# server starved of CPU cannot complete its fixed step in time — so instead of
+# degraded physics you get the whole simulation in slow motion, for the
+# participant and for every wall-clock-aligned signal recorded here.
+#
+# (Two earlier versions of this comment each asserted one clock as a permanent
+# fact — first synchronous, then asynchronous. Both are reachable; check the
+# --sync flag before relying on any claim about tick ownership.)
 #
 # Left at its default, torch sizes its intra-op pool to the core count (20 on
 # the lab machine) and every xLSTM forward becomes an all-core stampede.

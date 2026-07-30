@@ -176,6 +176,15 @@ _DEAD_PORT = 1
 # machine and the wait can only ever time out.
 DEFAULT_POPUP_WAIT_TIMEOUT = 180.0
 
+# Traffic manager port for the whole rig. ONE port, deliberately: CARLA's traffic
+# manager runs inside the client process that creates it, so under --sync the
+# process that ticks must be the process that owns the traffic manager the NPCs
+# are registered to. Two ports means one of them goes unticked and its vehicles
+# stop dead -- which is exactly what happened the last time --sync was attempted
+# (see src/drive/fixed_npc_traffic.py's module docstring). Passed to both
+# children so neither can drift from the other.
+TM_PORT = 9000
+
 # THE RIG. Address of the CARLA machine on the dedicated Ethernet link between
 # the two study machines. Fixed for the whole data-collection run, so the
 # --experiment-*-carla-remote presets set it themselves rather than having it
@@ -454,6 +463,10 @@ def build_drive_cmd(session, args):
         *(["--no-popup"] if args.no_popup else []),
         *(["--test-popup"] if args.test_popup else []),
         *(["--fixed"] if args.fixed else []),
+        # Under --sync this makes Drive wait on the clock instead of ticking, and
+        # points it at the clock owner's traffic manager. Both halves have to
+        # travel together -- see the --sync help text below.
+        *(["--sync", "--tm-port", str(TM_PORT)] if args.sync else []),
         # Omitted when neither flag was given, so Drive keeps its own default
         # (the wheel when one is bound, the keyboard otherwise).
         *([f"--{args.popup_input}-input"] if args.popup_input else []),
@@ -777,16 +790,34 @@ class ProcessManager:
         both want the same core, so it complements the thread caps in
         src/ProVoice/main.py rather than replacing them. No-op off Windows.
 
-        CARLA runs ASYNCHRONOUSLY here — do not assume otherwise. Every
-        sim_world.tick() in drive_improved.py sits behind ``if args.sync:``,
-        ``--sync`` is store_true (so it defaults to False), and build_drive_cmd()
-        below never passes it. Drive therefore takes the wait_for_tick() branch,
-        fixed_delta_seconds is never set, and the simulator advances on its own
-        clock rather than on any client's tick. src/drive/fixed_npc_traffic.py
-        matches this: SYNC_MODE=False, so its traffic manager is asynchronous too.
-        Stated explicitly because a previous version of this docstring claimed
-        synchronous mode, and that claim misled a debugging session into
-        "fixing" a nonexistent sync mismatch, which froze all NPC traffic.
+        WHICH CLOCK CARLA IS ON depends on ``--sync``, and no code below should
+        assume either. Both children are told, together, by this launcher.
+
+        Without ``--sync`` (the default, and how every session up to now has
+        run): nobody sets synchronous_mode, fixed_delta_seconds is never set, and
+        the simulator advances on its own variable clock. Both Drive and
+        fixed_npc_traffic.py sit in wait_for_tick().
+
+        With ``--sync``: fixed_npc_traffic.py owns the clock. It sets
+        synchronous_mode plus a fixed --delta step and ticks in a loop paced
+        against the wall clock; Drive gets ``--sync --tm-port`` and paces itself
+        to that clock with wait_for_tick(), ticking nothing and touching no world
+        settings.
+
+        That split is not a stylistic choice. CARLA's traffic manager runs inside
+        the client process that created it, so the process that ticks must be the
+        process that owns the traffic manager the NPCs are registered to -- here,
+        the one that spawns them. src/drive/fixed_npc_traffic.py's module
+        docstring has the full mechanism.
+
+        Worth knowing because this docstring has now been wrong in both
+        directions. It once claimed synchronous mode when the system was async,
+        which sent a debugging session after an imaginary mismatch. The
+        correction then hard-coded "async" as a permanent fact, and concluded
+        that the sync mismatch had never existed -- but it had: --sync used to
+        synchronise Drive's own traffic manager on port 8000, which no NPC is
+        registered to, leaving the port-9000 one that drives them unticked. That
+        is why every NPC froze, and it is fixed rather than merely documented.
         """
         print(f"[START] {name}{' (below-normal priority)' if below_normal else ''}")
         print("        ", " ".join(cmd))
@@ -1176,6 +1207,26 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--sync", action="store_true",
+                        help="SYNCHRONOUS mode: run the simulation on a fixed time "
+                             "step (--delta) driven by the NPC-traffic process, which "
+                             "paces it against the wall clock. Fixes the two things "
+                             "the free-running default cannot: physics is integrated "
+                             "at a constant step, so NPCs stop spinning out under "
+                             "machine load, and the traffic manager's seed actually "
+                             "makes the traffic identical for every participant. "
+                             "Costs real-time fidelity IF the rig cannot hold the "
+                             "step -- the run then goes into slow motion rather than "
+                             "dropping physics accuracy, and NPC_TRAFFIC prints the "
+                             "achieved rate every 30 s so you can tell. Sets up both "
+                             "children correctly; do not pass --sync to either by "
+                             "hand.")
+    parser.add_argument("--delta", type=float, default=0.05,
+                        help="Fixed time step in seconds for --sync (default 0.05 = "
+                             "20 Hz). KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND "
+                             "BOTH STUDY ARMS, for the same reason --decision-hz is "
+                             "fixed: it changes the simulation the driver responds "
+                             "to. Ignored without --sync.")
     parser.add_argument("--test-popup", dest="test_popup", action="store_true",
                         help="Teaching mode: open the simulator UI and show LoA "
                              "selection popups straight away, so the participant can "
@@ -1374,6 +1425,16 @@ def main():
               "speed/steer/brake/junction and every other vehicle field stay at "
               "their defaults, so THIS RUN IS NOT USABLE PARTICIPANT DATA. It is "
               "a diagnostic for the heap corruption only.")
+    if args.sync and args.test_popup:
+        parser.error("--sync and --test-popup are incompatible: --test-popup "
+                     "does not start NPC_TRAFFIC, and that is the process that "
+                     "drives the clock in synchronous mode. Drive would sit "
+                     "waiting on a clock nobody advances. Teach the control "
+                     "without --sync -- the scene is frozen for every popup "
+                     "anyway, so the time step changes nothing there.")
+    if args.delta != 0.05 and not args.sync:
+        print("[WARN] --delta only applies with --sync; the server free-runs on "
+              "its own variable step without it, so this value is ignored.")
     if args.test_popup and args.no_popup:
         parser.error("--test-popup and --no-popup contradict each other: one is "
                      "nothing but popups, the other suppresses them.")
@@ -1485,7 +1546,13 @@ def main():
             print("[SKIP] NPC_TRAFFIC not started (--test-popup)")
         else:
             pm.start(
-                [sys.executable, "-m", "src.drive.fixed_npc_traffic", "--host", args.host, "--port", str(args.port)],
+                [sys.executable, "-m", "src.drive.fixed_npc_traffic",
+                 "--host", args.host, "--port", str(args.port),
+                 "--tm-port", str(TM_PORT),
+                 # This child owns the simulation clock under --sync. It is
+                 # started BEFORE Drive, which is what the arrangement needs:
+                 # the clock has to be running by the time Drive waits on it.
+                 *(["--sync", "--delta", str(args.delta)] if args.sync else [])],
                 "NPC_TRAFFIC"
             )
 
