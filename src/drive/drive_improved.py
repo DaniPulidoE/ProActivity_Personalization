@@ -417,13 +417,20 @@ def append_user_loa_selection(selection_row):
 def _set_world_frozen(world, frozen):
     """Freeze/unfreeze the whole scene while the LoA popup is open.
 
-    The server free-runs and a brake control only makes the ego *coast* to a stop
-    while NPC traffic keeps driving.
+    Two mechanisms, and the good one needs --sync.
 
-    Still needed under --sync, for a non-obvious reason: Drive is not the clock
-    owner there (fixed_npc_traffic.py is), so it cannot pause the scene by simply
-    declining to tick. It has to hold the vehicles explicitly, exactly as in
-    async mode.
+    WITH --sync AND a clock-pause file: ask the clock owner
+    (fixed_npc_traffic.py) to stop ticking. That is a true pause -- every vehicle
+    holds its exact position, heading, speed and wheel angle, and resumes from
+    there, because from the simulation's point of view no time passed. Drive
+    cannot do this alone: it is not the clock owner, so it asks by touching a
+    file the owner polls.
+
+    OTHERWISE (async, or no pause file): hold each vehicle at zero velocity, as
+    below. This is a poor substitute and the live run showed why -- traffic stops
+    dead at every popup and pulls away from rest afterwards, which reads as
+    obviously unnatural. It is kept because the free-running clock offers nothing
+    better: there is no tick to withhold.
 
     We deliberately do NOT toggle ``set_simulate_physics`` here: disabling and
     re-enabling a vehicle's physics resets its drivetrain state, so the ego
@@ -459,6 +466,12 @@ def _set_world_frozen(world, frozen):
     """
     if world is None or getattr(world, 'world', None) is None:
         return
+
+    pause_file = getattr(world, 'clock_pause_file', '') or ''
+    if getattr(world, 'sync', False) and pause_file:
+        _request_clock_pause(pause_file, frozen)
+        return
+
     try:
         vehicles = world.world.get_actors().filter('vehicle.*')
     except Exception:
@@ -491,6 +504,50 @@ def _set_world_frozen(world, frozen):
             except Exception:
                 pass
         world._frozen_velocities = {}
+
+
+def _request_clock_pause(pause_file, paused):
+    """Ask the --sync clock owner to hold (or release) the simulation.
+
+    The whole protocol is "does this file exist", which is enough because the
+    question has exactly two states and one writer. The file is REWRITTEN each
+    time rather than merely created: the owner ignores a request older than a few
+    minutes, so a Drive that dies mid-popup cannot leave the rig frozen, and the
+    mtime is what that check reads. The contents are for a human reading the file
+    during a debug session -- nothing parses them.
+    """
+    try:
+        if paused:
+            with open(pause_file, 'w') as f:
+                f.write(datetime.datetime.now().isoformat())
+        else:
+            try:
+                os.remove(pause_file)
+            except FileNotFoundError:
+                pass
+    except OSError as e:
+        # Falling back would mean silently reintroducing the stop-dead-and-pull-
+        # away behaviour this replaces, so say so rather than degrade quietly.
+        print("[WARN] Could not %s the clock-pause flag %s: %s. The scene will "
+              "NOT freeze for this popup."
+              % ('set' if paused else 'clear', pause_file, e))
+
+
+def _drive_is_holding_clock(args, loa_popup, end_overlay):
+    """True when Drive has asked the --sync clock owner to STOP ticking.
+
+    Drive must not then wait for a tick: it is the reason there is no tick. That
+    wait would block the loop for the full stall timeout on every frame, so the
+    popup the pause exists to serve would become unresponsive.
+
+    Only the clock-pause path counts. Without a pause file the freeze is done by
+    holding vehicles at zero velocity and the clock keeps running normally, so
+    Drive should keep pacing to it.
+    """
+    if not (getattr(args, 'sync', False)
+            and getattr(args, 'clock_pause_file', '')):
+        return False
+    return end_overlay is not None or loa_popup.active
 
 
 # How long to wait for the world clock before deciding it has stalled. Generous
@@ -1283,10 +1340,11 @@ FIXED_SPAWN_POINT_INDEX = 152
 class World(object):
     def __init__(self, carla_world, hud, traffic_manager, args):
         self.world = carla_world
-        # Kept for reference by anything reading World, but no longer branched on:
-        # restart() waits for a tick either way now, because Drive never ticks in
-        # either mode (see _await_world_tick).
+        # Drive never ticks in either mode (see _await_world_tick), so restart()
+        # no longer branches on this -- but _set_world_frozen does: the clock can
+        # only be genuinely paused when there is a fixed-step clock to withhold.
         self.sync = args.sync
+        self.clock_pause_file = getattr(args, 'clock_pause_file', '')
         self.traffic_manager = traffic_manager
         self.actor_role_name = args.rolename
         self.control_mode = args.control  # Store control mode
@@ -2760,8 +2818,49 @@ def game_loop(args):
         # True while the --sync world clock is not advancing, so the warning is
         # printed on the transition instead of once per frame.
         sync_stalled = False
+
+        # Loop rate cap. Under --sync the world clock paces this loop, so the cap
+        # only has to stay ABOVE the tick rate: at or below it, pygame would gate
+        # the loop and the participant would get fewer frames than the simulation
+        # is producing. It still matters while the clock is deliberately held for
+        # a popup, where it is the only thing stopping a busy-spin.
+        loop_cap = 60
+        if args.sync:
+            step = sim_world.get_settings().fixed_delta_seconds or 0.05
+            loop_cap = max(60, int(round(1.0 / step)) + 10)
+            print("[INFO] --sync: loop capped at %d Hz against a %.1f Hz world "
+                  "clock." % (loop_cap, 1.0 / step))
+
         while True:
-            clock.tick_busy_loop(60)
+            # Wait for the tick BEFORE draining input, not after.
+            #
+            # This ordering is the difference between one step of control latency
+            # and two. Input is read from the OS queue at the moment event.get()
+            # is called; whatever is applied afterwards takes effect on the next
+            # tick. With the wait placed after event.get() -- where the old
+            # sim_world.tick() call sat -- the events were already up to a full
+            # step old before the control derived from them was even applied, so
+            # a steering input could take two steps to reach the wheels. At 20 Hz
+            # that is 100 ms, which is squarely in the range a driver feels as
+            # lag. Waiting first means input is always drained immediately after a
+            # tick and lands on the very next one.
+            if args.sync and not _drive_is_holding_clock(args, loa_popup,
+                                                        end_overlay):
+                if _await_world_tick(sim_world):
+                    if sync_stalled:
+                        sync_stalled = False
+                        print("[INFO] World clock recovered.")
+                elif not sync_stalled:
+                    sync_stalled = True
+                    print("[WARN] No world tick for %.0fs. The clock owner "
+                          "(src/drive/fixed_npc_traffic.py --sync) has probably "
+                          "died; the scene is frozen but Drive stays responsive "
+                          "so the session can be ended cleanly."
+                          % SYNC_STALL_TIMEOUT_S)
+                    world.hud.notification('Simulation stalled - clock lost',
+                                           seconds=8.0)
+
+            clock.tick_busy_loop(loop_cap)
             now_ms = pygame.time.get_ticks()
             events = pygame.event.get()
 
@@ -2929,24 +3028,9 @@ def game_loop(args):
                 pygame.display.flip()
                 continue
 
-            if args.sync:
-                # Pace to the external clock rather than ticking. Placed exactly
-                # where the old sim_world.tick() was, so the ordering the rest of
-                # the loop assumes is unchanged: the world advances, then input
-                # is read and a control applied, which the next step consumes.
-                if _await_world_tick(sim_world):
-                    if sync_stalled:
-                        sync_stalled = False
-                        print("[INFO] World clock recovered.")
-                elif not sync_stalled:
-                    sync_stalled = True
-                    print("[WARN] No world tick for %.0fs. The clock owner "
-                          "(src/drive/fixed_npc_traffic.py --sync) has probably "
-                          "died; the scene is frozen but Drive stays responsive "
-                          "so the session can be ended cleanly."
-                          % SYNC_STALL_TIMEOUT_S)
-                    world.hud.notification('Simulation stalled - clock lost',
-                                           seconds=8.0)
+            # No tick or wait here: the wait moved to the TOP of the loop so that
+            # input is drained fresh off a tick and the control applied just below
+            # lands on the very next one. See the comment there.
             if controller.parse_events(client, world, clock, args.sync, events):
                 return
             world.tick(clock)
@@ -2963,6 +3047,13 @@ def game_loop(args):
         # ticking it, which blocks every client that connects afterwards.
         if original_settings:
             sim_world.apply_settings(original_settings)
+
+        # Release the clock unconditionally. Quitting with a popup open would
+        # otherwise leave the request file behind, and the clock owner outlives
+        # Drive -- it would sit holding the simulation until its staleness
+        # timeout. Cheap insurance against ending a session on a frozen rig.
+        if getattr(args, 'clock_pause_file', ''):
+            _request_clock_pause(args.clock_pause_file, False)
 
         if (world and world.recording_enabled):
             client.stop_recorder()
@@ -3045,6 +3136,13 @@ def main():
              'tick -- src/drive/fixed_npc_traffic.py --sync does both, because '
              'CARLA only lets the process that owns the NPCs\' traffic manager '
              'drive it. Launch both together (start_experiment.py --sync).')
+    argparser.add_argument(
+        '--clock-pause-file', dest='clock_pause_file', default='',
+        help='Path used to ask the --sync clock owner to hold the simulation '
+             'while a LoA popup is open, giving a true freeze-and-resume instead '
+             'of stopping every vehicle dead and making it pull away from rest. '
+             'Must match the clock owner\'s --pause-file. Ignored without '
+             '--sync; start_experiment.py --sync sets both.')
     argparser.add_argument(
         '--tm-port', dest='tm_port', default=8000, type=int,
         help='Traffic manager port (default: 8000). Under --sync this MUST '

@@ -185,6 +185,13 @@ DEFAULT_POPUP_WAIT_TIMEOUT = 180.0
 # children so neither can drift from the other.
 TM_PORT = 9000
 
+# Under --sync, how Drive asks the clock owner to hold the simulation while a LoA
+# popup is open. Defined HERE and passed to both children, rather than agreed on
+# by two files, because a silent disagreement about the path would not fail --
+# Drive would write a pause nobody reads and fall back to freezing every vehicle
+# individually, which is the unnatural behaviour the pause exists to remove.
+CLOCK_PAUSE_FILE = "clock_paused.flag"
+
 # THE RIG. Address of the CARLA machine on the dedicated Ethernet link between
 # the two study machines. Fixed for the whole data-collection run, so the
 # --experiment-*-carla-remote presets set it themselves rather than having it
@@ -466,7 +473,8 @@ def build_drive_cmd(session, args):
         # Under --sync this makes Drive wait on the clock instead of ticking, and
         # points it at the clock owner's traffic manager. Both halves have to
         # travel together -- see the --sync help text below.
-        *(["--sync", "--tm-port", str(TM_PORT)] if args.sync else []),
+        *(["--sync", "--tm-port", str(TM_PORT),
+           "--clock-pause-file", CLOCK_PAUSE_FILE] if args.sync else []),
         # Omitted when neither flag was given, so Drive keeps its own default
         # (the wheel when one is bound, the keyboard otherwise).
         *([f"--{args.popup_input}-input"] if args.popup_input else []),
@@ -1221,10 +1229,16 @@ def main():
                              "achieved rate every 30 s so you can tell. Sets up both "
                              "children correctly; do not pass --sync to either by "
                              "hand.")
-    parser.add_argument("--delta", type=float, default=0.05,
-                        help="Fixed time step in seconds for --sync (default 0.05 = "
-                             "20 Hz). KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND "
-                             "BOTH STUDY ARMS, for the same reason --decision-hz is "
+    parser.add_argument("--delta", type=float, default=0.025,
+                        help="Fixed time step in seconds for --sync (default 0.025 "
+                             "= 40 Hz). This is the rate at which the world visibly "
+                             "moves AND at which steering/throttle take effect, so "
+                             "it sets the smoothness and the control latency the "
+                             "driver feels. 0.0167 gives 60 Hz and is worth trying "
+                             "on a machine dedicated to CARLA -- check the [SYNC] "
+                             "lines from NPC_TRAFFIC still report the rate holding. "
+                             "KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND BOTH "
+                             "STUDY ARMS, for the same reason --decision-hz is "
                              "fixed: it changes the simulation the driver responds "
                              "to. Ignored without --sync.")
     parser.add_argument("--test-popup", dest="test_popup", action="store_true",
@@ -1432,7 +1446,7 @@ def main():
                      "waiting on a clock nobody advances. Teach the control "
                      "without --sync -- the scene is frozen for every popup "
                      "anyway, so the time step changes nothing there.")
-    if args.delta != 0.05 and not args.sync:
+    if args.delta != parser.get_default("delta") and not args.sync:
         print("[WARN] --delta only applies with --sync; the server free-runs on "
               "its own variable step without it, so this value is ignored.")
     if args.test_popup and args.no_popup:
@@ -1552,7 +1566,8 @@ def main():
                  # This child owns the simulation clock under --sync. It is
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.
-                 *(["--sync", "--delta", str(args.delta)] if args.sync else [])],
+                 *(["--sync", "--delta", str(args.delta),
+                    "--pause-file", CLOCK_PAUSE_FILE] if args.sync else [])],
                 "NPC_TRAFFIC"
             )
 

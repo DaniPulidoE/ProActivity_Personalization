@@ -35,10 +35,32 @@ variable, load-dependent amount of driving inside each label window.
 """
 
 import carla
+import os
 import random
 import signal
 import time
 import argparse
+
+
+# A pause request older than this is treated as abandoned and ignored. Drive
+# removes the file when the popup closes and again in its finally block, so the
+# only way one goes stale is Drive dying while a popup is open -- and a dead
+# Drive must not be able to freeze the rig indefinitely. Comfortably longer than
+# any real deliberation over a five-option prompt.
+PAUSE_MAX_AGE_S = 300.0
+
+
+def _pause_requested(path):
+    """True if Drive is currently asking for the clock to be held."""
+    if not path:
+        return False
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False  # gone, or unreadable: not a pause
+    if age > PAUSE_MAX_AGE_S:
+        return False
+    return True
 
 
 # Physics substep budget. CARLA's documented requirement is
@@ -48,6 +70,35 @@ import argparse
 MAX_SUBSTEP_DELTA_TIME = 0.01
 MAX_SUBSTEPS = 24
 SUBSTEP_BUDGET_S = MAX_SUBSTEP_DELTA_TIME * MAX_SUBSTEPS
+
+# How long to let the scene settle after destroying the previous fleet, and again
+# after spawning the new one before handing it to the traffic manager.
+SETTLE_S = 1.0
+
+
+def _advance_world(world, seconds, sync_mode, delta):
+    """Let SIMULATED time pass, under either clock.
+
+    The distinction this exists to enforce: time.sleep() advances the WALL clock.
+    In asynchronous mode the server free-runs, so sleeping also advances the
+    simulation and the two are interchangeable. Under --sync they are not --
+    simulated time only moves when this process ticks, so a bare sleep advances
+    the simulation by exactly nothing.
+
+    That difference caused a real bug. The 1 s sleep after destroying the old
+    fleet was quietly load-bearing: it gave the server time to commit the
+    destruction and let freshly spawned cars drop the small distance from their
+    spawn point onto the road and settle. Under --sync it became a 1 s pause in
+    which the world did not move at all, so vehicles were handed to the traffic
+    manager still overlapping geometry and mid-drop. One would get a violent
+    depenetration impulse at the first tick, end up wrecked at the start line,
+    and later fall out of the world and vanish.
+    """
+    if not sync_mode:
+        time.sleep(seconds)
+        return
+    for _ in range(max(1, int(round(seconds / delta)))):
+        world.tick()
 
 
 def _install_graceful_stop():
@@ -101,10 +152,24 @@ def main():
                              "too, so it waits on the clock instead of "
                              "free-running. Without this flag the server "
                              "free-runs exactly as before.")
-    parser.add_argument("--delta", type=float, default=0.05,
+    parser.add_argument("--delta", type=float, default=0.025,
                         help="Fixed time step in seconds for --sync (default "
-                             "0.05 = 20 Hz). Must stay <= max_substep_delta_time "
-                             "* max_substeps, enforced below.")
+                             "0.025 = 40 Hz). This is the rate at which the world "
+                             "visibly MOVES and at which controls take effect, so "
+                             "it sets both the smoothness and the input latency "
+                             "the driver feels -- 20 Hz was measurably holding but "
+                             "felt laggy. Try 0.0167 (60 Hz) on a machine "
+                             "dedicated to CARLA; watch the [SYNC] report and back "
+                             "off if it stops holding the rate. Must stay <= "
+                             "max_substep_delta_time * max_substeps.")
+    parser.add_argument("--pause-file", default="",
+                        help="Path Drive uses to ask for the clock to be held "
+                             "(--sync only). While the file exists this process "
+                             "stops ticking, which freezes the whole scene "
+                             "mid-motion -- the honest way to pause a "
+                             "simulation. Without it Drive falls back to holding "
+                             "each vehicle at zero velocity, which makes traffic "
+                             "stop dead and pull away from rest at every popup.")
     args = parser.parse_args()
 
     # Before connecting, so a bad --delta fails instantly instead of after a
@@ -132,6 +197,18 @@ def main():
     SYNC_MODE = args.sync
 
     FIXED_DELTA_SECONDS = args.delta
+
+    PAUSE_FILE = args.pause_file if SYNC_MODE else ""
+
+    # A flag left behind by a Drive that died mid-popup would otherwise hold this
+    # run's clock from the very first tick, which looks exactly like the rig
+    # hanging on startup. Cleared before anything depends on it.
+    if PAUSE_FILE:
+        try:
+            os.remove(PAUSE_FILE)
+            print(f"Removed stale clock-pause flag {PAUSE_FILE}")
+        except OSError:
+            pass
 
     # fixed npc vehicle config
     # (spawn_point_index, blueprint_id)
@@ -203,9 +280,12 @@ def main():
     # the server's physics thread, and with 11 vehicles that is negligible --
     # rendering is the bottleneck here, not vehicle dynamics.
     #
-    # Under --sync this stops being a mitigation and becomes exact: a fixed
-    # 0.05 s step needs 5 substeps of 0.01 s, always, so the tire solve never
-    # sees a coarse delta no matter what the machine is doing.
+    # Under --sync this stops being a mitigation and becomes exact: a fixed step
+    # always divides into the same whole number of substeps of at most 0.01 s
+    # (three at the 0.025 s default), so the tire solve never sees a coarse delta
+    # no matter what the machine is doing. Raising the tick rate only makes this
+    # safer -- a smaller step needs FEWER substeps, so the budget is never the
+    # thing that limits how high --delta can go.
     settings.substepping = True
     settings.max_substep_delta_time = MAX_SUBSTEP_DELTA_TIME
     settings.max_substeps = MAX_SUBSTEPS
@@ -294,7 +374,9 @@ def main():
         except:
             pass
 
-    time.sleep(1)
+    # Ticks under --sync, sleeps otherwise -- see _advance_world. A bare sleep
+    # here is what left a wrecked car on the start line.
+    _advance_world(world, SETTLE_S, SYNC_MODE, FIXED_DELTA_SECONDS)
 
     # =========================
     # SPAWN VEHICLES
@@ -305,6 +387,9 @@ def main():
     spawn_points = world.get_map().get_spawn_points()
 
     vehicles_list = []
+    # (actor, blueprint_id) for the second pass. Separate from vehicles_list,
+    # which exists only so the cleanup handler can destroy everything.
+    spawned = []
 
     print("Spawning fixed NPC vehicles...")
 
@@ -329,61 +414,100 @@ def main():
                 print(f"Failed spawn at {spawn_index}")
                 continue
 
-            # autopilot
-            vehicle.set_autopilot(True, TM_PORT)
-
-            # Lane changes OFF, and the reason is STUDY DESIGN, not the time
-            # step. --sync does remove one of the two things that made TM lane
-            # changes collide here (it acted on a snapshot up to a frame stale,
-            # so the gap it committed to had already moved), and if these
-            # comments only said that, a future reader running --sync would
-            # rightly turn them back on. The reason that survives: a lane change
-            # is the manoeuvre where the TM's gap check is weakest, an NPC
-            # collision in front of the participant is a confound in the LoA
-            # label for that window, and the NPCs are here to populate the scene
-            # rather than to overtake. Nothing the study measures is worse off
-            # without them. Worth re-testing under --sync only if the traffic
-            # ever needs to look livelier -- and then as a deliberate change
-            # fixed across all participants, never mid-run.
-            tm.auto_lane_change(vehicle, False)
-
-            # 8 m, likewise independent of the time step: 5 m is under a 0.4 s
-            # headway at urban speeds, where real following distances are 1-2 s,
-            # so any leader braking became a rear-end hit with or without exact
-            # physics. --sync makes the controller's reaction deterministic; it
-            # does not give it more room to react in.
-            tm.distance_to_leading_vehicle(vehicle, 8.0)
-
-            # Speed, and the reason the sign matters: in this API a NEGATIVE
-            # percentage means FASTER than the posted limit. random.uniform(-10,
-            # 10) therefore ran the whole fleet at 90-110% of the limit, while
-            # CARLA's own default for traffic-manager vehicles is +30 (i.e. 70%
-            # of the limit). The NPCs were doing roughly a third more speed than
-            # the controller is tuned for, everywhere, including into corners.
-            #
-            # Positive values here put them back under the limit; heavy vehicles
-            # get more, because their stable cornering speed is genuinely lower.
-            #
-            # Unaffected by --sync: a fixed time step integrates the dynamics
-            # exactly, it does not teach the TM's lateral controller to pick a
-            # corner entry speed a firetruck can actually hold. If --sync turns
-            # out to remove enough of the spin-outs that this looks over-cautious,
-            # relax it deliberately and re-measure -- and keep whatever value is
-            # chosen fixed across every participant and both study arms, for the
-            # same reason --decision-hz and --delta are fixed.
-            if blueprint_id in HEAVY_BLUEPRINTS:
-                speed_penalty = random.uniform(35, 55)
-            else:
-                speed_penalty = random.uniform(15, 35)
-
-            tm.vehicle_percentage_speed_difference(vehicle, speed_penalty)
-
+            # NOT handed to the traffic manager yet -- that happens in a second
+            # pass, after the settle below. A car is spawned a short distance
+            # above the road and has to drop onto it; enabling autopilot here
+            # means the traffic manager starts steering and throttling it while
+            # it is still airborne, and it lands under power with the wheels
+            # already turned. That is survivable for a hatchback and not for a
+            # firetruck.
             vehicles_list.append(vehicle)
+            spawned.append((vehicle, blueprint_id))
 
             print(
                 f"Spawned: {vehicle.type_id} "
                 f"at spawn point {spawn_index}"
             )
+
+        except Exception as e:
+            print(e)
+
+    # Let the fleet drop, settle on its suspension and come to rest BEFORE the
+    # traffic manager touches it.
+    print("Settling %d vehicles..." % len(spawned))
+    _advance_world(world, SETTLE_S, SYNC_MODE, FIXED_DELTA_SECONDS)
+
+    # =========================
+    # HAND THE FLEET TO THE TRAFFIC MANAGER
+    # =========================
+
+    print("Enabling autopilot...")
+
+    for vehicle, blueprint_id in spawned:
+
+        try:
+
+            vehicle.set_autopilot(True, TM_PORT)
+
+            # Lane changes: OFF under the free-running clock, ON under --sync.
+            #
+            # Two separate things made traffic-manager lane changes collide here.
+            # One was the time step: it committed to a gap measured from a world
+            # snapshot up to a full frame stale, and at the frame times this rig
+            # hits in async the gap had already moved. --sync removes that
+            # entirely -- the snapshot is exact and the reaction deterministic.
+            # The other is that its gap check is imperfect in any mode.
+            #
+            # Under --sync the first cause is gone and the remaining risk is
+            # worth taking, because switching them off had a consequence that
+            # only shows up in a live drive: with no overtaking, one slow heavy
+            # vehicle turns into a permanent rolling roadblock and the entire
+            # fleet queues behind it. That reads as far more unnatural to a
+            # participant than an occasional imperfect merge, and a queue of
+            # stationary traffic is its own confound.
+            tm.auto_lane_change(vehicle, SYNC_MODE)
+
+            # 8 m, independent of the time step: 5 m is under a 0.4 s headway at
+            # urban speeds, where real following distances are 1-2 s, so any
+            # leader braking became a rear-end hit with or without exact physics.
+            # --sync makes the controller's reaction deterministic; it does not
+            # give it more room to react in.
+            tm.distance_to_leading_vehicle(vehicle, 8.0)
+
+            # Speed, and the reason the sign matters: in this API a NEGATIVE
+            # percentage means FASTER than the posted limit. The original
+            # random.uniform(-10, 10) ran the whole fleet at 90-110% of the
+            # limit, while CARLA's own default for traffic-manager vehicles is
+            # +30 (i.e. 70%). The NPCs were doing roughly a third more speed than
+            # the controller is tuned for, everywhere, including into corners.
+            #
+            # The values are per-clock, because what they are compensating for is
+            # different in each:
+            #
+            #   async  large penalties. The spin-outs there are an integration
+            #          failure -- a coarse substep delta under load -- and the
+            #          only lever this script has over that is to lower the
+            #          speeds the solver has to cope with.
+            #   sync   modest penalties. Physics is integrated exactly, so the
+            #          only thing left to respect is that the lateral controller
+            #          picks a corner entry speed from road geometry without
+            #          consulting mass or centre-of-gravity height. Heavy
+            #          vehicles still get more, but nothing needs to crawl, and
+            #          the first --sync run showed that crawling is exactly how
+            #          the previous async-tuned numbers felt.
+            #
+            # Whichever clock is used for the study, keep these fixed across
+            # every participant and both arms, for the same reason
+            # --decision-hz and --delta are fixed.
+            if SYNC_MODE:
+                speed_range = (20, 35) if blueprint_id in HEAVY_BLUEPRINTS \
+                    else (0, 15)
+            else:
+                speed_range = (35, 55) if blueprint_id in HEAVY_BLUEPRINTS \
+                    else (15, 35)
+
+            tm.vehicle_percentage_speed_difference(
+                vehicle, random.uniform(*speed_range))
 
         except Exception as e:
             print(e)
@@ -433,8 +557,29 @@ def main():
 
         consecutive_failures = 0
         MAX_CONSECUTIVE_FAILURES = 3
+        paused = False
 
         while True:
+
+            # Drive asking for a hold while a LoA popup is open. Not ticking IS
+            # the pause: every vehicle stays exactly where and as it was, mid
+            # corner, mid overtake, wheels turned, at whatever speed it had, and
+            # resumes from there when the file goes away. Nothing is overridden,
+            # no velocity is injected and no car has to pull away from rest, so
+            # the resume is invisible -- from the simulation's point of view no
+            # time passed, because none did.
+            if _pause_requested(PAUSE_FILE):
+                if not paused:
+                    paused = True
+                    print("[SYNC] clock held (Drive popup open).")
+                time.sleep(FIXED_DELTA_SECONDS)
+                # Deadline rebased so the hold is not then reported as lag.
+                next_tick = time.perf_counter()
+                continue
+            if paused:
+                paused = False
+                print("[SYNC] clock released.")
+                next_tick = time.perf_counter()
 
             try:
                 world.tick()
