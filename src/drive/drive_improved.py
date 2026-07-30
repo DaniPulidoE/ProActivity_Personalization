@@ -1087,11 +1087,13 @@ class LoASelectionPopup(object):
                 hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
                         'Use number keys 0-4 and ENTER, or N for no input.')
 
-        # Keyboard mode is the spoken-answer setup: the driver says the levels
-        # out loud and the experimenter enters them, so the instruction has to
-        # ask for speech rather than for a key press.
-        instruction = ('Say EVERY Level of Proactivity you would accept for the '
-                       'last 20 seconds.'
+        # Keyboard mode is the spoken-answer setup: the driver answers out loud
+        # and the experimenter types it. 'Read out' rather than 'say' on purpose
+        # — it points at the numbered list below, so the driver utters the
+        # numbers the experimenter has to type instead of paraphrasing ('the
+        # veto one'), which is where transcription errors come from.
+        instruction = ('Read out EVERY Level of Proactivity you would accept for '
+                       'the last 20 seconds.'
                        if self.input_mode != POPUP_INPUT_WHEEL
                        else 'Mark EVERY Level of Proactivity you would accept '
                             'for the last 20 seconds.')
@@ -1138,16 +1140,20 @@ class LoASelectionPopup(object):
             display.blit(surface, rect)
             y += 45
 
-        # In keyboard mode there is no cursor to park on a CONFIRM row, so the
-        # line names the key that actually submits instead.
-        confirm_label = ('CONFIRM' if self.input_mode == POPUP_INPUT_WHEEL
-                         else 'Press ENTER to confirm')
+        # The CONFIRM and NO INPUT rows exist for the wheel: they are the two
+        # rows its single front button parks on, so without them the wheel could
+        # neither submit nor discard. Keyboard mode addresses ENTER and N
+        # directly and never draws a cursor, so the rows would be two lines of
+        # instruction aimed at the experimenter on a screen the participant is
+        # reading — the popup ends at the level list instead.
+        if self.input_mode != POPUP_INPUT_WHEEL:
+            return
+
         if self.chosen:
-            confirm_text = '%s (%s)' % (
-                confirm_label, ', '.join(str(v) for v in sorted(self.chosen)))
+            confirm_text = 'CONFIRM (%s)' % ', '.join(str(v) for v in sorted(self.chosen))
             confirm_colour = (255, 220, 0) if self.selected == CONFIRM_ROW else (200, 200, 200)
         else:
-            confirm_text = '%s (tick at least one level first)' % confirm_label
+            confirm_text = 'CONFIRM (tick at least one level first)'
             confirm_colour = (140, 140, 140)
         if self.selected == CONFIRM_ROW:
             confirm_text = '> %s <' % confirm_text
@@ -1159,10 +1165,7 @@ class LoASelectionPopup(object):
         # findable when it is needed and unremarkable the rest of the time,
         # because a discard that looks as inviting as CONFIRM is one a tired
         # participant will start reaching for.
-        no_input_label = ('NO INPUT - discard this question, nothing is saved'
-                          if self.input_mode == POPUP_INPUT_WHEEL
-                          else 'Press N for no input - discard this question, '
-                               'nothing is saved')
+        no_input_label = 'NO INPUT - discard this question, nothing is saved'
         if self.selected == NO_INPUT_ROW:
             no_input_label = '> %s <' % no_input_label
             no_input_colour = (255, 170, 90)
