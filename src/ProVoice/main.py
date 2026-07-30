@@ -177,78 +177,50 @@ def _normalize_argv(tokens):
 # ── Camera selection ─────────────────────────────────────────────────────────
 # There is no camera *identity* anywhere in this pipeline: DataCollector passes
 # whatever it is given straight to cv2.VideoCapture, and an index means only
-# "the n-th device this OpenCV backend enumerated". On Windows that order
-# normally puts a laptop's built-in camera at 0 and a USB webcam after it, so
-# --webcam takes the lowest working index above 0. That is a CONVENTION, not a
-# guarantee (see the docstrings below) -- the probe prints the full map so the
-# operator can see what was picked and pin it with camera_source=N instead.
-_CAMERA_PROBE_RANGE = 5
+# "the n-th device this OpenCV backend enumerated". On the study machine that
+# order puts the built-in camera at 0 and the external USB webcam at 1, so
+# --webcam is exactly "use index 1" -- no probing, no fallback. If the machine
+# ever enumerates differently, pin the device with camera_source=N instead.
+_WEBCAM_INDEX = 1
 
 
-def _probe_cameras(max_index: int = _CAMERA_PROBE_RANGE) -> list[int]:
-    """Open every index in ``range(max_index)`` and report which ones answer.
+def _check_camera_index(index: int) -> str:
+    """``""`` if ``index`` opens AND delivers a frame, else why it didn't.
 
-    Probing goes through the SAME (default) backend DataCollector opens with.
-    This matters: an index is only meaningful relative to a backend, and on
-    Windows MSMF and DSHOW enumerate devices separately, so probing with one
-    and opening with the other can land on a different physical camera.
+    Both halves matter. cv2.VideoCapture does not raise on a missing device and
+    an index that is merely *claimed* by a driver can still return nothing, so
+    isOpened() alone would pass a camera that yields no frames -- DataCollector
+    would keep visual_enabled=True and run the whole session blind.
 
-    Each probe is released immediately, and all of them before this returns --
-    the device has to be free again when DataCollector opens it moments later.
-    A failing index is slow on Windows (the backend waits for a device that
-    isn't there), so this costs a few seconds at startup.
+    Checked through the SAME (default) backend DataCollector opens with: an
+    index is only meaningful relative to a backend, and on Windows MSMF and
+    DSHOW enumerate devices separately, so checking with one and opening with
+    the other can land on a different physical camera.
     """
     try:
         import cv2
     except Exception as e:  # noqa: BLE001 — no OpenCV means no camera at all
-        print(f"[camera] cannot probe: OpenCV unavailable ({e})")
-        return []
+        return f"OpenCV is unavailable ({e})"
 
-    found: list[int] = []
-    for i in range(max_index):
-        cap = None
-        ok = False
-        try:
-            cap = cv2.VideoCapture(i)
-            ok = bool(cap.isOpened())
-        except Exception as e:  # noqa: BLE001 — a bad index must not be fatal
-            print(f"[camera] index {i}: probe raised {e!r}")
-        finally:
-            if cap is not None:
-                cap.release()
-        print(f"[camera] index {i}: {'OPEN' if ok else 'unavailable'}")
-        if ok:
-            found.append(i)
-    return found
-
-
-def _select_webcam(max_index: int = _CAMERA_PROBE_RANGE) -> int:
-    """Lowest working camera index ABOVE 0 — the external webcam on a laptop.
-
-    Falls back to 0 with a loud warning when nothing else answers, because the
-    alternative (an unopenable index) fails silently: cv2.VideoCapture does not
-    raise on a missing device, so DataCollector would keep visual_enabled=True
-    and run the whole session blind.
-    """
-    found = _probe_cameras(max_index)
-    # The probe just closed the device DataCollector is about to open, and
-    # Windows does not always free a capture device the instant release()
-    # returns. The gap between here and cv2.VideoCapture() downstream is a few
-    # milliseconds, so give the driver a moment rather than racing it.
-    time.sleep(1.0)
-    external = [i for i in found if i > 0]
-    if external:
-        chosen = external[0]
-        if len(external) > 1:
-            print(f"[camera] --webcam: {len(external)} cameras above index 0 "
-                  f"({external}); taking the lowest. Pin one with camera_source=N "
-                  f"if this is the wrong device.")
-        print(f"[camera] --webcam: selected index {chosen}")
-        return chosen
-    print(f"[camera] --webcam: NO camera opened above index 0 "
-          f"(working indices: {found or 'none'}). Falling back to index 0, the "
-          f"built-in camera — CHECK THIS IS THE CAMERA YOU MEANT before driving.")
-    return 0
+    cap = None
+    try:
+        cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            return "no device answered at that index"
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return "the device opened but returned no frame"
+        return ""
+    except Exception as e:  # noqa: BLE001 — a bad index must not crash startup
+        return f"opening it raised {e!r}"
+    finally:
+        if cap is not None:
+            cap.release()
+        # This just closed the device DataCollector is about to open, and
+        # Windows does not always free a capture device the instant release()
+        # returns. The gap between here and cv2.VideoCapture() downstream is a
+        # few milliseconds, so give the driver a moment rather than racing it.
+        time.sleep(1.0)
 
 
 def _build_parser() -> ap.ArgumentParser:
@@ -279,12 +251,11 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--camera-source", dest="camera_source", default="front")
     p.add_argument("--camera-url", dest="camera_url", default="udp://127.0.0.1:8554")
     p.add_argument("--webcam", action="store_true",
-                   help="Probe camera indices 0..%d and use the lowest that opens "
-                        "above 0 — the external webcam on a laptop, where 0 is the "
-                        "built-in one. Only fills in for the DEFAULT camera source; "
-                        "an explicit camera_source= still wins. Adds a few seconds "
-                        "to startup and is a convention, not a guarantee: check the "
-                        "printed map." % (_CAMERA_PROBE_RANGE - 1))
+                   help="Use camera index %d — the external USB webcam, where 0 is "
+                        "the built-in one. Startup FAILS if that index does not "
+                        "deliver a frame, rather than recording a blind session. "
+                        "Only fills in for the DEFAULT camera source; an explicit "
+                        "camera_source= still wins." % _WEBCAM_INDEX)
     p.add_argument("--vehicle-id", dest="vehicle_id", default=None,
                    help="Skip vehicle_id.txt discovery when set.")
     p.add_argument("--host", default="localhost")
@@ -951,7 +922,20 @@ def main():
         webcam = False
 
     if webcam:
-        cam_index = _select_webcam()
+        cam_index = _WEBCAM_INDEX
+        # Refuse up front rather than discover it at the end. Every visual and
+        # physiological signal (EAR, MAR, gaze, emotion, HR, RR) comes off this
+        # camera, so a session that starts without it records nothing usable --
+        # and the failure is trivially fixable in the 30 s before driving.
+        why = _check_camera_index(cam_index)
+        if why:
+            raise SystemExit(
+                f"[FATAL] --webcam expects the external webcam at camera index "
+                f"{cam_index}, but {why}. Nothing visual or physiological would be "
+                f"recorded this session. Replug the webcam and retry, or pin the "
+                f"right device with camera_source=N (0 is normally the built-in "
+                f"camera). Drop --webcam to accept index 0 without this check.")
+        print(f"[camera] --webcam: using index {cam_index}")
     elif camera_source == "udp":
         cam_index = camera_url
     elif camera_source.isdigit():

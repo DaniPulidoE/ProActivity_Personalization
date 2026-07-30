@@ -426,9 +426,32 @@ def _set_world_frozen(world, frozen):
     comes back gutless (sluggish acceleration, lower top speed). Instead we use
     CARLA's constant-velocity hold, which pins each vehicle at 0 m/s server-side
     every tick while leaving the engine, gearbox and wheels fully alive. On
-    resume we release the hold and restore each vehicle's saved velocity, so the
-    ego keeps the speed it had before the popup and accelerates exactly as
-    before. No-ops harmlessly if the world/actor query fails.
+    resume we release the hold and restore the EGO's saved velocity, so the
+    participant keeps the speed they had before the popup and accelerates exactly
+    as before. No-ops harmlessly if the world/actor query fails.
+
+    Velocity is restored for the ego ONLY, and this asymmetry is deliberate --
+    restoring it on the NPCs was making them crash. Two reasons:
+
+    * set_target_velocity() injects a world-frame velocity vector directly into
+      the rigid body. After a hold the wheels have spun down to rest, so a car
+      handed back 12 m/s has tires at zero angular velocity: full slip, one
+      frame, in whatever direction it was previously travelling. On a car that
+      was mid-corner, that direction no longer matches its heading. The result
+      looks exactly like a vehicle that entered a turn far too fast and lost the
+      back end -- and it was happening to all eleven NPCs every 20 s, which is
+      why the crashes seemed constant. The ego escapes this because the
+      participant is steering it and it is under a wheel/pedal control loop, not
+      a waypoint follower.
+    * The CARLA docs warn outright that enabling a constant velocity on a
+      traffic-manager vehicle "may cause conflicts", because it overrides the
+      TM's own velocity changes. Releasing the NPCs at rest and letting the TM
+      accelerate them normally keeps that override as brief as possible.
+
+    Angular velocity is zeroed at freeze time for the same reason: the constant-
+    velocity hold pins LINEAR velocity only, so a vehicle caught mid-turn keeps
+    yawing on the spot for the whole popup and can be facing well out of its lane
+    by the time it is released.
     """
     if world is None or getattr(world, 'world', None) is None:
         return
@@ -437,12 +460,18 @@ def _set_world_frozen(world, frozen):
     except Exception:
         return
 
+    ego_id = getattr(getattr(world, 'player', None), 'id', None)
+    zero = carla.Vector3D(0, 0, 0)
+
     if frozen:
         saved = {}
         for actor in vehicles:
             try:
-                saved[actor.id] = (actor.get_velocity(), actor.get_angular_velocity())
-                actor.enable_constant_velocity(carla.Vector3D(0, 0, 0))
+                if actor.id == ego_id:
+                    saved[actor.id] = (actor.get_velocity(),
+                                       actor.get_angular_velocity())
+                actor.enable_constant_velocity(zero)
+                actor.set_target_angular_velocity(zero)
             except Exception:
                 pass
         world._frozen_velocities = saved
@@ -2524,7 +2553,7 @@ def _advance_or_close(loa_popup, world, now_ms):
 
 
 def game_loop(args):
-    # SDL's default is to MINIMISE a fullscreen window whenever it loses
+     # SDL's default is to MINIMISE a fullscreen window whenever it loses
     # keyboard focus, and nothing here would ever restore it -- so any window
     # that flashes into the foreground for a few hundred milliseconds drops the
     # drive into the taskbar for the rest of the run, with no user input and
@@ -2543,7 +2572,6 @@ def game_loop(args):
     # setdefault, not assignment: an operator who deliberately exported the
     # variable keeps their choice.
     os.environ.setdefault('SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS', '0')
-
     pygame.init()
     pygame.font.init()
     world = None

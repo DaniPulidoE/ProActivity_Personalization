@@ -75,6 +75,22 @@ def main():
         (50, "vehicle.taxi.ford"),
     ]
 
+    # Vans, trucks and the big SUV. The traffic manager's lateral controller is
+    # tuned for a sedan-sized vehicle: it picks a corner entry speed from the
+    # road geometry, not from the mass and centre-of-gravity height of the thing
+    # it is steering. Five of the eleven blueprints above are heavy and tall, and
+    # they are the ones that understeer wide, catch a kerb and then drift. They
+    # get a much larger speed penalty below rather than being removed, because
+    # the mix of vehicle types is part of the scene the participant is driving in.
+    HEAVY_BLUEPRINTS = {
+        "vehicle.sprinter.mercedes",
+        "vehicle.ambulance.ford",
+        "vehicle.firetruck.actors",
+        "vehicle.fuso.mitsubishi",
+        "vehicle.carlacola.actors",
+        "vehicle.nissan.patrol",
+    }
+
     # =========================
     # CONNECT
     # =========================
@@ -95,6 +111,25 @@ def main():
         settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
     else:
         settings.synchronous_mode = False
+
+    # Physics substep headroom -- this is why NPCs spin out and drift.
+    #
+    # In async mode the frame delta is whatever the server managed, and physics
+    # is integrated in substeps capped by max_substeps * max_substep_delta_time.
+    # CARLA's defaults (10 * 0.01) give a budget of 0.1 s of simulated time per
+    # frame. This rig runs the CARLA server, Drive AND the ProVoice perception
+    # stack (YOLO26 + MediaPipe + rPPG + EmotiEffLib) on one machine, so frames
+    # routinely take longer than that -- and when they do, the substep delta is
+    # stretched past 0.01 s. The tire/suspension model is stiff and integrating
+    # it at a coarse delta is exactly what produces "took the corner too fast,
+    # now it is drifting": the slip solve diverges, not the driving logic.
+    #
+    # 24 * 0.01 keeps substeps at or under 0.01 s down to ~4 FPS. Cost is CPU on
+    # the server's physics thread, and with 11 vehicles that is negligible --
+    # rendering is the bottleneck here, not vehicle dynamics.
+    settings.substepping = True
+    settings.max_substep_delta_time = 0.01
+    settings.max_substeps = 24
 
     world.apply_settings(settings)
 
@@ -193,15 +228,35 @@ def main():
             # autopilot
             vehicle.set_autopilot(True, TM_PORT)
 
-            # lane change
-            tm.auto_lane_change(vehicle, True)
+            # Lane changes OFF. The traffic manager decides to change lane from
+            # its own world snapshot, and in async mode that snapshot is up to a
+            # full frame stale -- at the frame times this rig actually hits, the
+            # gap it thought was there has moved. This is the source of the
+            # "drives into the car next to it" collisions; a vehicle that stays
+            # in lane has no such failure mode. Costs nothing the study needs:
+            # the NPCs exist to populate the scene, not to overtake.
+            tm.auto_lane_change(vehicle, False)
 
-            tm.distance_to_leading_vehicle(vehicle, 5.0)
+            # 5 m was under a 0.4 s headway at urban speeds -- less than one
+            # decision frame of margin, so any leader braking became a rear-end
+            # hit. 8 m gives the controller room to respond to a stale snapshot.
+            tm.distance_to_leading_vehicle(vehicle, 8.0)
 
-            tm.vehicle_percentage_speed_difference(
-                vehicle,
-                random.uniform(-10, 10)
-            )
+            # Speed, and the reason the sign matters: in this API a NEGATIVE
+            # percentage means FASTER than the posted limit. random.uniform(-10,
+            # 10) therefore ran the whole fleet at 90-110% of the limit, while
+            # CARLA's own default for traffic-manager vehicles is +30 (i.e. 70%
+            # of the limit). The NPCs were doing roughly a third more speed than
+            # the controller is tuned for, everywhere, including into corners.
+            #
+            # Positive values here put them back under the limit; heavy vehicles
+            # get more, because their stable cornering speed is genuinely lower.
+            if blueprint_id in HEAVY_BLUEPRINTS:
+                speed_penalty = random.uniform(35, 55)
+            else:
+                speed_penalty = random.uniform(15, 35)
+
+            tm.vehicle_percentage_speed_difference(vehicle, speed_penalty)
 
             vehicles_list.append(vehicle)
 
