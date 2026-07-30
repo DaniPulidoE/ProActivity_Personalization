@@ -318,8 +318,14 @@ def report_physics(vehicle):
 
 
 def apply_overrides(vehicle, args):
-    """Runtime-only physics changes, so a candidate fix can be felt immediately."""
-    if args.set_brake_torque is None and args.set_abs is None:
+    """Runtime-only physics changes, so a candidate fix can be felt immediately.
+
+    The write is read back and verified: Chaos silently ignores parts of a
+    physics-control write in some builds, and an override that never landed
+    looks exactly like an override that made no difference.
+    """
+    if (args.set_brake_torque is None and args.set_abs is None
+            and args.set_friction is None):
         return False
     pc = vehicle.get_physics_control()
     wheels = []
@@ -328,13 +334,35 @@ def apply_overrides(vehicle, args):
             w.max_brake_torque = args.set_brake_torque
         if args.set_abs is not None:
             w.abs_enabled = (args.set_abs == 'on')
+        if args.set_friction is not None:
+            w.friction_force_multiplier = args.set_friction
         wheels.append(w)
     pc.wheels = wheels
     vehicle.apply_physics_control(pc)
-    print("[INFO] Applied override: brake_torque=%s abs=%s (this process only, "
-          "reverts when the actor is respawned)"
-          % (args.set_brake_torque, args.set_abs))
-    return True
+    print("[INFO] Requested override: brake_torque=%s abs=%s friction=%s "
+          "(this process only, reverts when the actor is respawned)"
+          % (args.set_brake_torque, args.set_abs, args.set_friction))
+
+    back = vehicle.get_physics_control()
+    landed = True
+    for i, w in enumerate(back.wheels):
+        if (args.set_brake_torque is not None
+                and abs(w.max_brake_torque - args.set_brake_torque) > 1.0):
+            print("[FAIL] wheel %d max_brake_torque stayed at %.0f -- the write "
+                  "was ignored." % (i, w.max_brake_torque))
+            landed = False
+        if args.set_abs is not None and w.abs_enabled != (args.set_abs == 'on'):
+            print("[FAIL] wheel %d abs_enabled stayed at %s -- the write was "
+                  "ignored." % (i, w.abs_enabled))
+            landed = False
+        if (args.set_friction is not None
+                and abs(w.friction_force_multiplier - args.set_friction) > 0.01):
+            print("[FAIL] wheel %d friction_force_multiplier stayed at %.2f -- the "
+                  "write was ignored." % (i, w.friction_force_multiplier))
+            landed = False
+    if landed:
+        print("[ OK ] Override verified on all %d wheels." % len(back.wheels))
+    return landed
 
 
 # ==============================================================================
@@ -558,6 +586,9 @@ def main():
                    help='override max_brake_torque on every wheel before testing')
     p.add_argument('--set-abs', choices=['on', 'off'], default=None,
                    help='override abs_enabled on every wheel before testing')
+    p.add_argument('--set-friction', type=float, default=None,
+                   help='override friction_force_multiplier on every wheel '
+                        '(the tyre-grip ceiling) before testing')
     args = p.parse_args()
 
     if args.mode in ('all', 'pedal'):
