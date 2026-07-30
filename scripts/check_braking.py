@@ -262,6 +262,132 @@ class Ticker:
 
 
 # ==============================================================================
+# -- write probe ---------------------------------------------------------------
+# ==============================================================================
+
+
+def _probe_one(vehicle, ticker, client, label, mutate, read, use_batch=False):
+    """Write one field, tick, read it back, restore. Reports whether it stuck.
+
+    CARLA 0.10 moved vehicle physics onto Chaos and not every field of
+    VehiclePhysicsControl survives the round trip. Which ones do is a property
+    of the build, so it is measured rather than assumed.
+    """
+    original_pc = vehicle.get_physics_control()
+    before = read(vehicle.get_physics_control())
+
+    pc = vehicle.get_physics_control()
+    want = mutate(pc)
+    if use_batch:
+        client.apply_batch_sync(
+            [carla.command.ApplyVehiclePhysicsControl(vehicle.id, pc)], False)
+    else:
+        vehicle.apply_physics_control(pc)
+    for _ in range(3):
+        ticker.step()
+    after = read(vehicle.get_physics_control())
+
+    if isinstance(want, bool):
+        stuck = (after == want)
+    else:
+        stuck = abs(float(after) - float(want)) <= max(1e-3, abs(want) * 1e-3)
+    print("  %-34s %-10s -> %-10s  want %-10s  %s"
+          % (label, _fmt(before), _fmt(after), _fmt(want),
+             "STICKS" if stuck else "IGNORED"))
+
+    vehicle.apply_physics_control(original_pc)
+    for _ in range(2):
+        ticker.step()
+    return stuck
+
+
+def _fmt(v):
+    if isinstance(v, bool):
+        return str(v)
+    return "%.3f" % float(v)
+
+
+def probe_writes(vehicle, ticker, client):
+    """Which physics fields can actually be written on this CARLA build?"""
+    print("Probing which VehiclePhysicsControl fields survive a write+tick.")
+    print("Each field is written, ticked, read back, then restored.\n")
+
+    def wheels_set(pc, field, value):
+        ws = []
+        for w in pc.wheels:
+            setattr(w, field, value)
+            ws.append(w)
+        pc.wheels = ws
+        return value
+
+    results = {}
+    print("TOP-LEVEL FIELDS")
+    results['mass'] = _probe_one(
+        vehicle, ticker, client, 'mass',
+        lambda pc: setattr(pc, 'mass', pc.mass * 0.5) or pc.mass,
+        lambda pc: pc.mass)
+    results['drag_coefficient'] = _probe_one(
+        vehicle, ticker, client, 'drag_coefficient',
+        lambda pc: setattr(pc, 'drag_coefficient', pc.drag_coefficient + 1.0) or pc.drag_coefficient,
+        lambda pc: pc.drag_coefficient)
+    results['use_sweep_wheel_collision'] = _probe_one(
+        vehicle, ticker, client, 'use_sweep_wheel_collision',
+        lambda pc: setattr(pc, 'use_sweep_wheel_collision',
+                           not pc.use_sweep_wheel_collision) or pc.use_sweep_wheel_collision,
+        lambda pc: pc.use_sweep_wheel_collision)
+
+    print("\nPER-WHEEL FIELDS (apply_physics_control)")
+    results['max_brake_torque'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].max_brake_torque',
+        lambda pc: wheels_set(pc, 'max_brake_torque', 4000.0),
+        lambda pc: pc.wheels[0].max_brake_torque)
+    results['friction_force_multiplier'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].friction_force_multiplier',
+        lambda pc: wheels_set(pc, 'friction_force_multiplier', 3.5),
+        lambda pc: pc.wheels[0].friction_force_multiplier)
+    results['abs_enabled'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].abs_enabled',
+        lambda pc: wheels_set(pc, 'abs_enabled',
+                              not pc.wheels[0].abs_enabled),
+        lambda pc: pc.wheels[0].abs_enabled)
+    results['max_hand_brake_torque'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].max_hand_brake_torque',
+        lambda pc: wheels_set(pc, 'max_hand_brake_torque', 6000.0),
+        lambda pc: pc.wheels[0].max_hand_brake_torque)
+    results['wheel_radius'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].wheel_radius',
+        lambda pc: wheels_set(pc, 'wheel_radius', pc.wheels[0].wheel_radius * 1.5),
+        lambda pc: pc.wheels[0].wheel_radius)
+
+    print("\nPER-WHEEL VIA BATCH COMMAND (different server code path)")
+    results['max_brake_torque_batch'] = _probe_one(
+        vehicle, ticker, client, 'wheels[].max_brake_torque (batch)',
+        lambda pc: wheels_set(pc, 'max_brake_torque', 4000.0),
+        lambda pc: pc.wheels[0].max_brake_torque,
+        use_batch=True)
+
+    print()
+    print("=" * 68)
+    top_ok = any(results[k] for k in
+                 ('mass', 'drag_coefficient', 'use_sweep_wheel_collision'))
+    brake_ok = results['max_brake_torque'] or results['max_brake_torque_batch']
+    if brake_ok:
+        print("[ OK ] max_brake_torque is writable -- the brake fix is a physics")
+        print("       override applied at spawn.")
+    elif top_ok:
+        print("[FAIL] Top-level physics writes work but PER-WHEEL ones are dropped")
+        print("       by this build. max_brake_torque cannot be raised through the")
+        print("       Python API, so the brake strength has to come from elsewhere")
+        print("       (different vehicle blueprint, or a patched CARLA build).")
+    else:
+        print("[FAIL] NO physics write of any kind survives on this build. Either")
+        print("       the world is not ticking, or apply_physics_control is inert")
+        print("       here. Check the tick warnings above before concluding.")
+    print("=" * 68)
+    return results
+
+
+# ==============================================================================
 # -- physics -------------------------------------------------------------------
 # ==============================================================================
 
@@ -493,7 +619,7 @@ def _report_trace(trace, t_first_drop, v0, args):
     return mean_a
 
 
-def run_carla_modes(args, do_physics, do_test):
+def run_carla_modes(args, do_physics, do_test, do_probe=False):
     try:
         client = connect(args)
     except Exception as e:
@@ -539,6 +665,15 @@ def run_carla_modes(args, do_physics, do_test):
             print("-" * 68)
             report_physics(vehicle)
             print()
+
+        if do_probe:
+            if spawned is None:
+                print("[SKIP] Refusing to probe writes on the LIVE hero vehicle -- "
+                      "it would perturb the participant's car. Drop --use-hero.")
+                return None
+            print("-" * 68)
+            return probe_writes(vehicle, ticker, client)
+
         apply_overrides(vehicle, ticker, args)
 
         if do_test:
@@ -565,7 +700,7 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', nargs='?', default='all',
-                   choices=['all', 'pedal', 'physics', 'test'],
+                   choices=['all', 'pedal', 'physics', 'test', 'probe'],
                    help='which check to run (default: all)')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=2000)
@@ -604,13 +739,14 @@ def main():
         run_pedal(args)
         print()
 
-    if args.mode in ('all', 'physics', 'test'):
+    if args.mode in ('all', 'physics', 'test', 'probe'):
         print("=" * 68)
         print("CARLA  -- what the simulator does with the brake input")
         print("=" * 68)
         run_carla_modes(args,
-                        do_physics=args.mode in ('all', 'physics', 'test'),
-                        do_test=args.mode in ('all', 'test'))
+                        do_physics=args.mode in ('all', 'physics', 'test', 'probe'),
+                        do_test=args.mode in ('all', 'test'),
+                        do_probe=args.mode == 'probe')
 
 
 if __name__ == '__main__':
