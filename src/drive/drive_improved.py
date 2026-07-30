@@ -21,10 +21,12 @@ LoA Popup Function:
                        a window then holds two prompts about two different ones
 
 LoA Popup Input (which interface answers the popup):
-    --wheel-input    : Paddles move the cursor, the front button ticks the level
-                       under it, CONFIRM submits. Default when a wheel is bound.
-    --keyboard-input : Number keys 0-4 tick a level, the same number again unticks
-                       it, ENTER confirms. Default when no wheel is bound.
+    (default)        : Keyboard, on every rig, wheel attached or not -- the driver
+                       says the levels out loud and the experimenter types them
+    --keyboard-input : The default, stated explicitly. Number keys 0-4 tick a
+                       level, the same number again unticks it, ENTER confirms
+    --wheel-input    : Override: paddles move the cursor, the front button ticks
+                       the level under it, CONFIRM submits
     Either mode      : the last row, NO INPUT (or the N key), dismisses a prompt
                        WITHOUT writing a label -- the failsafe for a window the
                        driver cannot answer honestly. A missing label is data
@@ -632,11 +634,15 @@ NO_INPUT_ROW = CONFIRM_ROW + 1
 # --- Which interface answers the popup ----------------------------------------
 # The two are experiment conditions, not a preference: 'wheel' keeps the hands on
 # the rim (cursor + confirm row, as above), 'keyboard' addresses the levels
-# directly by number and needs no cursor at all. Selected with --wheel-input /
-# --keyboard-input; 'auto' resolves to the wheel whenever one is bound.
+# directly by number and needs no cursor at all.
+#
+# The keyboard is the DEFAULT for every run, whether or not a wheel is bound: the
+# study asks the driver to say the levels out loud and the experimenter types
+# them, so the interface must not change with the rig it happens to run on. Pass
+# --wheel-input to override it.
 POPUP_INPUT_WHEEL = 'wheel'
 POPUP_INPUT_KEYBOARD = 'keyboard'
-POPUP_INPUT_AUTO = 'auto'
+POPUP_INPUT_DEFAULT = POPUP_INPUT_KEYBOARD
 
 
 # --- Function pool for --random-function ---------------------------------------
@@ -2718,15 +2724,14 @@ class CameraManager(object):
 def _resolve_popup_input(args, has_wheel):
     """Decide which interface answers the LoA popup.
 
-    Without either flag this keeps the behaviour the experiment had before they
-    existed: the wheel whenever one is bound, the keyboard otherwise. Asking for
-    the wheel on a rig that has none would leave the participant staring at a
-    popup they cannot answer with the scene frozen behind it, so that falls back
-    loudly instead of failing.
+    No flag means the keyboard, on every rig — the presence of a wheel used to
+    decide this, which made the labelling interface an accident of the machine
+    rather than a property of the experiment. Asking for the wheel on a rig that
+    has none would leave the participant staring at a popup they cannot answer
+    with the scene frozen behind it, so that falls back loudly instead of
+    failing.
     """
-    mode = getattr(args, 'popup_input', POPUP_INPUT_AUTO)
-    if mode == POPUP_INPUT_AUTO:
-        return POPUP_INPUT_WHEEL if has_wheel else POPUP_INPUT_KEYBOARD
+    mode = getattr(args, 'popup_input', None) or POPUP_INPUT_DEFAULT
     if mode == POPUP_INPUT_WHEEL and not has_wheel:
         print('[WARN] --wheel-input, but no steering wheel is bound — the LoA '
               'popup falls back to the keyboard (0-4 tick, ENTER confirms).')
@@ -3348,20 +3353,20 @@ def main():
     popup_input_group.add_argument(
         '--wheel-input', dest='popup_input', action='store_const',
         const=POPUP_INPUT_WHEEL,
-        help='Answer the LoA popups from the steering wheel: the paddles move the '
-             'cursor, the front button ticks the level under it, and the CONFIRM row '
-             'submits. The row below it, NO INPUT, dismisses the prompt without '
-             'writing a label. Default when a wheel is bound. The number keys (and N '
-             'for no input) stay live as a fallback in case the rim buttons are '
-             'unmapped.')
+        help='Answer the LoA popups from the steering wheel instead of the keyboard: '
+             'the paddles move the cursor, the front button ticks the level under it, '
+             'and the CONFIRM row submits. The row below it, NO INPUT, dismisses the '
+             'prompt without writing a label. The number keys (and N for no input) '
+             'stay live as a fallback in case the rim buttons are unmapped.')
     popup_input_group.add_argument(
         '--keyboard-input', dest='popup_input', action='store_const',
         const=POPUP_INPUT_KEYBOARD,
         help='Answer the LoA popups from the keyboard: number keys 0-4 tick a level, '
              'pressing the same number again unticks it, ENTER confirms, and N '
              'dismisses the prompt without writing a label. The popup ignores the '
-             'wheel in this mode (it still steers). Default when no wheel is bound.')
-    argparser.set_defaults(popup_input=POPUP_INPUT_AUTO)
+             'wheel in this mode (it still steers). THE DEFAULT - the flag only '
+             'states it explicitly.')
+    argparser.set_defaults(popup_input=None)
     args = argparser.parse_args()
 
     if args.test_popup and args.no_popup:
@@ -3376,7 +3381,7 @@ def main():
     if args.popup_input == POPUP_INPUT_WHEEL and args.no_wheel:
         argparser.error('--wheel-input needs the steering wheel that --no-wheel '
                         'disables. Drop one of the two.')
-    if args.popup_input != POPUP_INPUT_AUTO and args.no_popup:
+    if args.popup_input is not None and args.no_popup:
         # Not fatal, but it means the run was configured for an interface it will
         # never show — worth saying rather than silently ignoring the flag.
         print('[WARN] --%s-input has no effect with --no-popup: there are no popups '

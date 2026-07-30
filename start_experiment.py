@@ -19,9 +19,11 @@ MAIN OPTIONS:
     state is served over HTTP; ProVoice runs on ANOTHER machine and is started
     there by hand, with the command line this launcher prints
 
-LoA POPUP INTERFACE (pick one; default = wheel if one is attached, else keyboard):
---wheel-input: paddles move the cursor, front button ticks, CONFIRM row submits
---keyboard-input: number keys 0-4 tick (same key again unticks), ENTER confirms
+LoA POPUP INTERFACE (default = keyboard on every rig, wheel attached or not):
+--keyboard-input: the default, stated explicitly -- number keys 0-4 tick a level
+    (same key again unticks), ENTER confirms, N discards the prompt
+--wheel-input: override -- paddles move the cursor, front button ticks, CONFIRM
+    row submits
 
 LoA POPUP FUNCTION:
 --functionname: one function for the whole run, one popup per 20 s window
@@ -483,7 +485,7 @@ def build_drive_cmd(session, args):
         "--clock-pause-file", CLOCK_PAUSE_FILE,
         *(["--sync", "--tm-port", str(TM_PORT)] if args.sync else []),
         # Omitted when neither flag was given, so Drive keeps its own default
-        # (the wheel when one is bound, the keyboard otherwise).
+        # (the keyboard, on every rig).
         *([f"--{args.popup_input}-input"] if args.popup_input else []),
         # Drive owns the draw: it is the process that shows the popups, so the
         # pool lives there and only the switch is forwarded.
@@ -1322,16 +1324,17 @@ def main():
     popup_input = parser.add_mutually_exclusive_group()
     popup_input.add_argument("--wheel-input", dest="popup_input", action="store_const",
                              const="wheel",
-                             help="Answer the LoA popups from the steering wheel: the "
-                                  "paddles move the cursor, the front button ticks the "
-                                  "level under it, the CONFIRM row submits. Default "
-                                  "when a wheel is attached.")
+                             help="Answer the LoA popups from the steering wheel "
+                                  "instead of the keyboard: the paddles move the "
+                                  "cursor, the front button ticks the level under it, "
+                                  "the CONFIRM row submits.")
     popup_input.add_argument("--keyboard-input", dest="popup_input", action="store_const",
                              const="keyboard",
                              help="Answer the LoA popups from the keyboard: number keys "
                                   "0-4 tick a level, the same number again unticks it, "
-                                  "ENTER confirms. The popup ignores the wheel, which "
-                                  "still steers. Default when no wheel is attached.")
+                                  "ENTER confirms, N discards the prompt. The popup "
+                                  "ignores the wheel, which still steers. THE DEFAULT "
+                                  "- the flag only states it explicitly.")
     parser.set_defaults(popup_input=None)
     parser.add_argument("--popup-wait-timeout", dest="popup_wait_timeout",
                         type=float, default=None,
