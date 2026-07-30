@@ -152,15 +152,18 @@ def main():
                              "too, so it waits on the clock instead of "
                              "free-running. Without this flag the server "
                              "free-runs exactly as before.")
-    parser.add_argument("--delta", type=float, default=0.025,
-                        help="Fixed time step in seconds for --sync (default "
-                             "0.025 = 40 Hz). This is the rate at which the world "
-                             "visibly MOVES and at which controls take effect, so "
-                             "it sets both the smoothness and the input latency "
-                             "the driver feels -- 20 Hz was measurably holding but "
-                             "felt laggy. Try 0.0167 (60 Hz) on a machine "
-                             "dedicated to CARLA; watch the [SYNC] report and back "
-                             "off if it stops holding the rate. Must stay <= "
+    parser.add_argument("--delta", type=float, default=0.05,
+                        help="Fixed time step in seconds for --sync (default 0.05 "
+                             "= 20 Hz). DO NOT raise this hoping for smoother "
+                             "motion. It is a DEMAND on the server, not a quality "
+                             "setting: every tick asks for a full rendered frame, "
+                             "and if the server cannot deliver them that fast the "
+                             "clock falls behind and the whole simulation runs in "
+                             "slow motion -- the participant's own car included. "
+                             "40 Hz was tried on this rig and did exactly that. "
+                             "The ceiling is the server's frame rate, which the "
+                             "[SYNC] report now measures and prints; only raise "
+                             "--delta if it shows real headroom. Must stay <= "
                              "max_substep_delta_time * max_substeps.")
     parser.add_argument("--pause-file", default="",
                         help="Path Drive uses to ask for the clock to be held "
@@ -549,10 +552,14 @@ def main():
         # is accurate to about a millisecond on Python 3.11+ on Windows, which
         # is fine against a 50 ms step.
         LAG_REPORT_EVERY_S = 30.0
+        FIRST_REPORT_S = 8.0
+        report_every = FIRST_REPORT_S
         next_tick = time.perf_counter()
         ticks = 0
         lagged_ticks = 0
         worst_lag = 0.0
+        tick_cost_sum = 0.0
+        worst_tick_cost = 0.0
         last_report = time.perf_counter()
 
         consecutive_failures = 0
@@ -582,7 +589,17 @@ def main():
                 next_tick = time.perf_counter()
 
             try:
+                # Timed, because how long the SERVER takes to complete a frame is
+                # the ceiling on the tick rate and the number nobody had. It
+                # includes rendering Drive's camera sensor, which on a fullscreen
+                # viewport is usually the dominant cost -- so the ceiling is a
+                # property of the render load, and a machine dedicated to CARLA
+                # does not raise it much.
+                t_before = time.perf_counter()
                 world.tick()
+                tick_cost = time.perf_counter() - t_before
+                tick_cost_sum += tick_cost
+                worst_tick_cost = max(worst_tick_cost, tick_cost)
                 consecutive_failures = 0
             except RuntimeError as e:
                 # A tick that times out or errors must not end this process by
@@ -614,21 +631,54 @@ def main():
                 next_tick = time.perf_counter()
 
             now = time.perf_counter()
-            if now - last_report >= LAG_REPORT_EVERY_S:
+            if now - last_report >= report_every:
                 achieved = ticks / (now - last_report)
-                if lagged_ticks:
-                    print("[SYNC] %.1f Hz achieved of %.1f Hz target -- %d/%d "
-                          "ticks late, worst %.0f ms. Simulated time is running "
-                          "at %.2fx real time."
-                          % (achieved, 1.0 / FIXED_DELTA_SECONDS, lagged_ticks,
-                             ticks, worst_lag * 1000.0,
-                             achieved * FIXED_DELTA_SECONDS))
-                else:
-                    print("[SYNC] %.1f Hz achieved, on schedule." % achieved)
+                sim_speed = achieved * FIXED_DELTA_SECONDS
+                target = 1.0 / FIXED_DELTA_SECONDS
+                mean_cost = tick_cost_sum / max(1, ticks)
+                # What the server could actually sustain if we asked for nothing
+                # more than it can render.
+                ceiling = 1.0 / mean_cost if mean_cost > 0 else float('inf')
+
+                # Sim speed is reported ALWAYS, not only when ticks run late,
+                # because it is the one number that says whether the participant
+                # is driving in real time -- and "on schedule" hid the answer.
+                # Everything moving in slow motion, ego included, looks nothing
+                # like a clock problem from the driver's seat; it looks like the
+                # cars are slow. That misread cost a debugging cycle.
+                print("[SYNC] %.1f Hz of %.1f Hz target | sim speed %.2fx | "
+                      "server frame %.0f ms mean, %.0f ms worst (ceiling ~%.0f Hz)"
+                      % (achieved, target, sim_speed, mean_cost * 1000.0,
+                         worst_tick_cost * 1000.0, ceiling))
+
+                if sim_speed < 0.95:
+                    # Actionable, with the number to use: the ceiling is measured,
+                    # so the right --delta is arithmetic rather than guesswork.
+                    suggested = 1.0 / max(1.0, ceiling * 0.9)
+                    print("[SYNC] *** SLOW MOTION: the simulation is running at "
+                          "%.0f%% of real time. The server cannot render %.1f "
+                          "frames a second; it tops out near %.0f Hz. Everything "
+                          "the participant sees, their own car included, is "
+                          "correspondingly slow. Re-run with --delta %.4f (~%.0f "
+                          "Hz) or lower the render cost (camera resolution, CARLA "
+                          "-quality-level). THIS RUN IS NOT USABLE PARTICIPANT "
+                          "DATA. ***"
+                          % (sim_speed * 100.0, target, ceiling, suggested,
+                             1.0 / suggested))
+                elif lagged_ticks:
+                    print("[SYNC] %d/%d ticks late, worst %.0f ms -- holding real "
+                          "time, but with little headroom."
+                          % (lagged_ticks, ticks, worst_lag * 1000.0))
+
                 ticks = 0
                 lagged_ticks = 0
                 worst_lag = 0.0
+                tick_cost_sum = 0.0
+                worst_tick_cost = 0.0
                 last_report = now
+                # First report comes early so a misconfigured rate is caught
+                # before the participant has driven for half a minute.
+                report_every = LAG_REPORT_EVERY_S
 
     except KeyboardInterrupt:
         pass

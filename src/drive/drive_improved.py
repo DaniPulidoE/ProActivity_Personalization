@@ -2737,7 +2737,11 @@ def game_loop(args):
             args.width, args.height,
             interval_seconds=TEST_POPUP_INTERVAL_S if args.test_popup else 20,
             enabled=not args.no_popup,
-            open_immediately=args.test_popup,
+            # --popup-immediate skips only the first window's wait, keeping the
+            # real 20 s interval and everything else about a normal run. That is
+            # what separates it from --test-popup, which also shortens the
+            # interval and is a different mode entirely.
+            open_immediately=args.test_popup or args.popup_immediate,
             input_mode=popup_input,
             function_name=getattr(args, 'functionname', ''),
             # --test-popup gets the pool too, so practice reproduces the shape of
@@ -3187,6 +3191,15 @@ def main():
              'does, so the popup one interval later covers a fully logged 20 s. '
              'Driving is not held up, only the windows. 0 disables the wait; ignored '
              'with --test-popup, which runs without ProVoice.')
+    argparser.add_argument(
+        '--popup-immediate', dest='popup_immediate', action='store_true',
+        help='Open the FIRST LoA window straight away instead of one interval in. '
+             'For rehearsing the popup flow on the real rig: unlike --test-popup '
+             'this keeps the genuine 20 s interval, the NPC traffic and everything '
+             'else about a normal run, so only the first window moves. Pair with '
+             '--popup-wait-timeout 0 to also skip the wait for ProVoice. Labels '
+             'from a run using this are NOT participant data -- the first window '
+             'covers driving that nothing was recording.')
     argparser.add_argument(
         '--provoice-status-file', dest='provoice_status_file', default=None,
         help='File published by scripts/provoice_status_server.py, for runs where '

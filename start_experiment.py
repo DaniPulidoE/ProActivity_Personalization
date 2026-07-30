@@ -485,6 +485,7 @@ def build_drive_cmd(session, args):
         # for the start, this launcher for the end), and pointing it at a
         # status file nothing writes would just add a file to ignore.
         *(["--provoice-status-file", args.status_file] if args.remote else []),
+        *(["--popup-immediate"] if args.test else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1215,6 +1216,18 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--test", action="store_true",
+                        help="REHEARSAL for the CARLA-machine data-collection run: "
+                             "the LoA popups fire from the very start instead of "
+                             "waiting for ProVoice on the other machine to load its "
+                             "models and report its first frame. Everything else is "
+                             "the real run -- NPC traffic, fullscreen, the genuine "
+                             "20 s interval, random functions -- so it exercises the "
+                             "popup flow, the wheel bindings and the label file on "
+                             "the actual rig without needing the ProVoice machine up. "
+                             "THE LABELS IT PRODUCES ARE NOT PARTICIPANT DATA: the "
+                             "windows cover driving no ProVoice was recording. Use "
+                             "with --experiment-data-collection-carla-remote.")
     parser.add_argument("--sync", action="store_true",
                         help="SYNCHRONOUS mode: run the simulation on a fixed time "
                              "step (--delta) driven by the NPC-traffic process, which "
@@ -1229,18 +1242,20 @@ def main():
                              "achieved rate every 30 s so you can tell. Sets up both "
                              "children correctly; do not pass --sync to either by "
                              "hand.")
-    parser.add_argument("--delta", type=float, default=0.025,
-                        help="Fixed time step in seconds for --sync (default 0.025 "
-                             "= 40 Hz). This is the rate at which the world visibly "
-                             "moves AND at which steering/throttle take effect, so "
-                             "it sets the smoothness and the control latency the "
-                             "driver feels. 0.0167 gives 60 Hz and is worth trying "
-                             "on a machine dedicated to CARLA -- check the [SYNC] "
-                             "lines from NPC_TRAFFIC still report the rate holding. "
-                             "KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND BOTH "
-                             "STUDY ARMS, for the same reason --decision-hz is "
-                             "fixed: it changes the simulation the driver responds "
-                             "to. Ignored without --sync.")
+    parser.add_argument("--delta", type=float, default=0.05,
+                        help="Fixed time step in seconds for --sync (default 0.05 = "
+                             "20 Hz). This is a DEMAND on the CARLA server, not a "
+                             "quality setting: each tick asks for a full rendered "
+                             "frame, and if the server cannot keep up the clock "
+                             "falls behind and EVERYTHING runs in slow motion, the "
+                             "participant's own car included. 40 Hz was tried here "
+                             "and did exactly that, so do not raise it without "
+                             "evidence -- the [SYNC] lines from NPC_TRAFFIC print "
+                             "the measured server frame time and the rate it can "
+                             "actually sustain. KEEP THIS FIXED ACROSS ALL "
+                             "PARTICIPANTS AND BOTH STUDY ARMS, for the same reason "
+                             "--decision-hz is fixed: it changes the simulation the "
+                             "driver responds to. Ignored without --sync.")
     parser.add_argument("--test-popup", dest="test_popup", action="store_true",
                         help="Teaching mode: open the simulator UI and show LoA "
                              "selection popups straight away, so the participant can "
@@ -1362,6 +1377,17 @@ def main():
         # checks below are all about that machinery, so they are not merely
         # unnecessary here, they would be reasoning about processes that do not
         # exist.
+        #
+        # Which is exactly why this one check has to be HERE rather than with
+        # its siblings below: this branch returns, so anything about --test
+        # placed down there would never run on the machine where --test is
+        # wrong. It was, and the flag silently started a real ProVoice instead.
+        if args.test:
+            parser.error("--test rehearses the LoA popups, which Drive shows -- "
+                         "and the --experiment-*-provoice-remote presets start "
+                         "ProVoice alone, with no Drive on this machine. Run "
+                         "--test on the CARLA machine, with "
+                         "--experiment-data-collection-carla-remote.")
         if args.functionname is None:
             args.functionname = DEFAULT_FUNCTIONNAME
         run_provoice_only(args)
@@ -1439,6 +1465,16 @@ def main():
               "speed/steer/brake/junction and every other vehicle field stay at "
               "their defaults, so THIS RUN IS NOT USABLE PARTICIPANT DATA. It is "
               "a diagnostic for the heap corruption only.")
+    # (--test on a ProVoice-only preset is rejected earlier, before that branch
+    # returns.)
+    if args.test and args.no_popup:
+        parser.error("--test and --no-popup contradict each other: --test exists "
+                     "to fire the popups early, --no-popup suppresses them "
+                     "entirely. Note --experiment-calibration-carla-remote "
+                     "implies --no-popup, so --test does not apply to it.")
+    if args.test and args.test_popup:
+        print("[WARN] --test adds nothing to --test-popup: that mode already "
+              "opens popups immediately and never waits for ProVoice.")
     if args.sync and args.test_popup:
         parser.error("--sync and --test-popup are incompatible: --test-popup "
                      "does not start NPC_TRAFFIC, and that is the process that "
@@ -1513,6 +1549,18 @@ def main():
     # default as a local run.
     if args.popup_wait_timeout is None:
         args.popup_wait_timeout = DEFAULT_POPUP_WAIT_TIMEOUT
+    if args.test:
+        # Applied AFTER the default above so it wins, and stated out loud because
+        # it is the whole point of the flag: the wait exists so no window is
+        # labelled without driver-state data behind it, and a rehearsal has no
+        # ProVoice to wait for. Drive also gets --popup-immediate, so the first
+        # window opens at once rather than one interval in.
+        if args.popup_wait_timeout:
+            print("[TEST] popups will NOT wait for ProVoice "
+                  "(--popup-wait-timeout %g -> 0)" % args.popup_wait_timeout)
+        args.popup_wait_timeout = 0.0
+        print("[TEST] rehearsal run: first LoA window opens immediately, then "
+              "every 20 s as normal. The labels are NOT participant data.")
     if args.remote and args.no_popup:
         # Deliberately stated as a fact with both readings rather than as a
         # warning: this launcher cannot tell them apart. Whether ProVoice on
