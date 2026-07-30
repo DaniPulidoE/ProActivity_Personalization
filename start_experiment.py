@@ -486,6 +486,7 @@ def build_drive_cmd(session, args):
         # status file nothing writes would just add a file to ignore.
         *(["--provoice-status-file", args.status_file] if args.remote else []),
         *(["--popup-immediate"] if args.test else []),
+        *(["--speed"] if args.speed else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1216,6 +1217,15 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--speed", action="store_true",
+                        help="Show the vehicle speed in km/h on screen, bottom-right. "
+                             "A single large readout, not the F1 debug panel, so it "
+                             "is safe to have in front of a participant. Off by "
+                             "default because it changes the driving task: a precise "
+                             "speed instrument is something the driver can regulate "
+                             "against, and it plausibly shifts how they judge the "
+                             "assistant's autonomy. If you use it, use it for EVERY "
+                             "participant and BOTH study arms.")
     parser.add_argument("--test", action="store_true",
                         help="REHEARSAL for the CARLA-machine data-collection run: "
                              "the LoA popups fire from the very start instead of "

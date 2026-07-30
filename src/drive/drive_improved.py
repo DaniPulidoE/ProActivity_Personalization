@@ -2016,7 +2016,7 @@ class KeyboardControl(object):
 
 
 class HUD(object):
-    def __init__(self, width, height):
+    def __init__(self, width, height, show_speed=False):
         self.dim = (width, height)
         font = pygame.font.Font(pygame.font.get_default_font(), 20)
         font_name = 'courier' if os.name == 'nt' else 'mono'
@@ -2034,6 +2034,24 @@ class HUD(object):
         self._info_text = []
         self._server_clock = pygame.time.Clock()
 
+        # Speedometer, opt-in via --speed. Separate from the F1 debug panel above
+        # on purpose: that panel shows twenty lines of diagnostics, which is not
+        # something to put in front of a participant. This is the one number a
+        # driver actually needs.
+        #
+        # Off by default because it is an addition to what participants have seen
+        # so far: a speed readout is a real change to the driving task (it gives
+        # them a precise instrument to regulate against), so turning it on should
+        # be a decision, and one held constant across the whole study.
+        #
+        # Sized from the window rather than fixed, so it reads the same on the
+        # 1280x720 development window and the fullscreen rig.
+        self.speed_kmh = 0.0
+        self.show_speed = show_speed
+        speed_pt = max(28, int(height * 0.055))
+        self._font_speed = pygame.font.Font(mono, speed_pt)
+        self._font_speed_unit = pygame.font.Font(mono, max(12, speed_pt // 3))
+
         self._show_ackermann_info = False
         self._ackermann_control = carla.VehicleAckermannControl()
 
@@ -2045,6 +2063,16 @@ class HUD(object):
 
     def tick(self, world, clock):
         self._notifications.tick(world, clock)
+
+        # Speed is read BEFORE the early return below, because the speedometer
+        # is always on while the debug panel (_show_info, F1) is off by default
+        # and off entirely in --control test, which is what the study runs.
+        try:
+            vel = world.player.get_velocity()
+            self.speed_kmh = 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+        except Exception:
+            pass
+
         if not self._show_info:
             return
         t = world.player.get_transform()
@@ -2162,7 +2190,45 @@ class HUD(object):
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
         self._notifications.render(display)
+        self._render_speed(display)
         self.help.render(display)
+
+    def _render_speed(self, display):
+        """Draw the speed readout in the bottom-right corner.
+
+        Bottom-RIGHT because the two things already on screen are anchored
+        elsewhere: notifications occupy a full-width bar along the bottom edge
+        (its text left-aligned) and the LoA popup is centred. Drawn after the
+        notifications so a notification cannot cover the speed, and before the
+        help overlay so that still wins when it is open.
+        """
+        if not self.show_speed:
+            return
+
+        value = self._font_speed.render('%d' % round(self.speed_kmh), True,
+                                        (255, 255, 255))
+        unit = self._font_speed_unit.render('km/h', True, (220, 220, 220))
+
+        margin = max(12, int(self.dim[0] * 0.012))
+        pad = max(6, margin // 2)
+        block_w = value.get_width() + pad + unit.get_width()
+        block_h = value.get_height()
+        x = self.dim[0] - margin - block_w
+        y = self.dim[1] - margin - block_h
+
+        # Dimmed plate behind the digits: the camera view is arbitrary and white
+        # text over a bright road surface is unreadable exactly when the driver
+        # is looking for it.
+        plate = pygame.Surface((block_w + 2 * pad, block_h + pad))
+        plate.set_alpha(110)
+        plate.fill((0, 0, 0))
+        display.blit(plate, (x - pad, y - pad // 2))
+
+        display.blit(value, (x, y))
+        # Unit sits on the digits' baseline rather than centred, so it does not
+        # bounce as the number changes width between 9 and 10 km/h.
+        display.blit(unit, (x + value.get_width() + pad,
+                            y + block_h - unit.get_height() - 2))
 
 
 # ==============================================================================
@@ -2727,7 +2793,7 @@ def game_loop(args):
         display.fill((0,0,0))
         pygame.display.flip()
 
-        hud = HUD(args.width, args.height)
+        hud = HUD(args.width, args.height, show_speed=args.speed)
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
@@ -3191,6 +3257,14 @@ def main():
              'does, so the popup one interval later covers a fully logged 20 s. '
              'Driving is not held up, only the windows. 0 disables the wait; ignored '
              'with --test-popup, which runs without ProVoice.')
+    argparser.add_argument(
+        '--speed', action='store_true',
+        help='Show the vehicle speed in km/h in the bottom-right corner. Unlike '
+             'the F1 debug panel this is a single large readout suitable to have '
+             'in front of a participant. Off by default because it changes the '
+             'driving task -- it gives the driver a precise instrument to regulate '
+             'against -- so if it is used at all it should be used for EVERY '
+             'participant and both study arms.')
     argparser.add_argument(
         '--popup-immediate', dest='popup_immediate', action='store_true',
         help='Open the FIRST LoA window straight away instead of one interval in. '
