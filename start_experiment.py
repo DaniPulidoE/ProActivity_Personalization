@@ -475,8 +475,13 @@ def build_drive_cmd(session, args):
         # Under --sync this makes Drive wait on the clock instead of ticking, and
         # points it at the clock owner's traffic manager. Both halves have to
         # travel together -- see the --sync help text below.
-        *(["--sync", "--tm-port", str(TM_PORT),
-           "--clock-pause-file", CLOCK_PAUSE_FILE] if args.sync else []),
+        # The pause file goes in under BOTH clocks: NPC_TRAFFIC can hold a
+        # free-running world too (by switching it into synchronous mode and not
+        # ticking), so the popup freeze is a real freeze either way and traffic
+        # never stops dead and pulls away from rest. Only --sync/--tm-port are
+        # conditional.
+        "--clock-pause-file", CLOCK_PAUSE_FILE,
+        *(["--sync", "--tm-port", str(TM_PORT)] if args.sync else []),
         # Omitted when neither flag was given, so Drive keeps its own default
         # (the wheel when one is bound, the keyboard otherwise).
         *([f"--{args.popup_input}-input"] if args.popup_input else []),
@@ -1663,9 +1668,10 @@ def main():
                  # This child owns the simulation clock under --sync. It is
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.
+                 "--pause-file", CLOCK_PAUSE_FILE,
                  *(["--sync", "--delta", str(args.delta),
-                    "--substep-delta", str(args.substep_delta),
-                    "--pause-file", CLOCK_PAUSE_FILE] if args.sync else [])],
+                    "--substep-delta", str(args.substep_delta)]
+                   if args.sync else [])],
                 "NPC_TRAFFIC"
             )
 

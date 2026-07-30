@@ -49,6 +49,15 @@ import argparse
 # any real deliberation over a five-option prompt.
 PAUSE_MAX_AGE_S = 300.0
 
+# Step the world is put on while frozen under the FREE-RUNNING clock, and the
+# size of the single priming tick on release. Small and fixed, because the danger
+# on resume is the server computing its first free-running delta from the WALL
+# time that passed while frozen: after a 15 s deliberation that would be a 15 s
+# physics step, which would fling every vehicle across the map. Ticking once at
+# this step immediately before handing the clock back leaves the server with a
+# fresh, recent frame reference instead.
+FREEZE_STEP_S = 0.05
+
 
 def _pause_requested(path):
     """True if Drive is currently asking for the clock to be held."""
@@ -249,7 +258,13 @@ def main():
 
     FIXED_DELTA_SECONDS = args.delta
 
-    PAUSE_FILE = args.pause_file if SYNC_MODE else ""
+    # Honoured in BOTH modes. Under --sync the clock is held by not ticking;
+    # under the free-running clock it is held by switching the world INTO
+    # synchronous mode and never ticking it, which stops the server dead. Either
+    # way the freeze is real -- vehicles keep their position, heading, speed and
+    # wheel angle and carry on from there -- so traffic never has to stop at a
+    # popup and pull away from rest afterwards.
+    PAUSE_FILE = args.pause_file
 
     # A flag left behind by a Drive that died mid-popup would otherwise hold this
     # run's clock from the very first tick, which looks exactly like the rig
@@ -593,8 +608,65 @@ def main():
     try:
 
         if not SYNC_MODE:
+            # Free-running clock, with an honest pause.
+            #
+            # There is no tick of ours to withhold here, so the hold is done by
+            # putting the world INTO synchronous mode and never ticking it: a
+            # synchronous server advances only when a client says so, and no
+            # client will. That freezes the scene exactly as it stands, which is
+            # what the constant-velocity hold in Drive could never do -- that one
+            # pinned every vehicle to 0 m/s, so traffic stopped dead at each
+            # popup and pulled away from rest afterwards.
+            async_paused = False
             while True:
-                world.wait_for_tick()
+                want_pause = _pause_requested(PAUSE_FILE)
+
+                if want_pause and not async_paused:
+                    try:
+                        s = world.get_settings()
+                        s.synchronous_mode = True
+                        s.fixed_delta_seconds = FREEZE_STEP_S
+                        world.apply_settings(s)
+                        async_paused = True
+                        print("[PAUSE] world held (Drive popup open).")
+                    except Exception as e:
+                        print("[WARN] could not hold the world:", e)
+
+                elif not want_pause and async_paused:
+                    try:
+                        # Prime before releasing -- see FREEZE_STEP_S. This tick
+                        # advances FREEZE_STEP_S of simulated time, not the
+                        # deliberation time, and leaves the server with a current
+                        # frame reference so its first free-running delta is
+                        # small rather than the whole pause.
+                        try:
+                            world.tick()
+                        except RuntimeError:
+                            pass
+                        s = world.get_settings()
+                        s.synchronous_mode = False
+                        s.fixed_delta_seconds = None
+                        world.apply_settings(s)
+                        print("[PAUSE] world released.")
+                    except Exception as e:
+                        print("[WARN] could not release the world:", e)
+                    finally:
+                        # Cleared even if the release throws, so a failure cannot
+                        # strand this loop believing the world is still frozen
+                        # and leave it held for the rest of the session.
+                        async_paused = False
+
+                if async_paused:
+                    time.sleep(0.02)
+                    continue
+
+                try:
+                    # Bounded, and a timeout is NOT an error here: this process
+                    # has nothing to do between ticks, and the world may legally
+                    # be held by a pause we are about to notice.
+                    world.wait_for_tick(2.0)
+                except RuntimeError:
+                    pass
 
         # Wall-clock-paced tick loop.
         #

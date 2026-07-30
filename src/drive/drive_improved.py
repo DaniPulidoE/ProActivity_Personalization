@@ -468,7 +468,11 @@ def _set_world_frozen(world, frozen):
         return
 
     pause_file = getattr(world, 'clock_pause_file', '') or ''
-    if getattr(world, 'sync', False) and pause_file:
+    if pause_file:
+        # Works under BOTH clocks, which is why there is no --sync check here.
+        # fixed_npc_traffic.py holds a synchronous world by not ticking it, and a
+        # free-running one by switching it into synchronous mode and not ticking
+        # it either. Drive only ever asks; it does not need to know which.
         _request_clock_pause(pause_file, frozen)
         return
 
@@ -1063,44 +1067,45 @@ class LoASelectionPopup(object):
         overlay.fill((0, 0, 0))
         display.blit(overlay, (0, 0))
 
-        if self.input_mode != POPUP_INPUT_WHEEL:
-            hint = ('Number keys 0-4 tick a level (same key again unticks)  -  '
-                    'ENTER confirms  -  N = no input')
-        elif self.wheel_mapped:
-            hint = ('Paddles move  -  front button ticks a level  -  '
-                    'then pick CONFIRM (or NO INPUT)')
-        else:
-            # Unmapped buttons would make the whole wheel feel dead; say so
-            # rather than leaving the driver pressing an inert control.
-            hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
-                    'Use number keys 0-4 and ENTER, or N for no input.')
+        # Keyboard mode shows no key hint at all: there the keys are the
+        # experimenter's, not the driver's, and the CONFIRM and NO INPUT rows
+        # below already name ENTER and N for whoever is typing.
+        hint = ''
+        if self.input_mode == POPUP_INPUT_WHEEL:
+            if self.wheel_mapped:
+                hint = ('Paddles move  -  front button ticks a level  -  '
+                        'then pick CONFIRM (or NO INPUT)')
+            else:
+                # Unmapped buttons would make the whole wheel feel dead; say so
+                # rather than leaving the driver pressing an inert control.
+                hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
+                        'Use number keys 0-4 and ENTER, or N for no input.')
+
+        # Keyboard mode is the spoken-answer setup: the driver says the levels
+        # out loud and the experimenter enters them, so the instruction has to
+        # ask for speech rather than for a key press.
+        instruction = ('Say EVERY Level of Proactivity you would accept for the '
+                       'last 20 seconds.'
+                       if self.input_mode != POPUP_INPUT_WHEEL
+                       else 'Mark EVERY Level of Proactivity you would accept '
+                            'for the last 20 seconds.')
 
         header = [
             (self._title_font, 'Level of Proactivity Selection Required', (255, 255, 255)),
         ]
-        if self.prompts_per_window > 1:
-            # Two prompts in a row look identical apart from the function line, so
-            # say which one this is — otherwise confirming the first reads as if
-            # the popup simply failed to close.
-            header.append((self._small_font,
-                           'Question %d of %d for this 20 s window'
-                           % (self.prompt_in_window, self.prompts_per_window),
-                           (200, 200, 200)))
         if self.function_name:
             # Blue, not the yellow/green used for the cursor and the ticks: this
             # line is context, never something that can be selected.
             header.append(
                 (self._text_font, 'FUNCTION: %s' % self.function_name, (140, 200, 255)))
-        header.extend([
-            (self._text_font,
-             'Mark EVERY Level of Proactivity you would accept for the last 20 seconds.',
-             (255, 255, 255)),
-            (self._text_font, hint, (255, 255, 255)),
-        ])
+        header.append((self._text_font, instruction, (255, 255, 255)))
+        if hint:
+            header.append((self._text_font, hint, (255, 255, 255)))
 
         # Each header line beyond the original three would push the confirm row
         # toward the bottom edge of a 720p window, so the block rises half a line
-        # per extra one and keeps the footprint it had.
+        # per extra one — and drops half a line per missing one — keeping the
+        # footprint it had.
         y = int(self.height * 0.32) - 22 * (len(header) - 3)
         for font, text, colour in header:
             surface = font.render(text, True, colour)
