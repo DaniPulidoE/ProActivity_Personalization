@@ -2524,6 +2524,26 @@ def _advance_or_close(loa_popup, world, now_ms):
 
 
 def game_loop(args):
+    # SDL's default is to MINIMISE a fullscreen window whenever it loses
+    # keyboard focus, and nothing here would ever restore it -- so any window
+    # that flashes into the foreground for a few hundred milliseconds drops the
+    # drive into the taskbar for the rest of the run, with no user input and
+    # nothing left on screen to explain it.
+    #
+    # Measured 2026-07-30: two scheduled tasks belonging to OTHER projects on
+    # this machine (afd_watchdog and MicrogestureExtractionWatchdog) fire every
+    # 10 minutes and launch `powershell -WindowStyle Hidden`. On Windows 11 the
+    # default console host is Windows Terminal, which -WindowStyle Hidden cannot
+    # hide, so a real window is created and ACTIVATED before the script exits.
+    # Because the trigger sits on a wall-clock grid unrelated to run start
+    # (minute :05/:09/:15/:19/...), a participant run catches at most one and it
+    # looks random. With this hint set the window keeps its pixels: focus is
+    # still lost for ~100-270 ms, then automatically regained.
+    #
+    # setdefault, not assignment: an operator who deliberately exported the
+    # variable keeps their choice.
+    os.environ.setdefault('SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS', '0')
+
     pygame.init()
     pygame.font.init()
     world = None
