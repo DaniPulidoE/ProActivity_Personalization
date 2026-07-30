@@ -42,10 +42,17 @@ EXPERIMENT SETUP (remote):
     CARLA MACHINE:    uv run python start_experiment.py --experiment-adaptation
 2. Calibration:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-calibration-carla-remote --participantid <participantid>
-    PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote <carla-machine-ip>
+    PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote
 3. Data collection:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-data-collection-carla-remote --participantid <participantid>
-    PROVOICE MACHINE: uv run python start_experiment.py --experiment-data-collection-provoice-remote <carla-machine-ip>
+    PROVOICE MACHINE: uv run python start_experiment.py --experiment-data-collection-provoice-remote
+
+No addresses anywhere: both machines run THIS file, so both take the link
+address from CARLA_MACHINE_IP below -- the CARLA side to publish and bind, the
+ProVoice side to connect. The participant id is typed once, on the CARLA
+machine, and read from the bridge on the other. Off the rig, the ProVoice
+presets still accept an explicit address (or PV_BRIDGE_URL). Setup for the link
+itself: docs/remote_setup.md.
 
 --participantid is given ONCE, on the CARLA machine: the ProVoice machine reads
 it (and the session id) from the bridge, so there is no second place to mistype
@@ -75,11 +82,20 @@ the line beside it, and any flag they do not mention (--webcam, --environment,
         = --test-drive --no-popup --fullscreen
     --experiment-calibration-carla-remote
         = --fixed --remote --no-popup --fullscreen
+          --remote-host <CARLA_MACHINE_IP> --remote-bind <CARLA_MACHINE_IP>
           (--remote alone means "ProVoice runs on the other machine, not
            here", so --test-drive would add nothing; --no-popup because the
            baseline drive collects no labels)
     --experiment-data-collection-carla-remote
         = --remote --data-collection --random-function --fullscreen
+          --remote-host <CARLA_MACHINE_IP> --remote-bind <CARLA_MACHINE_IP>
+
+    Both pin the study link's address, since it is a property of the rig
+    rather than of the run: --remote-host is what gets published to the
+    ProVoice machine (the automatic guess names the Wi-Fi card instead), and
+    --remote-bind keeps the bridges off every other network this machine is
+    on. Edit CARLA_MACHINE_IP if the rig is re-addressed; passing either flag
+    explicitly still wins for a one-off.
 
 The two ProVoice-machine presets have no equivalent flag spelling, because
 that machine runs neither CARLA nor Drive and this launcher previously had no
@@ -97,6 +113,12 @@ mode for "ProVoice alone". They start ProVoice and nothing else:
           raw_data.jsonl only: no decision engine, no interventions, and the
           participant's stored baseline is reused rather than re-measured.
           Its first logged frame is what opens the LoA windows over there.
+
+    [URL] defaults to PV_BRIDGE_URL and then to CARLA_MACHINE_IP, so on the
+    rig neither preset takes an argument at all. Give one to point at a
+    different machine, or a full URL for a tunnel. The source that won is
+    printed at startup -- worth a glance, since the pinned default is only
+    right while both machines are running the same revision of this file.
 
     Both imply --webcam, i.e. the external driver-facing camera rather than
     this machine's built-in one, and both imply it so the baseline and the
@@ -152,6 +174,22 @@ _DEAD_PORT = 1
 # "nobody said", which --remote needs: there ProVoice logs on a DIFFERENT
 # machine and the wait can only ever time out.
 DEFAULT_POPUP_WAIT_TIMEOUT = 180.0
+
+# THE RIG. Address of the CARLA machine on the dedicated Ethernet link between
+# the two study machines. Fixed for the whole data-collection run, so the
+# --experiment-*-carla-remote presets set it themselves rather than having it
+# retyped at 9am with a participant waiting. CHANGE IT HERE if the rig is
+# re-addressed; an explicit --remote-host / --remote-bind still overrides it.
+#
+# It fills two different roles, and both need it:
+#   --remote-host  the address PUBLISHED to the ProVoice machine. Left to
+#                  itself the launcher guesses with outbound_ip(), which
+#                  answers "which interface reaches the internet" -- the Wi-Fi
+#                  card, not the cable carrying this pairing.
+#   --remote-bind  the interface the two bridges LISTEN on. Pinning it here
+#                  means they are not reachable from campus Wi-Fi at all,
+#                  instead of being exposed there and merely firewalled off.
+CARLA_MACHINE_IP = "192.168.50.1"
 
 
 def outbound_ip() -> str:
@@ -538,11 +576,16 @@ _CARLA_PRESETS = {
     "experiment_popup": {"test_popup": True, "fullscreen": True},
     "experiment_adaptation": {"test_drive": True, "no_popup": True,
                               "fullscreen": True},
+    # The two remote presets also pin the link addresses (see CARLA_MACHINE_IP):
+    # they are a property of the rig, not of the run, and getting either wrong
+    # fails as a TIMEOUT minutes later rather than as an error at startup.
     "experiment_calibration_carla_remote": {
-        "fixed": True, "remote": True, "no_popup": True, "fullscreen": True},
+        "fixed": True, "remote": True, "no_popup": True, "fullscreen": True,
+        "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},
     "experiment_data_collection_carla_remote": {
         "remote": True, "data_collection": True, "random_function": True,
-        "fullscreen": True},
+        "fullscreen": True,
+        "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},
 }
 
 _PROVOICE_PRESETS = {
@@ -610,19 +653,25 @@ def apply_experiment_presets(parser, args) -> None:
     else:
         overrides = _PROVOICE_PRESETS[name]
         args.provoice_only = True
-        # nargs="?" leaves "" when the flag was given without a value; the
-        # environment variable is the "I run this ten times a day on the same
-        # pair of machines" path.
-        raw = getattr(args, name) or os.environ.get("PV_BRIDGE_URL", "")
+        # Three sources, most specific first. The pinned constant is last and
+        # is why this needs no argument on the rig: the CARLA machine's address
+        # is a property of the pairing, both machines run THIS file, and the
+        # presets on the other side pin the very same value. Requiring it here
+        # only ever caught "forgot to type it" -- typing it WRONG failed
+        # identically either way, ten seconds later.
+        #
+        # Which source won is printed, because the one way this defaulting
+        # misleads is a repo out of sync between the two machines: then the
+        # address is confidently wrong, and the printed line is what makes that
+        # visible instead of mysterious.
+        raw = getattr(args, name)
+        source = "command line"
         if not raw:
-            parser.error(
-                "--%s needs the address of the CARLA machine's vehicle-state "
-                "bridge: the participant id, the session id and the vehicle "
-                "state all come from there. Pass it as a bare IP "
-                "(--%s 192.168.1.50), an IP:PORT, or a full URL, or set "
-                "PV_BRIDGE_URL in this shell."
-                % (name.replace("_", "-"), name.replace("_", "-")))
+            raw, source = os.environ.get("PV_BRIDGE_URL", ""), "PV_BRIDGE_URL"
+        if not raw:
+            raw, source = CARLA_MACHINE_IP, "the pinned rig address"
         args.bridge_url = normalize_bridge_url(raw, args.remote_port)
+        print("[PRESET] bridge at %s (from %s)" % (args.bridge_url, source))
 
     if args.no_webcam:
         # Honoured rather than overridden: a preset expresses the usual rig,
@@ -630,11 +679,22 @@ def apply_experiment_presets(parser, args) -> None:
         overrides = {k: v for k, v in overrides.items() if k != "webcam"}
         args.webcam = False
 
+    applied = []
     for flag, value in overrides.items():
+        if isinstance(value, str) and getattr(args, flag) is not None:
+            # A VALUE the operator typed beats the preset's. Switches cannot
+            # collide this way -- a preset only ever turns one on, and the
+            # operator asking for the same thing is not a disagreement -- but
+            # an address is a real choice, and re-addressing the rig for one
+            # run must not need the source edited.
+            print("[PRESET] keeping --%s=%s from the command line (preset "
+                  "would have used %s)"
+                  % (flag.replace("_", "-"), getattr(args, flag), value))
+            continue
         setattr(args, flag, value)
-    print("[PRESET] --%s = %s" % (
-        name.replace("_", "-"),
-        " ".join("--" + f.replace("_", "-") for f in overrides)))
+        applied.append("--" + flag.replace("_", "-")
+                       + ("" if value is True else " " + str(value)))
+    print("[PRESET] --%s = %s" % (name.replace("_", "-"), " ".join(applied)))
 
 
 def run_provoice_only(args) -> None:
@@ -1038,9 +1098,12 @@ def main():
                              "be brought together before the dataset is built.")
     parser.add_argument("--remote-port", dest="remote_port", type=int, default=8080,
                         help="Port the vehicle-state server listens on (--remote).")
-    parser.add_argument("--remote-bind", dest="remote_bind", default="0.0.0.0",
-                        help="Interface the vehicle-state server binds (--remote). "
-                             "0.0.0.0 accepts from the LAN, which is the point; "
+    parser.add_argument("--remote-bind", dest="remote_bind", default=None,
+                        help="Interface the two bridges bind (--remote). Default "
+                             "0.0.0.0, which accepts from every network this "
+                             "machine is on; the --experiment-*-carla-remote "
+                             "presets narrow it to the study link instead, so the "
+                             "bridges are not listening on campus Wi-Fi at all. "
                              "127.0.0.1 would only serve a tunnel running here.")
     parser.add_argument("--status-port", dest="status_port", type=int, default=8081,
                         help="Port the REVERSE bridge listens on (--remote): "
@@ -1201,11 +1264,13 @@ def main():
                          nargs="?", const="", default=None, metavar="BRIDGE",
                          help="Phase 2 on the ProVoice machine: start ProVoice "
                               "ALONE in --calibration-only mode against the "
-                              "bridge at BRIDGE (bare IP, IP:PORT or URL; "
-                              "PV_BRIDGE_URL is used when omitted). Participant "
-                              "and session ids come from BRIDGE/session. Implies "
-                              "--webcam (the driver-facing camera on this "
-                              "machine); --no-webcam cancels it.")
+                              "bridge at BRIDGE (bare IP, IP:PORT or URL). "
+                              "Defaults to PV_BRIDGE_URL, then to the pinned rig "
+                              "address, so on the rig it needs no argument. "
+                              "Participant and session ids come from "
+                              "BRIDGE/session. Implies --webcam (the "
+                              "driver-facing camera on this machine); "
+                              "--no-webcam cancels it.")
     presets.add_argument("--experiment-data-collection-provoice-remote",
                          dest="experiment_data_collection_provoice_remote",
                          nargs="?", const="", default=None, metavar="BRIDGE",
@@ -1220,6 +1285,10 @@ def main():
     # Expanded first, so every check and warning below judges the flags the
     # preset stands for rather than the preset itself.
     apply_experiment_presets(parser, args)
+    # Left as None until now so a preset can tell "nobody said" from an
+    # explicit --remote-bind and only fill in the former.
+    if args.remote_bind is None:
+        args.remote_bind = "0.0.0.0"
 
     if args.provoice_only:
         # Nothing else in main() applies on the ProVoice machine: no CARLA
