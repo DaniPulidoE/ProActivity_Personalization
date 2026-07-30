@@ -687,35 +687,67 @@ def main():
                 # Everything moving in slow motion, ego included, looks nothing
                 # like a clock problem from the driver's seat; it looks like the
                 # cars are slow. That misread cost a debugging cycle.
-                # substeps/s is printed because it, not the tick rate, is what
-                # predicts sim speed -- and it stays put when --delta changes,
-                # which is the whole counter-intuitive point.
+                # DUTY is the number that says WHERE the time goes, and it is the
+                # one to read first when the rate is short of target:
+                #
+                #   duty ~100%  every millisecond is spent inside world.tick().
+                #               The server genuinely cannot go faster; the
+                #               ceiling below is real and the fix is to make the
+                #               server's frame cheaper.
+                #   duty  <80%  the loop is idle while still missing the target,
+                #               which the pacing code should make impossible.
+                #               That points at this script, not at CARLA.
+                #
+                # Worth having explicitly because achieved-rate ratios alone
+                # cannot tell those apart -- two plausible-looking diagnoses
+                # (render-bound, then physics-bound) were argued from ratios and
+                # both turned out to be wrong.
+                duty = min(999.0, 100.0 * mean_cost * achieved)
                 print("[SYNC] %.1f Hz of %.1f Hz target | sim speed %.2fx | "
-                      "server frame %.0f ms mean, %.0f ms worst (ceiling ~%.0f "
-                      "Hz) | %.0f physics substeps/s"
+                      "tick %.0f ms mean, %.0f ms worst -> ceiling ~%.0f Hz | "
+                      "duty %.0f%% | %.0f substeps/s"
                       % (achieved, target, sim_speed, mean_cost * 1000.0,
-                         worst_tick_cost * 1000.0, ceiling,
+                         worst_tick_cost * 1000.0, ceiling, duty,
                          1.0 / args.substep_delta))
 
+                if sim_speed < 0.95 and duty < 80.0:
+                    print("[SYNC]     NOTE: only %.0f%% of wall time is spent "
+                          "inside world.tick(), yet the target is being missed. "
+                          "The server is NOT the limit here -- the time is going "
+                          "somewhere else in this loop." % duty)
+
                 if sim_speed < 0.95:
-                    # The advice deliberately does NOT say "lower --delta". That
-                    # is the intuitive fix and it does not work: substeps per
-                    # simulated second are 1/substep_delta whatever the tick rate,
-                    # so a lower tick rate buys nothing. Measured here as a
-                    # constant ~0.8x at both 20 Hz and 10 Hz targets.
-                    suggested_sub = args.substep_delta / max(0.05, sim_speed)
                     print("[SYNC] *** SLOW MOTION: the simulation is running at "
                           "%.0f%% of real time -- everything the participant "
                           "sees, their own car included. THIS RUN IS NOT USABLE "
                           "PARTICIPANT DATA. ***"
                           % (sim_speed * 100.0))
-                    print("[SYNC]     Lowering --delta will NOT fix this: the "
-                          "server must run %.0f physics substeps per simulated "
-                          "second at ANY tick rate, because --substep-delta is "
-                          "%.4f. Try --substep-delta %.4f (%.0f substeps/s), or "
-                          "reduce physics cost another way."
-                          % (1.0 / args.substep_delta, args.substep_delta,
-                             suggested_sub, 1.0 / suggested_sub))
+                    if duty >= 80.0:
+                        # Server-bound: the tick rate simply cannot exceed
+                        # 1/tick_cost, so the only honest options are a cheaper
+                        # frame or a target the server can actually meet. Note
+                        # this suggests a --delta, which the physics-bound advice
+                        # this block used to carry explicitly told you NOT to do;
+                        # that advice assumed substepping dominated, and on this
+                        # rig it measurably does not.
+                        suggested = 1.0 / max(1.0, ceiling * 0.9)
+                        print("[SYNC]     Server-bound: %.0f%% of wall time is "
+                              "inside world.tick(), which needs %.0f ms per "
+                              "frame. No tick rate above ~%.0f Hz is reachable "
+                              "until that frame gets cheaper (--render-scale on "
+                              "Drive, CARLA -RenderOffScreen / -quality-level=Low). "
+                              "Otherwise set --delta %.4f (~%.0f Hz) and the run "
+                              "is real-time again."
+                              % (duty, mean_cost * 1000.0, ceiling, suggested,
+                                 1.0 / suggested))
+                    else:
+                        suggested_sub = args.substep_delta / max(0.05, sim_speed)
+                        print("[SYNC]     Not server-bound (duty %.0f%%). If "
+                              "physics substepping is the cost, try "
+                              "--substep-delta %.4f (%.0f substeps/s); the server "
+                              "runs 1/substep-delta substeps per SIMULATED second "
+                              "at any tick rate."
+                              % (duty, suggested_sub, 1.0 / suggested_sub))
                 elif lagged_ticks:
                     print("[SYNC] %d/%d ticks late, worst %.0f ms -- holding real "
                           "time, but with little headroom."
