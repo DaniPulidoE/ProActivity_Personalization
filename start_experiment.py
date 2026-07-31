@@ -513,6 +513,13 @@ def build_drive_cmd(session, args):
           if args.ambient_gain is not None else []),
         *(["--ambient-seed", str(args.ambient_seed)]
           if args.ambient_seed is not None else []),
+        # Scripted precipitation ramp -- see drive_improved.py's World class
+        # (start_weather_schedule/update_weather_schedule) for the mechanics.
+        # Drive is where CARLA weather is actually set, so this only reaches
+        # Drive's command line; ProVoice already reads live precipitation off
+        # the shared CARLA world every frame, no flag needed on that side.
+        *(["--condition-sun-rain"] if args.condition_sun_rain else []),
+        *(["--condition-rain-sun"] if args.condition_rain_sun else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1322,6 +1329,24 @@ def main():
                              "Gain plus seed reproduce exactly what a "
                              "participant heard; both are logged per label row. "
                              "No reason to vary it across participants.")
+    condition_group = parser.add_mutually_exclusive_group()
+    condition_group.add_argument("--condition-sun-rain", dest="condition_sun_rain",
+                                 action="store_true",
+                                 help="Scripted weather: precipitation starts at 80%% "
+                                      "and ramps linearly down to 0%% over 10 minutes, "
+                                      "timed from when the driver starts driving (not "
+                                      "process launch). Forwarded to Drive, which owns "
+                                      "the CARLA weather; ProVoice picks up the change "
+                                      "for free since it reads live precipitation off "
+                                      "the same CARLA world every frame. Mutually "
+                                      "exclusive with --condition-rain-sun.")
+    condition_group.add_argument("--condition-rain-sun", dest="condition_rain_sun",
+                                 action="store_true",
+                                 help="Scripted weather: sunny (0%% precipitation) for "
+                                      "the first 5 minutes of driving, then ramps "
+                                      "linearly up to 80%% over the following 10 "
+                                      "minutes. Mutually exclusive with "
+                                      "--condition-sun-rain.")
     parser.add_argument("--test", action="store_true",
                         help="REHEARSAL for the CARLA-machine data-collection run: "
                              "the LoA popups fire from the very start instead of "

@@ -1465,6 +1465,15 @@ BRAKE_ASSIST_WET_CEILING = 0.65    # ceiling multiplier at 100% precipitation
 BRAKE_ASSIST_MIN_SPEED = 1.0       # m/s; below this the stock brakes hold the car
 BRAKE_ASSIST_WEATHER_PERIOD = 40   # ticks between weather refreshes (one RPC each)
 
+# --condition-sun-rain / --condition-rain-sun: a scripted precipitation ramp,
+# in CARLA's 0-100 percent scale. Timed off wall-clock (pygame.time.get_ticks),
+# the same clock the 20 s LoA window interval uses, so it runs at the same
+# rate whether or not --sync holds the world clock for popups.
+CONDITION_PEAK_PRECIPITATION = 80.0    # percent
+CONDITION_RAMP_MINUTES = 10.0          # minutes to cross the full 0-80 range
+CONDITION_SUN_HOLD_MINUTES = 5.0       # rain-sun only: sunny minutes before the ramp starts
+CONDITION_PRECIP_STEP = 0.5            # percent; smaller changes are not sent to CARLA
+
 
 class World(object):
     def __init__(self, carla_world, hud, traffic_manager, args):
@@ -1494,6 +1503,17 @@ class World(object):
         self.camera_manager = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
+        # Scripted precipitation schedule (--condition-sun-rain /
+        # --condition-rain-sun). None = no schedule, weather stays whatever
+        # next_weather()/CARLA's default leaves it at.
+        if getattr(args, 'condition_sun_rain', False):
+            self._precip_mode = 'sun_rain'
+        elif getattr(args, 'condition_rain_sun', False):
+            self._precip_mode = 'rain_sun'
+        else:
+            self._precip_mode = None
+        self._precip_start_ms = None
+        self._precip_last_pct = None
         self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
@@ -1652,6 +1672,64 @@ class World(object):
         if self.control_mode == 'full':
             self.hud.notification('Weather: %s' % preset[1])
         self.player.get_world().set_weather(preset[0])
+
+    def _apply_precipitation(self, pct):
+        """Push a precipitation level to CARLA, skipping negligible changes.
+
+        One RPC (get + set) per call that actually moves the needle. A 0-80%
+        ramp over CONDITION_RAMP_MINUTES only crosses CONDITION_PRECIP_STEP
+        every few seconds, so this naturally throttles itself to about the
+        same rate as the brake-assist weather refresh (BRAKE_ASSIST_WEATHER_PERIOD)
+        without a separate tick counter.
+        """
+        pct = max(0.0, min(100.0, pct))
+        if (self._precip_last_pct is not None
+                and abs(pct - self._precip_last_pct) < CONDITION_PRECIP_STEP):
+            return
+        weather = self.world.get_weather()
+        weather.precipitation = pct
+        weather.precipitation_deposits = pct
+        weather.wetness = pct
+        self.world.set_weather(weather)
+        self._precip_last_pct = pct
+
+    def start_weather_schedule(self, now_ms):
+        """Arm the --condition-sun-rain / --condition-rain-sun ramp.
+
+        Called once, when the driver actually starts driving (not at world
+        spawn, which can sit on the start screen for an arbitrary time) --
+        so "start of session" means what a participant would expect it to.
+        """
+        if self._precip_mode is None:
+            return
+        self._precip_start_ms = now_ms
+        initial = (CONDITION_PEAK_PRECIPITATION if self._precip_mode == 'sun_rain'
+                  else 0.0)
+        self._apply_precipitation(initial)
+        print('[CONDITION] %s: precipitation schedule armed'
+              % self._precip_mode)
+
+    def update_weather_schedule(self, now_ms):
+        """Advance the scripted precipitation ramp. No-op with no schedule armed.
+
+        Timed off elapsed wall-clock minutes since start_weather_schedule(),
+        not incremented per call, so calling it irregularly (e.g. skipped
+        while a LoA popup freezes the scene) cannot drift it -- the next call
+        just computes the correct value for however much time has actually
+        passed.
+        """
+        if self._precip_mode is None or self._precip_start_ms is None:
+            return
+        elapsed_min = (now_ms - self._precip_start_ms) / 60000.0
+        if self._precip_mode == 'sun_rain':
+            # 80% -> 0% over CONDITION_RAMP_MINUTES, starting immediately.
+            pct = CONDITION_PEAK_PRECIPITATION * max(0.0, 1.0 - elapsed_min / CONDITION_RAMP_MINUTES)
+        else:
+            # sunny for CONDITION_SUN_HOLD_MINUTES, then 0% -> 80% over
+            # CONDITION_RAMP_MINUTES.
+            ramp_elapsed = elapsed_min - CONDITION_SUN_HOLD_MINUTES
+            pct = CONDITION_PEAK_PRECIPITATION * min(1.0, max(0.0, ramp_elapsed / CONDITION_RAMP_MINUTES))
+        self._apply_precipitation(pct)
 
     def next_map_layer(self, reverse=False):
         self.current_map_layer += -1 if reverse else 1
@@ -2423,11 +2501,11 @@ class HUD(object):
     def _render_speed(self, display):
         """Draw the speed readout as a HUD element over the steering wheel.
 
-        Bottom-CENTER, because the driver-seat camera puts the car's own
-        steering wheel there — reading speed off the wheel is what a real
-        heads-up display approximates. Drawn after the notifications so a
-        notification cannot cover the speed, and before the help overlay so
-        that still wins when it is open.
+        Centered horizontally, and anchored to the base of the windshield
+        (a fixed fraction of window height) rather than the bottom screen
+        edge — that's where the wheel sits in the driver-seat camera, and
+        it mimics where a real HUD projects speed: just above the dash, not
+        down on the hood where it is easy to miss.
         """
         if not self.show_speed:
             return
@@ -2436,12 +2514,11 @@ class HUD(object):
                                         (255, 255, 255))
         unit = self._font_speed_unit.render('km/h', True, (220, 220, 220))
 
-        margin = max(12, int(self.dim[0] * 0.012))
-        pad = max(6, margin // 2)
+        pad = max(6, int(self.dim[0] * 0.006))
         block_w = value.get_width() + pad + unit.get_width()
         block_h = value.get_height()
         x = (self.dim[0] - block_w) // 2
-        y = self.dim[1] - margin - block_h
+        y = int(self.dim[1] * 0.64) - block_h
 
         # Dimmed plate behind the digits: the camera view is arbitrary and white
         # text over a bright road surface is unreadable exactly when the driver
@@ -3128,6 +3205,15 @@ def game_loop(args):
             'ambient_source': ambience.source,
         }
         print(f"[INFO] Drive session_id={session_id}")
+        if world._precip_mode == 'sun_rain':
+            print("[INFO] --condition-sun-rain: precipitation starts at %.0f%% and "
+                  "ramps down to 0%% over %.0f min, from the moment driving starts."
+                  % (CONDITION_PEAK_PRECIPITATION, CONDITION_RAMP_MINUTES))
+        elif world._precip_mode == 'rain_sun':
+            print("[INFO] --condition-rain-sun: sunny for %.0f min, then "
+                  "precipitation ramps up to %.0f%% over the following %.0f min."
+                  % (CONDITION_SUN_HOLD_MINUTES, CONDITION_PEAK_PRECIPITATION,
+                     CONDITION_RAMP_MINUTES))
         if args.no_popup:
             print("[INFO] Popups off: no LoA popups, no user labels written")
         elif args.test_popup:
@@ -3211,6 +3297,7 @@ def game_loop(args):
 
             clock.tick_busy_loop(loop_cap)
             now_ms = pygame.time.get_ticks()
+            world.update_weather_schedule(now_ms)
             events = pygame.event.get()
 
             # ProVoice on the other machine has exited: from here the drive is
@@ -3264,6 +3351,7 @@ def game_loop(args):
                         return
                     if action == 'start':
                         started = True
+                        world.start_weather_schedule(now_ms)
                         if wait_for_provoice:
                             provoice_watcher.start(now_ms)
                             print("[INFO] Holding the LoA windows until ProVoice logs "
@@ -3657,6 +3745,22 @@ def main():
              'no label). The popup ignores the wheel in this mode (it still steers). '
              'THE DEFAULT - the flag only states it explicitly.')
     argparser.set_defaults(popup_input=None)
+    condition_group = argparser.add_mutually_exclusive_group()
+    condition_group.add_argument(
+        '--condition-sun-rain', dest='condition_sun_rain', action='store_true',
+        help='Scripted weather condition: precipitation starts at %.0f%% and '
+             'ramps linearly down to 0%% over %.0f minutes, from the moment '
+             'driving starts (the start-screen "start" action, not process '
+             'launch). Mutually exclusive with --condition-rain-sun.'
+             % (CONDITION_PEAK_PRECIPITATION, CONDITION_RAMP_MINUTES))
+    condition_group.add_argument(
+        '--condition-rain-sun', dest='condition_rain_sun', action='store_true',
+        help='Scripted weather condition: sunny (0%% precipitation) for the '
+             'first %.0f minutes of driving, then ramps linearly up to %.0f%% '
+             'over the following %.0f minutes. Mutually exclusive with '
+             '--condition-sun-rain.'
+             % (CONDITION_SUN_HOLD_MINUTES, CONDITION_PEAK_PRECIPITATION,
+                CONDITION_RAMP_MINUTES))
     args = argparser.parse_args()
 
     if args.test_popup and args.no_popup:
