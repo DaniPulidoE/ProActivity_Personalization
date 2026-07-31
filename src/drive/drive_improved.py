@@ -2421,13 +2421,13 @@ class HUD(object):
         self.help.render(display)
 
     def _render_speed(self, display):
-        """Draw the speed readout in the bottom-right corner.
+        """Draw the speed readout as a HUD element over the steering wheel.
 
-        Bottom-RIGHT because the two things already on screen are anchored
-        elsewhere: notifications occupy a full-width bar along the bottom edge
-        (its text left-aligned) and the LoA popup is centred. Drawn after the
-        notifications so a notification cannot cover the speed, and before the
-        help overlay so that still wins when it is open.
+        Bottom-CENTER, because the driver-seat camera puts the car's own
+        steering wheel there — reading speed off the wheel is what a real
+        heads-up display approximates. Drawn after the notifications so a
+        notification cannot cover the speed, and before the help overlay so
+        that still wins when it is open.
         """
         if not self.show_speed:
             return
@@ -2440,7 +2440,7 @@ class HUD(object):
         pad = max(6, margin // 2)
         block_w = value.get_width() + pad + unit.get_width()
         block_h = value.get_height()
-        x = self.dim[0] - margin - block_w
+        x = (self.dim[0] - block_w) // 2
         y = self.dim[1] - margin - block_h
 
         # Dimmed plate behind the digits: the camera view is arbitrary and white
