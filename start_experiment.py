@@ -498,6 +498,10 @@ def build_drive_cmd(session, args):
         *(["--speed"] if args.speed else []),
         *(["--render-scale", str(args.render_scale)]
           if args.render_scale != 1.0 else []),
+        # Always forwarded, not conditionally: the seed is only meaningful next
+        # to the gain it was used with, and Drive logs both into every label row.
+        "--ambient-gain", str(args.ambient_gain),
+        "--ambient-seed", str(args.ambient_seed),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1270,6 +1274,26 @@ def main():
                              "against, and it plausibly shifts how they judge the "
                              "assistant's autonomy. If you use it, use it for EVERY "
                              "participant and BOTH study arms.")
+    parser.add_argument("--ambient-gain", dest="ambient_gain", type=float,
+                        default=0.0,
+                        help="Play synthesised road/cabin noise at this gain, "
+                             "0-1 (default 0 = silent). CARLA has NO audio of "
+                             "its own in any version, so this is the only thing "
+                             "standing between the participant and a silent "
+                             "rig. Level tracks speed, idles at a standstill. "
+                             "Off by default because it is an arousal "
+                             "manipulation whether or not it is meant as one, "
+                             "and hr_delta / rr_delta are model inputs: use it "
+                             "for EVERY participant and BOTH arms or not at "
+                             "all. Not a level -- set the amplifier once, "
+                             "measure dB(A) at the driver's head, report that. "
+                             "Logged per label row as ambient_gain.")
+    parser.add_argument("--ambient-seed", dest="ambient_seed", type=int,
+                        default=0,
+                        help="Seed for the ambience noise loop (default 0). "
+                             "Gain plus seed reproduce exactly what a "
+                             "participant heard; both are logged per label row. "
+                             "No reason to vary it across participants.")
     parser.add_argument("--test", action="store_true",
                         help="REHEARSAL for the CARLA-machine data-collection run: "
                              "the LoA popups fire from the very start instead of "

@@ -151,6 +151,14 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+try:
+    from .ambience import Ambience, configure_mixer
+except ImportError:
+    # Launched as a plain script path rather than -m src.drive.drive_improved,
+    # so there is no package context for a relative import.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from ambience import Ambience, configure_mixer
+
 OBJECT_TO_COLOR = [
     (255, 255, 255),
     (128, 64, 128),
@@ -219,6 +227,15 @@ USER_LOA_LABEL_COLUMNS = [
     'modeltype',
     'state_model',
     'w_fcd',
+    # What the participant HEARD during this window. ambient_gain is the gain
+    # actually applied, not the one requested: a rig whose mixer failed to open
+    # logs 0 and is therefore correctly grouped with the silent runs instead of
+    # looking like a noise condition that never happened. Background noise is an
+    # arousal manipulation whether or not it is intended as one, and hr_delta /
+    # rr_delta are model inputs -- without these columns a mid-study volume
+    # change is a confound that cannot even be detected after the fact.
+    'ambient_gain',
+    'ambient_seed',
     'user_selected_loa',
     'system_action',
     'system_level',
@@ -2803,9 +2820,16 @@ def game_loop(args):
     # setdefault, not assignment: an operator who deliberately exported the
     # variable keeps their choice.
     os.environ.setdefault('SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS', '0')
+    # BEFORE pygame.init(), which is what opens the audio device: pre_init only
+    # supplies the parameters that init will use, so afterwards it is a no-op and
+    # the mixer buffer -- the one parameter that cannot be changed later -- keeps
+    # SDL's default. Harmless when --ambient-gain is 0; the device is only
+    # actually opened if Ambience is asked for sound.
+    configure_mixer()
     pygame.init()
     pygame.font.init()
     world = None
+    ambience = None
     original_settings = None
 
     try:
@@ -2860,6 +2884,12 @@ def game_loop(args):
         pygame.display.flip()
 
         hud = HUD(args.width, args.height, show_speed=args.speed)
+        # Started here, before the start overlay and therefore before ProVoice's
+        # 60 s calibration, and left running for the whole session. Noise onset
+        # is an arousal event: starting it partway through would move the HR/RR
+        # baseline that hr_delta and rr_delta are normalised against, for that
+        # participant only.
+        ambience = Ambience(gain=args.ambient_gain, seed=args.ambient_seed)
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
@@ -2913,6 +2943,9 @@ def game_loop(args):
             'modeltype': getattr(args, 'modeltype', ''),
             'state_model': getattr(args, 'state_model', ''),
             'w_fcd': getattr(args, 'w_fcd', ''),
+            # effective_gain, not args.ambient_gain — see USER_LOA_LABEL_COLUMNS.
+            'ambient_gain': ambience.effective_gain,
+            'ambient_seed': args.ambient_seed,
         }
         print(f"[INFO] Drive session_id={session_id}")
         if args.no_popup:
@@ -3029,6 +3062,10 @@ def game_loop(args):
                 for event in events:
                     if end_overlay.handle_event(event) == 'quit':
                         return
+                # Same reason as the popup branch: no world.tick here, and the
+                # session is over -- the bed settles to idle rather than holding
+                # the speed the car had when ProVoice stopped.
+                ambience.update(0.0)
                 world.render(display)
                 end_overlay.render(display)
                 pygame.display.flip()
@@ -3159,6 +3196,11 @@ def game_loop(args):
                         # at the prompt just answered and must not leak into the
                         # next one.
                         break
+                # Explicitly idle: this branch never reaches world.tick, so
+                # hud.speed_kmh still holds the speed the car was doing when the
+                # scene froze, and the bed would sit at motorway level over a
+                # motionless picture for the whole deliberation.
+                ambience.update(0.0)
                 world.render(display)
                 loa_popup.render(display)
                 pygame.display.flip()
@@ -3170,6 +3212,10 @@ def game_loop(args):
             if controller.parse_events(client, world, clock, args.sync, events):
                 return
             world.tick(clock)
+            # After world.tick, which is what refreshes hud.speed_kmh (it does so
+            # regardless of --speed: the readout is drawn from it, not the other
+            # way round).
+            ambience.update(world.hud.speed_kmh)
             world.render(display)
             pygame.display.flip()
 
@@ -3196,6 +3242,9 @@ def game_loop(args):
 
         if world is not None:
             world.destroy()
+
+        if ambience is not None:
+            ambience.stop()
 
         pygame.quit()
 
@@ -3341,6 +3390,24 @@ def main():
              'driving task -- it gives the driver a precise instrument to regulate '
              'against -- so if it is used at all it should be used for EVERY '
              'participant and both study arms.')
+    argparser.add_argument(
+        '--ambient-gain', dest='ambient_gain', type=float, default=0.0,
+        help='Play synthesised road/cabin noise at this gain, 0-1 (default: '
+             '%(default)s = silent, which is what CARLA gives you on its own -- '
+             'it has no audio at all). The level tracks vehicle speed and idles '
+             'at a standstill. Off by default because sound is an arousal '
+             'manipulation whether or not it is meant as one, and hr_delta / '
+             'rr_delta are model inputs: if it is used at all it must be used '
+             'for EVERY participant and BOTH study arms, at the same gain and '
+             'the same physical volume. This number is not a level -- set the '
+             'amplifier once, measure dB(A) at the driver\'s head, and report '
+             'that. Logged per label row as ambient_gain.')
+    argparser.add_argument(
+        '--ambient-seed', dest='ambient_seed', type=int, default=0,
+        help='Seed for the ambience noise loop (default: %(default)s). The bed '
+             'is synthesised, so this seed plus the gain reproduce exactly what '
+             'a participant heard; it is logged per label row. There is no '
+             'reason to vary it across participants, and good reason not to.')
     argparser.add_argument(
         '--popup-immediate', dest='popup_immediate', action='store_true',
         help='Open the FIRST LoA window straight away instead of one interval in. '
