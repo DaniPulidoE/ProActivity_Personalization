@@ -21,7 +21,8 @@ MAIN OPTIONS:
 
 LoA POPUP INTERFACE (default = keyboard on every rig, wheel attached or not):
 --keyboard-input: the default, stated explicitly -- number keys 0-4 tick a level
-    (same key again unticks), ENTER confirms, N discards the prompt
+    (same key again unticks), N ticks INVALID FRAME instead, ENTER commits
+    whatever is ticked (an invalid frame writes no label)
 --wheel-input: override -- paddles move the cursor, front button ticks, CONFIRM
     row submits
 
@@ -1383,9 +1384,10 @@ def main():
                              const="keyboard",
                              help="Answer the LoA popups from the keyboard: number keys "
                                   "0-4 tick a level, the same number again unticks it, "
-                                  "ENTER confirms, N discards the prompt. The popup "
-                                  "ignores the wheel, which still steers. THE DEFAULT "
-                                  "- the flag only states it explicitly.")
+                                  "N ticks INVALID FRAME instead, and ENTER commits "
+                                  "whatever is ticked. The popup ignores the wheel, "
+                                  "which still steers. THE DEFAULT - the flag only "
+                                  "states it explicitly.")
     parser.set_defaults(popup_input=None)
     parser.add_argument("--popup-wait-timeout", dest="popup_wait_timeout",
                         type=float, default=None,

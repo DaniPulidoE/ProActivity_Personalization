@@ -27,11 +27,14 @@ LoA Popup Input (which interface answers the popup):
                        level, the same number again unticks it, ENTER confirms
     --wheel-input    : Override: paddles move the cursor, the front button ticks
                        the level under it, CONFIRM submits
-    Either mode      : the last row, NO INPUT (or the N key), dismisses a prompt
-                       WITHOUT writing a label -- the failsafe for a window the
-                       driver cannot answer honestly. A missing label is data
-                       the analysis simply does not have; a guessed one is data
-                       it cannot tell from a real answer.
+    Either mode      : a prompt can be dismissed WITHOUT writing a label -- the
+                       failsafe for a window the driver cannot answer honestly.
+                       On the keyboard, N ticks the INVALID FRAME box and ENTER
+                       commits it, exactly like ticking levels; on the wheel it
+                       is the NO INPUT row (N there is still a one-press
+                       failsafe, in case the rim buttons are unmapped). A missing
+                       label is data the analysis simply does not have; a guessed
+                       one is data it cannot tell from a real answer.
 
 Basic Controls (available in both modes):
     W            : throttle
@@ -885,6 +888,10 @@ class LoASelectionPopup(object):
         # and the set of LoAs marked acceptable — more than one is allowed.
         self.selected = None
         self.chosen = set()
+        # Keyboard mode's discard, ticked with N and committed with ENTER like
+        # every other answer. Mutually exclusive with `chosen`: a window is
+        # either answerable or it is not.
+        self.invalid_frame = False
         self.input_mode = input_mode
         # The vehicle function the levels refer to. Shown under the title so the
         # driver answers about the right one; the line is dropped entirely when
@@ -965,6 +972,7 @@ class LoASelectionPopup(object):
         # Never carry a choice over from the previous prompt.
         self.selected = None
         self.chosen = set()
+        self.invalid_frame = False
         self.prompt_started_ms = now_ms
         self.function_name = self._window_functions[self.prompt_in_window]
         self.prompt_in_window += 1
@@ -996,6 +1004,15 @@ class LoASelectionPopup(object):
             self.chosen.discard(loa)
         else:
             self.chosen.add(loa)
+            # A level and "invalid frame" are contradictory answers about the
+            # same 20 s, so the later press wins rather than leaving both ticked
+            # and ENTER having to guess which one was meant.
+            self.invalid_frame = False
+
+    def _toggle_invalid(self):
+        self.invalid_frame = not self.invalid_frame
+        if self.invalid_frame:
+            self.chosen.clear()
 
     def _activate(self):
         """Act on the cursor row.
@@ -1036,14 +1053,25 @@ class LoASelectionPopup(object):
                 self._toggle(int(event.unicode))
                 return None, None
             if event.key in (K_RETURN, K_KP_ENTER):
-                # Submitting nothing would write an empty label, so it is a no-op.
+                # One key commits whatever is ticked: the levels as a label, or
+                # the invalid-frame row as a discard. Nothing ticked is a no-op,
+                # because submitting nothing would write an empty label.
+                if self.invalid_frame:
+                    return 'skip', None
                 if self.chosen:
                     return 'select', sorted(self.chosen)
                 return None, None
             if event.key == K_n:
-                # Live in BOTH modes, like the number keys above: the wheel can
-                # be unmapped or drop out mid-session, and a failsafe reachable
-                # only through the control that failed is not a failsafe.
+                if self.input_mode != POPUP_INPUT_WHEEL:
+                    # Ticks the row the driver can see and commits on ENTER, so
+                    # the destructive answer takes the same two steps as a real
+                    # one and can be taken back before it lands.
+                    self._toggle_invalid()
+                    return None, None
+                # In wheel mode N stays a one-press failsafe: it exists for the
+                # case where the rim buttons are unmapped or the wheel drops out
+                # mid-session, and a failsafe that needs a second confirmation
+                # on a screen showing no invalid-frame row is a worse one.
                 return 'skip', None
             if self.input_mode == POPUP_INPUT_KEYBOARD:
                 # Numbers and ENTER are the entire interface here; the cursor
@@ -1168,8 +1196,17 @@ class LoASelectionPopup(object):
         # neither submit nor discard. Keyboard mode addresses ENTER and N
         # directly and never draws a cursor, so the rows would be two lines of
         # instruction aimed at the experimenter on a screen the participant is
-        # reading — the popup ends at the level list instead.
+        # reading — it gets the invalid-frame tick box instead.
         if self.input_mode != POPUP_INPUT_WHEEL:
+            # Same tick box as the levels, because it is answered the same way:
+            # N ticks it, ENTER commits it. Amber rather than the levels' green
+            # so a ticked discard never looks like a recorded answer at a
+            # glance, and grey while untouched so it does not invite a press.
+            text = '%s Invalid frame' % ('[x]' if self.invalid_frame else '[ ]')
+            colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
+            surface = self._small_font.render(text, True, colour)
+            rect = surface.get_rect(center=(self.width // 2, y + 12))
+            display.blit(surface, rect)
             return
 
         if self.chosen:
@@ -1374,6 +1411,48 @@ def get_actor_blueprints(world, filter, generation):
 FIXED_SPAWN_POINT_INDEX = 152
 
 
+# ==============================================================================
+# -- Brake assist ---------------------------------------------------------------
+# ==============================================================================
+
+# CARLA 0.10 ships every vehicle with brake torque worth only ~0.5-0.7 g, and on
+# this build the per-wheel fields of VehiclePhysicsControl are effectively
+# read-only: apply_physics_control accepts the write, ticks, and leaves the
+# wheels array unchanged (verified with scripts/check_braking.py probe). No
+# blueprint in the fleet reaches a realistic 0.9 g -- the best sedan, the MKZ
+# this file spawns, measures 6.6 m/s^2 -- so the shortfall cannot be fixed where
+# it belongs, in the physics.
+#
+# Instead the deficit is topped up with a force opposing travel, scaled by the
+# brake input, so full brake produces roughly what a real car does. The stock
+# capability is measured from the spawned vehicle's own physics, so this adapts
+# if the blueprint changes rather than hard-coding one car's shortfall.
+#
+# What this deliberately does NOT reproduce:
+#   - Weight transfer. Actor.add_force takes no application point, so the force
+#     acts at the centre of mass and the car does not pitch under braking. The
+#     deceleration is right; the body attitude is not.
+#   - Tyre behaviour. The top-up bypasses the tyre model, so it is capped at a
+#     friction-derived ceiling that falls in rain rather than braking as hard
+#     wet as dry. That ceiling approximates grip; it does not simulate it.
+#   - ABS, on the topped-up portion.
+#
+# IMPORTANT: deterministic only when the drive loop runs one iteration per
+# simulation tick, i.e. under --sync (where fixed_npc_traffic.py owns the
+# clock). Without --sync the force lands at whatever rate the loop happens to
+# run and braking becomes frame-rate dependent.
+#
+# Keep BRAKE_ASSIST_TARGET_DECEL fixed across every participant and both study
+# arms. Braking strength changes driving behaviour, which feeds brake,
+# speed_ratio_* and indirectly the physiological features -- varying it would
+# confound the personalization comparison exactly as a varying --decision-hz
+# would.
+BRAKE_ASSIST_TARGET_DECEL = 9.0    # m/s^2 at full brake on dry asphalt (~0.9 g)
+BRAKE_ASSIST_WET_CEILING = 0.65    # ceiling multiplier at 100% precipitation
+BRAKE_ASSIST_MIN_SPEED = 1.0       # m/s; below this the stock brakes hold the car
+BRAKE_ASSIST_WEATHER_PERIOD = 40   # ticks between weather refreshes (one RPC each)
+
+
 class World(object):
     def __init__(self, carla_world, hud, traffic_manager, args):
         self.world = carla_world
@@ -1407,6 +1486,16 @@ class World(object):
         self._gamma = args.gamma
         self._render_scale = getattr(args, 'render_scale', 1.0)
         self._fixed_spawn = args.fixed
+        # Brake assist. Measured per spawn in _cache_brake_assist, which runs
+        # from modify_vehicle_physics inside restart() -- so these have to exist
+        # before restart() is called.
+        self.brake_assist_decel = getattr(args, 'brake_assist_decel',
+                                          BRAKE_ASSIST_TARGET_DECEL)
+        self._assist_mass = 0.0
+        self._assist_stock_decel = 0.0
+        self._assist_wet = 0.0
+        self._assist_wet_age = 0
+        self._assist_dt = self.world.get_settings().fixed_delta_seconds or 0.05
         self.restart()
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -1601,6 +1690,88 @@ class World(object):
             actor.apply_physics_control(physics_control)
         except Exception:
             pass
+        # Deliberately outside the try above: a failure to measure the brake
+        # assist is not the same failure as a vehicle with no physics control,
+        # and swallowing it would silently disable the assist.
+        self._cache_brake_assist(actor)
+
+    def _cache_brake_assist(self, actor):
+        """Measure how much braking the stock physics gives, once per spawn.
+
+        Peak deceleration is the summed per-wheel braking force (torque over
+        radius, for the wheels the brake acts on) divided by mass. Validated
+        against measurement: this predicted 5.7 m/s^2 for the Dodge Charger and
+        scripts/check_braking.py measured 6.0, the excess being engine braking.
+        """
+        self._assist_mass = 0.0
+        self._assist_stock_decel = 0.0
+        if self.brake_assist_decel <= 0.0:
+            print("[INFO] Brake assist disabled (--brake-assist-decel 0); the car "
+                  "brakes on stock CARLA physics.")
+            return
+        try:
+            pc = actor.get_physics_control()
+        except Exception as e:
+            print("[WARN] Brake assist off: could not read physics control (%s)" % e)
+            return
+        force = 0.0
+        for w in pc.wheels:
+            radius_m = w.wheel_radius / 100.0  # centimetres in CARLA 0.10
+            if radius_m > 0 and w.affected_by_brake:
+                force += w.max_brake_torque / radius_m
+        if pc.mass <= 0 or force <= 0:
+            print("[WARN] Brake assist off: implausible physics (mass=%.1f, "
+                  "force=%.1f)" % (pc.mass, force))
+            return
+        self._assist_mass = pc.mass
+        self._assist_stock_decel = force / pc.mass
+        share = max(0.0, self.brake_assist_decel - self._assist_stock_decel)
+        print("[INFO] Brake assist: stock %.1f m/s^2, target %.1f m/s^2 -- assist "
+              "supplies %.0f%% of peak braking."
+              % (self._assist_stock_decel, self.brake_assist_decel,
+                 100.0 * share / self.brake_assist_decel))
+        if not self.sync:
+            print("[WARN] Brake assist is frame-rate dependent without --sync. "
+                  "Run the study with --sync so braking is reproducible.")
+
+    def apply_brake_assist(self, control):
+        """Top up the stock brakes toward BRAKE_ASSIST_TARGET_DECEL.
+
+        Called once per drive-loop iteration, which under --sync is once per
+        simulation tick. A no-op when not braking, when nearly stopped, or when
+        the stock physics already meets the target.
+        """
+        if self._assist_mass <= 0.0 or control.brake <= 0.0:
+            return
+        velocity = self.player.get_velocity()
+        # Horizontal only: on a slope the full 3D direction would add a vertical
+        # component that changes wheel load, and a bouncing car would get a
+        # force with no relation to braking.
+        speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+        if speed < BRAKE_ASSIST_MIN_SPEED:
+            return
+
+        self._assist_wet_age -= 1
+        if self._assist_wet_age <= 0:
+            try:
+                self._assist_wet = self.world.get_weather().precipitation / 100.0
+            except Exception:
+                self._assist_wet = 0.0
+            self._assist_wet_age = BRAKE_ASSIST_WEATHER_PERIOD
+
+        ceiling = self.brake_assist_decel * (
+            1.0 - (1.0 - BRAKE_ASSIST_WET_CEILING) * self._assist_wet)
+        accel = max(0.0, ceiling - self._assist_stock_decel) * control.brake
+        # Never more than brings the car to rest this tick, so the assist can
+        # never push it backwards.
+        accel = min(accel, speed / max(self._assist_dt, 1e-3))
+        if accel <= 0.0:
+            return
+        magnitude = self._assist_mass * accel
+        self.player.add_force(carla.Vector3D(
+            -velocity.x / speed * magnitude,
+            -velocity.y / speed * magnitude,
+            0.0))
 
     def tick(self, clock):
         self.hud.tick(self, clock)
@@ -1951,6 +2122,10 @@ class KeyboardControl(object):
                 # Apply control
                 if not self._ackermann_enabled:
                     world.player.apply_control(self._control)
+                    # Top up the stock brakes, which CARLA 0.10 leaves well
+                    # short of a real car and which cannot be raised through
+                    # the physics API on this build. No-op when not braking.
+                    world.apply_brake_assist(self._control)
                 else:
                     world.player.apply_ackermann_control(self._ackermann_control)
                     # Update control to the last one applied by the ackermann controller.
@@ -3302,6 +3477,14 @@ def main():
         '--gamma', default=1.0, type=float,
         help='Gamma correction of the camera (default: 1.0)')
     argparser.add_argument(
+        '--brake-assist-decel', default=BRAKE_ASSIST_TARGET_DECEL, type=float,
+        help='peak deceleration in m/s^2 at full brake (default: %.1f, about '
+             '0.9g). CARLA 0.10 vehicles manage only ~0.6g and the physics API '
+             'cannot raise it, so the shortfall is supplied by a force opposing '
+             'travel. 0 disables the assist and leaves stock CARLA braking. '
+             'KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND BOTH STUDY ARMS.'
+             % BRAKE_ASSIST_TARGET_DECEL)
+    argparser.add_argument(
         '--participantid', default='',
         help='participant id for label logging')
     argparser.add_argument(
@@ -3473,10 +3656,10 @@ def main():
         '--keyboard-input', dest='popup_input', action='store_const',
         const=POPUP_INPUT_KEYBOARD,
         help='Answer the LoA popups from the keyboard: number keys 0-4 tick a level, '
-             'pressing the same number again unticks it, ENTER confirms, and N '
-             'dismisses the prompt without writing a label. The popup ignores the '
-             'wheel in this mode (it still steers). THE DEFAULT - the flag only '
-             'states it explicitly.')
+             'pressing the same number again unticks it, N ticks INVALID FRAME '
+             'instead, and ENTER commits whatever is ticked (an invalid frame writes '
+             'no label). The popup ignores the wheel in this mode (it still steers). '
+             'THE DEFAULT - the flag only states it explicitly.')
     argparser.set_defaults(popup_input=None)
     args = argparser.parse_args()
 
