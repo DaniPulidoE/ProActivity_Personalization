@@ -97,6 +97,12 @@ import math
 import numpy as np
 import pygame
 
+try:
+    from . import ambience_assets
+except ImportError:
+    # Plain-script launch: no package context for a relative import.
+    import ambience_assets
+
 # Mixer format. -16 is signed 16-bit, matching the int16 buffers built below.
 # The 512-sample buffer is ~12 ms of latency at 44.1 kHz, small enough that the
 # engine note still feels connected to the throttle.
@@ -249,6 +255,14 @@ LOOP_SECONDS = 20.0
 # has a high crest factor, so this is headroom against the rare peak. Layers
 # sum, hence the conservative value.
 PEAK_SCALE = 0.5
+
+# --- Recorded path ----------------------------------------------------------
+# Level curve applied to recorded clips (see asset_level). Gentler than the
+# synthesised layers on purpose: the clips carry the character themselves, so
+# this only restores the loudness difference that RMS-matching them removed.
+ASSET_REST_LEVEL = 0.45
+ASSET_FULL_LEVEL = 1.0
+ASSET_LEVEL_EXPONENT = 0.7
 
 # Time constants. Speed is tracked faster than the mix so the engine still feels
 # connected to the pedal; without any smoothing the step to idle when the scene
@@ -486,6 +500,49 @@ def mix_levels(speed_kmh, throttle, previous_gear):
     return gear, rpm, road, engine
 
 
+def asset_level(speed_kmh):
+    """Overall level for the RECORDED path at this speed.
+
+    Deliberately gentler than the synthesised curves. There, level was doing all
+    the work of conveying speed; here the clips themselves carry the character
+    -- a 100 km/h recording already sounds like 100 km/h -- so this only has to
+    supply the loudness difference the RMS matching in ambience_assets removed.
+    Overdriving it would undo the point of having recordings.
+    """
+    v = min(max(speed_kmh, 0.0) / SPEED_FULL_KMH, 1.0)
+    return (ASSET_REST_LEVEL
+            + (ASSET_FULL_LEVEL - ASSET_REST_LEVEL) * v ** ASSET_LEVEL_EXPONENT)
+
+
+def asset_weights(speed_kmh, voice_speeds):
+    """Equal-power crossfade weights across the clips, bracketing this speed.
+
+    Equal-power (sqrt) rather than linear because these beds are uncorrelated
+    recordings: a linear crossfade would dip ~3 dB halfway between two clips, so
+    holding a speed exactly between them would sound like a hole rather than a
+    blend. Outside the recorded range the nearest clip simply holds.
+    """
+    count = len(voice_speeds)
+    weights = [0.0] * count
+    if count == 0:
+        return weights
+    if count == 1 or speed_kmh <= voice_speeds[0]:
+        weights[0] = 1.0
+        return weights
+    if speed_kmh >= voice_speeds[-1]:
+        weights[-1] = 1.0
+        return weights
+    for i in range(count - 1):
+        lo, hi = voice_speeds[i], voice_speeds[i + 1]
+        if lo <= speed_kmh <= hi:
+            span = hi - lo
+            f = (speed_kmh - lo) / span if span > 0 else 0.0
+            weights[i] = math.sqrt(1.0 - f)
+            weights[i + 1] = math.sqrt(f)
+            break
+    return weights
+
+
 def engine_bucket_rpm(index):
     """Engine speed bucket ``index`` is rendered at. Geometric, see ENGINE_BUCKETS.
 
@@ -541,14 +598,18 @@ class Ambience(object):
     """
 
     def __init__(self, gain=DEFAULT_AMBIENT_GAIN, seed=0,
-                 loop_seconds=LOOP_SECONDS):
+                 loop_seconds=LOOP_SECONDS, assets_dir=None):
         self.requested_gain = max(0.0, float(gain))
         self.seed = int(seed)
         self.effective_gain = 0.0
-        self._road = []           # [(channel, rest, full, exponent)]
+        # What was actually played, for the label rows: 'off', 'synth', or the
+        # short hash of the recorded clip set. See the `source` property.
+        self.assets = None
+        self._road = []           # [(channel, sound, rest, full, exponent)]
         self._engine_sounds = []
         self._engine_ch = [None, None]
         self._engine_bucket = [-1, -1]
+        self._voices = []         # [(speed_kmh, channel, sound)] when recorded
         self._speed = 0.0
         self._throttle = 0.0
         self._gear = 1
@@ -578,13 +639,41 @@ class Ambience(object):
                     % abs(fmt))
             channels = max(1, channels)
 
+            started_ms = pygame.time.get_ticks()
+
+            # Recordings win when they are present. The synthesiser sounds like
+            # *a* car; a recording sounds like *this* car, and no amount of
+            # tuning closes that gap -- so the synth is the fallback for a
+            # machine that has not copied the clips, not the preferred path.
+            self.assets = ambience_assets.load(assets_dir, rate, channels,
+                                               SPEED_FULL_KMH)
+            if self.assets is not None:
+                needed = len(self.assets)
+                if pygame.mixer.get_num_channels() < needed:
+                    pygame.mixer.set_num_channels(needed)
+                for idx, (speed, sound) in enumerate(self.assets.voices):
+                    ch = pygame.mixer.Channel(idx)
+                    ch.set_volume(0.0)
+                    ch.play(sound, loops=-1)
+                    self._voices.append((speed, ch, sound))
+                build_ms = pygame.time.get_ticks() - started_ms
+                self.effective_gain = self.requested_gain
+                self._started = True
+                self.update(0.0)
+                print('[INFO] Ambience on (recorded): gain=%.2f %s, %d Hz, '
+                      '%d ch, loaded in %d ms. Fix the gain AND the physical '
+                      'volume across all participants and both study arms, and '
+                      'report the measured dB(A), not this number.'
+                      % (self.effective_gain, self.assets.describe(), rate,
+                         channels, build_ms))
+                return
+
             # One channel per road layer plus two for the engine crossfade.
             needed = len(ROAD_LAYERS) + 2
             if pygame.mixer.get_num_channels() < needed:
                 pygame.mixer.set_num_channels(needed)
 
             rng = np.random.default_rng(self.seed)
-            started_ms = pygame.time.get_ticks()
 
             # Channels are claimed BY INDEX, not via find_channel(): two
             # consecutive find_channel() calls with nothing played in between
@@ -630,14 +719,19 @@ class Ambience(object):
         self.effective_gain = self.requested_gain
         self._started = True
         self.update(0.0)
-        print('[INFO] Ambience on: gain=%.2f seed=%d (%d road layers + %d rev '
-              'buckets, %d Hz, %d ch, built in %d ms). Fix the gain AND the '
-              'physical volume across all participants and both study arms, '
-              'and report the measured dB(A), not this number.'
+        print('[INFO] Ambience on (synthesised): gain=%.2f seed=%d (%d road '
+              'layers + %d rev buckets, %d Hz, %d ch, built in %d ms). Fix the '
+              'gain AND the physical volume across all participants and both '
+              'study arms, and report the measured dB(A), not this number.'
               % (self.effective_gain, self.seed, len(self._road),
                  ENGINE_BUCKETS, rate, channels, build_ms))
 
     def _silence(self):
+        for _speed, ch, _sound in self._voices:
+            try:
+                ch.stop()
+            except pygame.error:
+                pass
         for entry in self._road:
             try:
                 entry[0].stop()
@@ -649,6 +743,7 @@ class Ambience(object):
                     ch.stop()
                 except pygame.error:
                     pass
+        self._voices = []
         self._road = []
         self._engine_sounds = []
         self._engine_ch = [None, None]
@@ -657,6 +752,20 @@ class Ambience(object):
     @property
     def active(self):
         return self._started
+
+    @property
+    def source(self):
+        """What was played, for the label rows.
+
+        'off' when there was no audio, the clip set's short hash when it came
+        from recordings, 'synth' when it came from the synthesiser. This is the
+        column that makes a run interpretable after the fact: with recordings
+        the seed means nothing, and a clip swapped halfway through a study is
+        otherwise an undetectable change to the stimulus.
+        """
+        if not self._started:
+            return 'off'
+        return self.assets.assets_id if self.assets is not None else 'synth'
 
     @property
     def rpm(self):
@@ -698,6 +807,10 @@ class Ambience(object):
                 self._throttle += (1.0 - math.exp(-dt / THROTTLE_TAU_S)) * (
                     target_throttle - self._throttle)
         self._last_ms = now
+
+        if self._voices:
+            self._update_recorded()
+            return
 
         self._gear, rpm, road_levels, engine_level = mix_levels(
             self._speed, self._throttle, self._gear)
@@ -741,6 +854,16 @@ class Ambience(object):
                 if bucket is not None and self._engine_bucket[slot] != bucket:
                     ch.play(self._engine_sounds[bucket], loops=-1)
                     self._engine_bucket[slot] = bucket
+                ch.set_volume(level * weight)
+            except pygame.error:
+                pass
+
+    def _update_recorded(self):
+        """Crossfade the recorded clips bracketing the current speed."""
+        level = self.effective_gain * asset_level(self._speed)
+        weights = asset_weights(self._speed, [s for s, _c, _s in self._voices])
+        for (_speed, ch, _sound), weight in zip(self._voices, weights):
+            try:
                 ch.set_volume(level * weight)
             except pygame.error:
                 pass

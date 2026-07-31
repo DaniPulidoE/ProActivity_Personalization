@@ -236,6 +236,12 @@ USER_LOA_LABEL_COLUMNS = [
     # change is a confound that cannot even be detected after the fact.
     'ambient_gain',
     'ambient_seed',
+    # Which sound: the clip set's short hash when recordings were used, 'synth'
+    # when the synthesiser was, 'off' when there was none. Without it a clip
+    # swapped halfway through the study is an undetectable change of stimulus --
+    # and ambient_seed only reproduces the SYNTHESISED path, so for recordings
+    # this is the only thing tying a row to what was actually heard.
+    'ambient_source',
     'user_selected_loa',
     'system_action',
     'system_level',
@@ -2889,7 +2895,8 @@ def game_loop(args):
         # is an arousal event: starting it partway through would move the HR/RR
         # baseline that hr_delta and rr_delta are normalised against, for that
         # participant only.
-        ambience = Ambience(gain=args.ambient_gain, seed=args.ambient_seed)
+        ambience = Ambience(gain=args.ambient_gain, seed=args.ambient_seed,
+                            assets_dir=args.ambient_dir)
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
@@ -2943,9 +2950,11 @@ def game_loop(args):
             'modeltype': getattr(args, 'modeltype', ''),
             'state_model': getattr(args, 'state_model', ''),
             'w_fcd': getattr(args, 'w_fcd', ''),
-            # effective_gain, not args.ambient_gain — see USER_LOA_LABEL_COLUMNS.
+            # effective_gain and source, not the requested values — see
+            # USER_LOA_LABEL_COLUMNS. Both report what was actually played.
             'ambient_gain': ambience.effective_gain,
             'ambient_seed': args.ambient_seed,
+            'ambient_source': ambience.source,
         }
         print(f"[INFO] Drive session_id={session_id}")
         if args.no_popup:
@@ -3415,6 +3424,14 @@ def main():
              'is synthesised, so this seed plus the gain reproduce exactly what '
              'a participant heard; it is logged per label row. There is no '
              'reason to vary it across participants, and good reason not to.')
+    argparser.add_argument(
+        '--ambient-dir', dest='ambient_dir', default=None,
+        help='Directory of recorded cabin clips (default: <repo>/assets/'
+             'ambience, or $PROVOICE_AMBIENCE_DIR). Files named '
+             'interior_<kmh>.wav are crossfaded by speed; a single interior.wav '
+             'also works. Clips are loop-repaired on load, so they can be '
+             'dropped in untouched. With no usable clips the synthesiser is '
+             'used instead and ambient_source is logged as "synth".')
     argparser.add_argument(
         '--popup-immediate', dest='popup_immediate', action='store_true',
         help='Open the FIRST LoA window straight away instead of one interval in. '
