@@ -5,18 +5,31 @@ Run this with CARLA already started (CarlaUnreal.exe), nothing else needs to
 be running. It does three things, each printed so you can correlate with what
 you see in the CARLA window:
 
-  1. Reports the current map and the full list of maps this server has.
+  1. Reports the current map and the full list of maps this server has, and
+     drops the SPECTATOR to a low, close-up vantage point near a spawn point
+     -- NOT the default top-down bird's-eye view. That default view is a bad
+     test for rain: particles are spawned in a radius around whatever
+     camera/pawn is active (for performance), and even the lighting/cloudiness
+     change is subtle from directly overhead at altitude. A top-down view
+     showing "no change" does not mean the weather system is broken.
   2. Sets HardRainNoon on the CURRENT map (whatever is loaded -- Mine_01 in
      the normal experiment setup) and reads the weather back to prove the RPC
      round-trips correctly.
   3. If a stock CARLA town is available, loads it and sets HardRainNoon there
-     too. Watch the CARLA window when this happens.
+     too (repositioning the spectator there as well). Watch the CARLA window
+     when this happens.
 
 If rain renders in step 3 but not step 2 -- despite both using the identical
 set_weather(HardRainNoon) call -- the conclusion is that Mine_01 (or whatever
 custom map is loaded) has no weather-reactive Niagara/rain actor placed in
 its level, which is a map-authoring issue, not something fixable from the
 Python client.
+
+The most representative test of all is still the actual Drive window (the
+in-car dash-cam view a participant sees), e.g.:
+    python start_experiment.py --test-drive --no-popup --condition-sun-rain
+which starts at 80% precipitation immediately -- if this diagnostic and a
+real test-drive disagree, trust the test-drive.
 
 Usage:
     python scripts/check_weather_vfx.py [--host 127.0.0.1] [--port 2000]
@@ -30,6 +43,26 @@ import sys
 import time
 
 import carla
+
+
+def _drop_spectator_low(world, label):
+    """Move the spectator to a ground-level vantage point near a spawn point.
+
+    CARLA's default spectator sits high above the map looking straight down
+    -- exactly the view that makes rain particles and lighting changes hard
+    or impossible to notice. A handful of metres above the road, angled
+    slightly down, is what a driver's-eye check actually needs.
+    """
+    spawn_points = world.get_map().get_spawn_points()
+    if not spawn_points:
+        print(f"[{label}] No spawn points on this map; spectator left where it was.")
+        return
+    sp = spawn_points[0]
+    loc = sp.location + carla.Location(z=3.0)
+    rot = carla.Rotation(pitch=-10.0, yaw=sp.rotation.yaw, roll=0.0)
+    world.get_spectator().set_transform(carla.Transform(loc, rot))
+    print(f"[{label}] Spectator moved to ground level near spawn point 0 "
+          f"({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f}).")
 
 
 def main():
@@ -62,6 +95,7 @@ def main():
         available = []
     print("=" * 72)
 
+    _drop_spectator_low(world, "STEP 2")
     print(f"[STEP 2] Setting HardRainNoon on the CURRENT map ({current_map})...")
     world.set_weather(carla.WeatherParameters.HardRainNoon)
     readback = world.get_weather()
@@ -93,6 +127,7 @@ def main():
           f"anything currently in the world)...")
     world = client.load_world(target)
     time.sleep(3.0)  # let the map finish loading before touching weather
+    _drop_spectator_low(world, "STEP 3")
     print(f"[STEP 3] Setting HardRainNoon on {target}...")
     world.set_weather(carla.WeatherParameters.HardRainNoon)
     readback = world.get_weather()
