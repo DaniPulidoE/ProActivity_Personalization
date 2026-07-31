@@ -1202,7 +1202,7 @@ class LoASelectionPopup(object):
             # N ticks it, ENTER commits it. Amber rather than the levels' green
             # so a ticked discard never looks like a recorded answer at a
             # glance, and grey while untouched so it does not invite a press.
-            text = '%s Invalid window' % ('[x]' if self.invalid_frame else '[ ]')
+            text ="- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - \n%s Invalid window" % ('[x]' if self.invalid_frame else '[ ]')
             colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
             surface = self._small_font.render(text, True, colour)
             rect = surface.get_rect(center=(self.width // 2, y + 12))
