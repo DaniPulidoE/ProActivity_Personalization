@@ -31,16 +31,52 @@ So the bed is four layers mixed live:
 
   rumble / body / hiss   three noise bands with DIFFERENT speed exponents, so
                          their balance (the spectral tilt) moves with speed
-  engine                 a harmonic stack whose fundamental tracks a simulated
-                         gearbox, pre-rendered at ENGINE_BUCKETS speeds and
-                         crossfaded
+  engine                 firing impulses through a fixed resonant body, whose
+                         firing rate tracks a simulated gearbox, pre-rendered at
+                         ENGINE_BUCKETS speeds and crossfaded
 
-Every buffer is built in the frequency domain (magnitudes on bin centres,
-random phases, inverse FFT), which makes it exactly periodic BY CONSTRUCTION so
-``loops=-1`` wraps with no click. That matters more here than it looks: a
-periodic tick is exactly the kind of thing a participant stops noticing
-consciously after ten minutes and keeps responding to physiologically, and this
-project MEASURES that (hr_delta, rr_delta feed the model).
+WHY THE ENGINE IS AN IMPULSE TRAIN AND NOT A HARMONIC STACK
+-----------------------------------------------------------
+This layer was first written the same way as the road bed -- harmonic
+MAGNITUDES on bin centres with RANDOM PHASES -- and it sounded like a church
+organ, which is the one thing everybody who has done this reports. Three
+separate reasons, all of them structural:
+
+* PHASE. A cylinder firing is an IMPULSE, and at 25-140 Hz its period is
+  7-40 ms, far longer than the ear's ~2 ms temporal resolution -- so the
+  individual firings are RESOLVED, and what the listener hears is the pulse
+  train, the "putt-putt" at idle and the bark under load. Random phase spreads
+  each period's energy evenly across the period: identical magnitude spectrum,
+  no impulse, and the result is a drone. Phase-deafness (Ohm's law) is about
+  steady tones well above the resolution limit; it does not apply down here.
+* A FIXED SPECTRAL ENVELOPE. Exhaust pipe, intake, block and panels resonate at
+  frequencies that DO NOT MOVE, and rpm slides the harmonics through that fixed
+  envelope. A rolloff expressed per harmonic INDEX (k**-a) stretches with rpm
+  instead, so the whole timbre sweeps together -- a siren, not an engine. Worse,
+  a fixed harmonic COUNT means the bandwidth scales with rpm: fourteen
+  harmonics of a 25 Hz idle stop at 350 Hz, a muffled boom, while real idle has
+  content past 2 kHz.
+* HALF ORDERS. Cylinders are not identical, so the pattern repeats over the
+  full four-stroke cycle (two revolutions, ENGINE_CYLINDERS firings), not over
+  one firing. That puts energy at 1/4, 1/2, 3/4 of the firing frequency, and
+  that lumpiness is a large part of what reads as "engine" rather than "tone
+  generator", especially at idle.
+
+So the engine is built the way the physics is: an excitation (one impulse per
+firing, per-cylinder amplitude trims, per-cycle timing jitter, plus combustion
+noise gated by the firings) convolved with a fixed body impulse response (a sum
+of decaying resonances). The convolution is CIRCULAR, which is what keeps the
+loop exactly periodic -- the ring-out of the last firing wraps into the first,
+which is precisely what a steady engine does.
+
+The road buffers are still built in the frequency domain (magnitudes on bin
+centres, random phases, inverse FFT) -- for broadband noise, phase carries no
+information the ear can use, and that construction makes them exactly periodic
+BY CONSTRUCTION so ``loops=-1`` wraps with no click. Both layers therefore loop
+seamlessly. That matters more here than it looks: a periodic tick is exactly the
+kind of thing a participant stops noticing consciously after ten minutes and
+keeps responding to physiologically, and this project MEASURES that (hr_delta,
+rr_delta feed the model).
 
 It still sounds synthesised -- it is a synthesiser. It sounds like a car rather
 than like weather, which is the bar that matters for presence.
@@ -112,29 +148,86 @@ TEXTURE_BAND_HZ = (0.15, 2.5)
 TEXTURE_DEPTH = 0.35
 
 # --- Engine -----------------------------------------------------------------
-# A 4-stroke fires CYLINDERS/2 times per revolution, so the fundamental is
-# rpm/60 * CYLINDERS/2 -- 25 Hz at idle, ~140 Hz at redline for these numbers.
+# A 4-stroke fires CYLINDERS/2 times per revolution, so the FIRING frequency is
+# rpm/60 * CYLINDERS/2 -- 25 Hz at idle, 140 Hz at redline for these numbers.
+# Four is also the right number for the car actually spawned: the MKZ's base
+# engine is a 2.0 l four. Set 6 and every order below moves with it.
 ENGINE_CYLINDERS = 4
 IDLE_RPM = 750.0
 SHIFT_RPM = 2600.0
 REDLINE_RPM = 4200.0
-ENGINE_HARMONICS = 14
-ENGINE_HARMONIC_ROLLOFF = 1.15
 
-# Each harmonic is smeared over a few bins rather than placed on exactly one.
-# A pure line spectrum sounds like a church organ; real combustion is rough,
-# and this width is most of the difference between "engine" and "synth tone".
-ENGINE_PARTIAL_WIDTH_HZ = 1.5
-ENGINE_PARTIAL_WIDTH_REL = 0.008
-# Broadband combustion/induction noise mixed under the harmonics.
-ENGINE_NOISE_LEVEL = 0.30
+# The body: (frequency Hz, Q, gain) of the resonances the firing impulses are
+# played through -- tailpipe, block/panel boom, and the two mid formants that
+# carry most of the "car" of it. These frequencies are FIXED and do not move
+# with rpm, which is the whole point: the harmonics slide through a stationary
+# envelope, exactly as they do in the car. Each entry contributes a decaying
+# sinusoid exp(-pi*f*t/Q)*sin(2*pi*f*t) to the impulse response, so Q is
+# literally how long it rings (tau = Q/(pi*f): 16 ms for the first, 0.3 ms for
+# the last), and the gain is its RESPONSE at resonance -- see _engine_cycle for
+# why that is not the same as the amplitude of the decaying sinusoid.
+#
+# The Qs of the two boom resonances are the punch/drone knob and were measured,
+# not guessed: at Q=7 the 92 Hz one rings for 24 ms, which is longer than the
+# firing period above ~1200 rpm, so consecutive firings overlap and the layer
+# smooths back into the drone this rewrite exists to remove. Keep tau below a
+# firing period across most of the rev range.
+ENGINE_RESONANCES = (
+    (92.0,   4.5, 1.00),
+    (188.0,  4.0, 0.65),
+    (430.0,  3.5, 0.38),
+    (1150.0, 3.0, 0.20),
+    (2450.0, 2.5, 0.10),
+)
+# Band limits on the finished loop. The high one keeps the impulses from
+# sounding like digital clicks; the low one removes the sub-audible content that
+# would otherwise eat the headroom (same argument as the road bands).
+ENGINE_LOW_HZ = 28.0
+ENGINE_HIGH_HZ = 5200.0
+
+# Per-cylinder amplitude trim, one per cylinder, mean 1. Real cylinders differ
+# in fuelling and compression, and that difference is what makes the pattern
+# repeat over the four-stroke cycle instead of over one firing -- which is where
+# the half orders come from. Constants rather than draws from the session rng on
+# purpose: this is a property of the CAR, so it must be identical in every
+# bucket (a different pattern per bucket would smear across the crossfade) and
+# in every session.
+ENGINE_CYLINDER_TRIM = (1.00, 0.88, 1.06, 0.94)
+# Cycle-to-cycle roughness. Timing jitter is a fraction of the firing period.
+# This is the real source of the roughness that smearing each partial across
+# bins was faking -- combustion is irregular in TIME, and a magnitude smear with
+# independent random phases is a detuned chorus, not an engine.
+ENGINE_TIMING_JITTER = 0.012
+ENGINE_AMPLITUDE_JITTER = 0.07
+# Combustion/induction noise, gated by the firings (loudest just after each one)
+# and pushed through the same body. Matched on RMS against the impulse train,
+# not on peak -- see the same lesson in the road layers.
+ENGINE_NOISE_LEVEL = 0.35
+ENGINE_NOISE_DECAY_S = 0.020
 
 # Pre-rendered rev buckets, crossfaded in pairs. pygame cannot pitch-shift a
-# playing Sound, so continuous revving is 20 fixed points with a crossfade
-# between neighbours -- standard game-audio practice, and at this spacing the
-# steps are inaudible.
-ENGINE_BUCKETS = 20
-ENGINE_LOOP_S = 1.0
+# playing Sound, so continuous revving is a set of fixed points with a crossfade
+# between neighbours -- standard game-audio practice.
+#
+# Spaced GEOMETRICALLY, because the ear hears pitch ratios. Linear spacing over
+# 750-4200 rpm puts 181 rpm between neighbours everywhere, which is +4.5% at the
+# top of the range and +24% at the bottom -- nearly four semitones, so the whole
+# lower half of the rev range was crossfading between two audibly different
+# notes and beating between them. Geometric spacing is 6.6% per step at every
+# rpm, a bit over a semitone, and 28 of them cost 8 MB and 0.45 s to build
+# (measured; see _smooth_length for why it is not four times that).
+ENGINE_BUCKETS = 28
+ENGINE_LOOP_S = 1.6
+# RMS every bucket is normalised to. NOT peak: an impulse train has a crest
+# factor that falls as the firings crowd together, so peak-normalising every
+# bucket (which is what the road layers do) would make the engine quietly ramp
+# up in loudness with rpm ON TOP of the level curve below, for no reason the
+# curve knows about. Matching RMS is matching loudness, which is what the
+# crossfade needs to be transparent.
+ENGINE_RMS = 0.13
+# Peak above which the soft knee starts. Transparent below it, asymptotic to 1
+# above, so a rare impulse cannot clip without the ordinary ones being squashed.
+ENGINE_KNEE = 0.80
 # Engine level: present at idle, louder under load.
 ENGINE_REST_LEVEL = 0.30
 ENGINE_FULL_LEVEL = 0.85
@@ -182,8 +275,13 @@ def configure_mixer():
         print('[WARN] Could not pre-configure the audio mixer (%s).' % exc)
 
 
-def _to_int16(buf, channels):
+def _to_int16(buf, channels, normalise=True):
     """Normalise to PEAK_SCALE and quantise, as the array shape the mixer wants.
+
+    ``normalise=False`` skips the peak normalisation and scales the buffer as
+    given. The engine buckets need this: they are matched to each other on RMS
+    (see ENGINE_RMS), and peak-normalising them here would throw that match
+    away one bucket at a time.
 
     rint, not a bare astype: astype truncates TOWARDS ZERO, which is a
     signal-correlated error rather than noise. Measured on these spectra it left
@@ -191,9 +289,10 @@ def _to_int16(buf, channels):
     Inaudible either way, but rounding is free and correct, and the low end is
     where the tilts already concentrate the energy.
     """
-    peak = float(np.max(np.abs(buf)))
-    if peak > 0.0:
-        buf = buf / peak
+    if normalise:
+        peak = float(np.max(np.abs(buf)))
+        if peak > 0.0:
+            buf = buf / peak
     if buf.ndim == 1 and channels >= 2:
         buf = np.repeat(buf[:, None], channels, axis=1)
     return np.ascontiguousarray(np.rint(buf * PEAK_SCALE * 32767.0)
@@ -244,46 +343,124 @@ def _texture_envelope(seconds, rate, rng):
     return 1.0 + TEXTURE_DEPTH * env
 
 
+def _smooth_length(n):
+    """Smallest 7-smooth integer >= n, i.e. the next length numpy likes.
+
+    numpy's FFT is fast when the length factorises into small primes and falls
+    back to Bluestein's algorithm when it does not. Measured across this rev
+    ladder that is not a detail: the buckets whose length happened to come out
+    smooth built in 16-26 ms and the rest took ~70 ms, four times the cost, for
+    two thirds of the module's whole start-up.
+
+    Rounding up moves the firing frequency by at most a few tenths of a percent
+    -- a small fraction of the 6.6% between neighbouring buckets, so the
+    crossfade cannot tell and neither can a listener.
+    """
+    while True:
+        m = n
+        for p in (2, 3, 5, 7):
+            while m % p == 0:
+                m //= p
+        if m == 1:
+            return n
+        n += 1
+
+
+def _soft_limit(buf, knee=ENGINE_KNEE):
+    """Round off peaks above ``knee``, asymptotic to 1, transparent below it.
+
+    A plain rescale-to-fit would be wrong here: it would undo the RMS match
+    between buckets that the crossfade depends on, and it would pay for one rare
+    impulse by making every ordinary one quieter -- i.e. it would spend the
+    headroom on exactly the transients this synthesis exists to produce.
+    """
+    out = np.array(buf, dtype=np.float64, copy=True)
+    a = np.abs(out)
+    over = a > knee
+    if np.any(over):
+        head = 1.0 - knee
+        out[over] = np.sign(out[over]) * (
+            knee + head * np.tanh((a[over] - knee) / head))
+    return out
+
+
 def _engine_cycle(rpm, seconds, rate, rng):
-    """Harmonic stack for one engine speed, as a periodic loop.
+    """One engine speed as a periodic loop: firing impulses through a body.
+
+    Excitation (impulse per firing + gated combustion noise) circularly
+    convolved with a fixed resonant impulse response. See the module docstring
+    for why it is built this way and not as a harmonic stack.
+
+    ``seconds`` is a TARGET, not the length: the loop is rounded to a whole
+    number of four-stroke cycles so the per-cylinder pattern -- and therefore
+    the half orders it generates -- survives the loop point instead of being
+    cut mid-cycle.
 
     Mono on purpose: the engine is in front of the driver and belongs in the
     middle of the image, unlike the road layers which surround them.
     """
-    n = int(round(seconds * rate))
-    freqs = np.fft.rfftfreq(n, 1.0 / rate)
-    mag = np.zeros_like(freqs)
-    nyquist = 0.45 * rate
+    f0 = rpm / 60.0 * ENGINE_CYLINDERS / 2.0          # firings per second
+    cycles = max(1, int(round(f0 * seconds / ENGINE_CYLINDERS)))
+    fires = cycles * ENGINE_CYLINDERS
+    n = _smooth_length(int(round(fires * rate / f0)))
+    period = n / float(fires)                          # samples per firing
 
-    f0 = rpm / 60.0 * ENGINE_CYLINDERS / 2.0
-    for k in range(1, ENGINE_HARMONICS + 1):
-        centre = f0 * k
-        if centre >= nyquist:
-            break
-        # Gaussian smear instead of a single bin: a line spectrum is an organ,
-        # combustion is rough. Width grows with frequency, as the jitter is a
-        # roughly constant fraction of the period.
-        width = ENGINE_PARTIAL_WIDTH_HZ + ENGINE_PARTIAL_WIDTH_REL * centre
-        mag += (k ** -ENGINE_HARMONIC_ROLLOFF) * np.exp(
-            -0.5 * ((freqs - centre) / width) ** 2)
+    # One impulse per firing, placed at a FRACTIONAL sample position and split
+    # across the two neighbouring samples. Rounding to the nearest sample
+    # instead would quantise the firing interval to 23 us steps, which at these
+    # periods is an audible mistuning of the higher orders.
+    exc = np.zeros(n)
+    for i in range(fires):
+        pos = (i * period
+               + ENGINE_TIMING_JITTER * period * float(rng.standard_normal()))
+        amp = ENGINE_CYLINDER_TRIM[i % len(ENGINE_CYLINDER_TRIM)] * (
+            1.0 + ENGINE_AMPLITUDE_JITTER * float(rng.standard_normal()))
+        base = int(math.floor(pos))
+        frac = pos - base
+        exc[base % n] += amp * (1.0 - frac)
+        exc[(base + 1) % n] += amp * frac
 
-    # Induction/combustion hiss under the harmonics, so the stack sits in
-    # something rather than floating in silence between its partials.
+    # Combustion noise, loudest just after each firing and decaying between
+    # them: white noise windowed by the impulse train convolved with an
+    # exponential. Circular again, so the tail of the last firing gates the
+    # noise at the top of the loop just as it gates the impulses.
+    decay = np.exp(-np.arange(n) / max(1.0, ENGINE_NOISE_DECAY_S * rate))
+    gate = np.fft.irfft(np.fft.rfft(np.abs(exc)) * np.fft.rfft(decay), n)
+    noise = rng.standard_normal(n) * np.maximum(gate, 0.0)
+    exc_rms = float(np.sqrt(np.mean(exc ** 2)))
+    noise_rms = float(np.sqrt(np.mean(noise ** 2)))
+    if noise_rms > 0.0 and exc_rms > 0.0:
+        noise *= ENGINE_NOISE_LEVEL * exc_rms / noise_rms
+
+    # The body. Same impulse response at every rpm -- that is what makes the
+    # spectral envelope stationary while the orders move through it.
     #
-    # Matched on ENERGY, not on peak magnitude. Scaling by peak looks right and
-    # is badly wrong: the harmonics occupy a few bins each while the noise is
-    # spread over three kilohertz, so peak-matching at 0.30 put roughly NINE
-    # TIMES more energy in the noise than in the stack -- an engine layer that
-    # was mostly hiss, which is the exact "it sounds like wind" failure this
-    # rewrite exists to fix.
-    noise_band = (freqs >= 80.0) & (freqs <= 3500.0)
-    noise_mag = np.zeros_like(freqs)
-    noise_mag[noise_band] = freqs[noise_band] ** -1.0
-    harmonic_energy = float(np.sqrt(np.sum(mag ** 2)))
-    noise_energy = float(np.sqrt(np.sum(noise_mag ** 2)))
-    if noise_energy > 0.0 and harmonic_energy > 0.0:
-        noise_mag *= ENGINE_NOISE_LEVEL * harmonic_energy / noise_energy
-    return _spectrum_to_signal(mag + noise_mag, n, rng)
+    # The 2*pi*f/Q factor turns the tabulated gain into the RESPONSE at
+    # resonance, which is what makes the table mean what it says. A decaying
+    # sinusoid of unit amplitude has |H(f)| = Q/(2*pi*f) at its peak, so writing
+    # the amplitudes directly buries a 1/f tilt in the table: the 2450 Hz entry
+    # at gain 0.10 would land 40 dB below the number written next to it, and the
+    # layer comes out with no top at all -- measured, that was -48 dB in the
+    # 2-4 kHz octave, i.e. an engine with a blanket over it.
+    t = np.arange(n) / float(rate)
+    body = np.zeros(n)
+    for freq, q, gain in ENGINE_RESONANCES:
+        body += gain * (2.0 * np.pi * freq / q) * np.exp(
+            -np.pi * freq * t / q) * np.sin(2.0 * np.pi * freq * t)
+
+    freqs = np.fft.rfftfreq(n, 1.0 / rate)
+    # Zero-phase band limits. Applied to the transfer function rather than to
+    # the excitation so the impulses themselves stay sharp.
+    shape = (freqs ** 2) / (freqs ** 2 + ENGINE_LOW_HZ ** 2)
+    shape /= np.sqrt(1.0 + (freqs / ENGINE_HIGH_HZ) ** 4)
+
+    sig = np.fft.irfft(
+        np.fft.rfft(exc + noise) * np.fft.rfft(body) * shape, n)
+
+    rms = float(np.sqrt(np.mean(sig ** 2)))
+    if rms > 0.0:
+        sig *= ENGINE_RMS / rms
+    return _soft_limit(sig)
 
 
 def mix_levels(speed_kmh, throttle, previous_gear):
@@ -309,9 +486,26 @@ def mix_levels(speed_kmh, throttle, previous_gear):
     return gear, rpm, road, engine
 
 
+def engine_bucket_rpm(index):
+    """Engine speed bucket ``index`` is rendered at. Geometric, see ENGINE_BUCKETS.
+
+    The one definition of the bucket ladder: Ambience builds from it and
+    engine_blend() inverts it, so the two cannot disagree about which rpm a
+    bucket holds.
+    """
+    frac = index / float(max(1, ENGINE_BUCKETS - 1))
+    return IDLE_RPM * (REDLINE_RPM / IDLE_RPM) ** frac
+
+
 def engine_blend(rpm):
-    """(lo bucket, hi bucket, hi weight) for the crossfade at this engine speed."""
-    pos = ((rpm - IDLE_RPM) / max(1.0, REDLINE_RPM - IDLE_RPM)
+    """(lo bucket, hi bucket, hi weight) for the crossfade at this engine speed.
+
+    The inverse of engine_bucket_rpm(), hence the log: a linear position would
+    put the blend in the wrong place at every rpm but the two ends, and audibly
+    so low down where the buckets are furthest apart in Hz.
+    """
+    rpm = min(max(float(rpm), IDLE_RPM), REDLINE_RPM)
+    pos = (math.log(rpm / IDLE_RPM) / math.log(REDLINE_RPM / IDLE_RPM)
            * (ENGINE_BUCKETS - 1))
     lo = int(min(max(pos, 0.0), ENGINE_BUCKETS - 1))
     frac = min(max(pos - lo, 0.0), 1.0)
@@ -412,11 +606,11 @@ class Ambience(object):
                 self._road.append((ch, sound, rest, full, exponent))
 
             for i in range(ENGINE_BUCKETS):
-                frac = i / float(max(1, ENGINE_BUCKETS - 1))
-                rpm = IDLE_RPM + frac * (REDLINE_RPM - IDLE_RPM)
-                cycle = _engine_cycle(rpm, ENGINE_LOOP_S, rate, rng)
+                cycle = _engine_cycle(engine_bucket_rpm(i), ENGINE_LOOP_S,
+                                      rate, rng)
                 self._engine_sounds.append(
-                    pygame.sndarray.make_sound(_to_int16(cycle, channels)))
+                    pygame.sndarray.make_sound(
+                        _to_int16(cycle, channels, normalise=False)))
 
             for slot in (0, 1):
                 ch = pygame.mixer.Channel(len(ROAD_LAYERS) + slot)

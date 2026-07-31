@@ -70,13 +70,14 @@ def render(rate, seed, gain, loop_seconds, block=1024):
         peak = float(np.max(np.abs(buf)))
         road.append(buf / peak if peak > 0 else buf)
 
-    engine = []
-    for i in range(A.ENGINE_BUCKETS):
-        frac = i / float(max(1, A.ENGINE_BUCKETS - 1))
-        rpm = A.IDLE_RPM + frac * (A.REDLINE_RPM - A.IDLE_RPM)
-        cyc = A._engine_cycle(rpm, A.ENGINE_LOOP_S, rate, rng)
-        peak = float(np.max(np.abs(cyc)))
-        engine.append(cyc / peak if peak > 0 else cyc)
+    # No peak normalisation here, unlike the road layers above: the buckets are
+    # matched to each other on RMS by _engine_cycle, and normalising each one to
+    # its own peak would undo that and hand back a level that ramps with rpm on
+    # top of the level curve. The live path passes normalise=False for the same
+    # reason.
+    engine = [A._engine_cycle(A.engine_bucket_rpm(i), A.ENGINE_LOOP_S, rate,
+                              rng)
+              for i in range(A.ENGINE_BUCKETS)]
 
     total = int(PROFILE[-1][0] * rate)
     out = np.zeros((total, 2), dtype=np.float64)
@@ -102,8 +103,13 @@ def render(rate, seed, gain, loop_seconds, block=1024):
             idx = (np.arange(start, start + n) % len(buf))
             out[start:start + n] += level * buf[idx]
 
-        eidx = (np.arange(start, start + n) % len(engine[lo]))
-        cyc = ((1.0 - frac) * engine[lo][eidx] + frac * engine[hi][eidx])
+        # Indexed per bucket, not once: the buckets are whole numbers of
+        # four-stroke cycles and therefore differ in length by up to a firing
+        # period, so one shared index array would read off the end of the
+        # shorter of the pair.
+        pos = np.arange(start, start + n)
+        cyc = ((1.0 - frac) * engine[lo][pos % len(engine[lo])]
+               + frac * engine[hi][pos % len(engine[hi])])
         out[start:start + n] += engine_level * cyc[:, None]
 
     peak = float(np.max(np.abs(out)))
