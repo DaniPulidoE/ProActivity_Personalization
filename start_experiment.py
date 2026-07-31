@@ -498,10 +498,20 @@ def build_drive_cmd(session, args):
         *(["--speed"] if args.speed else []),
         *(["--render-scale", str(args.render_scale)]
           if args.render_scale != 1.0 else []),
-        # Always forwarded, not conditionally: the seed is only meaningful next
-        # to the gain it was used with, and Drive logs both into every label row.
-        "--ambient-gain", str(args.ambient_gain),
-        "--ambient-seed", str(args.ambient_seed),
+        # Forwarded ONLY when the operator typed them, so the default lives in
+        # exactly one place (DEFAULT_AMBIENT_GAIN in src/drive/ambience.py) and
+        # the launcher cannot drift from Drive and hand two participants
+        # different conditions. Drive logs whatever it ends up using into every
+        # label row, so nothing depends on the launcher knowing the number.
+        #
+        # This is also the whole reason the ambience is confined to the CARLA
+        # machine: the audio lives inside the Drive process, and the ProVoice
+        # presets never reach this function -- they route to run_provoice_only(),
+        # which starts no Drive at all.
+        *(["--ambient-gain", str(args.ambient_gain)]
+          if args.ambient_gain is not None else []),
+        *(["--ambient-seed", str(args.ambient_seed)]
+          if args.ambient_seed is not None else []),
         "--popup-wait-timeout", str(args.popup_wait_timeout),
     ]
 
@@ -1275,22 +1285,24 @@ def main():
                              "assistant's autonomy. If you use it, use it for EVERY "
                              "participant and BOTH study arms.")
     parser.add_argument("--ambient-gain", dest="ambient_gain", type=float,
-                        default=0.0,
-                        help="Play synthesised road/cabin noise at this gain, "
-                             "0-1 (default 0 = silent). CARLA has NO audio of "
-                             "its own in any version, so this is the only thing "
-                             "standing between the participant and a silent "
-                             "rig. Level tracks speed, idles at a standstill. "
-                             "Off by default because it is an arousal "
+                        default=None,
+                        help="Gain of the synthesised engine/road cabin sound, "
+                             "0-1. ON by default (0.35, defined once in "
+                             "src/drive/ambience.py); pass 0 for a silent rig, "
+                             "which is what CARLA gives on its own -- it has no "
+                             "audio in any version. Applies only to runs that "
+                             "start Drive, i.e. the CARLA machine; the "
+                             "--experiment-*-provoice-remote presets start no "
+                             "Drive and are unaffected. It is an arousal "
                              "manipulation whether or not it is meant as one, "
-                             "and hr_delta / rr_delta are model inputs: use it "
-                             "for EVERY participant and BOTH arms or not at "
-                             "all. Not a level -- set the amplifier once, "
-                             "measure dB(A) at the driver's head, report that. "
-                             "Logged per label row as ambient_gain.")
+                             "and hr_delta / rr_delta are model inputs, so keep "
+                             "it identical for EVERY participant and BOTH arms. "
+                             "Not a level -- set the amplifier once, measure "
+                             "dB(A) at the driver's head, report that. Logged "
+                             "per label row as ambient_gain.")
     parser.add_argument("--ambient-seed", dest="ambient_seed", type=int,
-                        default=0,
-                        help="Seed for the ambience noise loop (default 0). "
+                        default=None,
+                        help="Seed for the ambience noise layers (default 0). "
                              "Gain plus seed reproduce exactly what a "
                              "participant heard; both are logged per label row. "
                              "No reason to vary it across participants.")

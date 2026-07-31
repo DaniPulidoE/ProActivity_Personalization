@@ -152,12 +152,12 @@ except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
 try:
-    from .ambience import Ambience, configure_mixer
+    from .ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
 except ImportError:
     # Launched as a plain script path rather than -m src.drive.drive_improved,
     # so there is no package context for a relative import.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from ambience import Ambience, configure_mixer
+    from ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
 
 OBJECT_TO_COLOR = [
     (255, 255, 255),
@@ -3214,8 +3214,14 @@ def game_loop(args):
             world.tick(clock)
             # After world.tick, which is what refreshes hud.speed_kmh (it does so
             # regardless of --speed: the readout is drawn from it, not the other
-            # way round).
-            ambience.update(world.hud.speed_kmh)
+            # way round). Throttle comes off the controller's OWN control object
+            # -- a local field it just wrote, not an RPC to the server, so the
+            # engine note follows the pedal for free on a loop this project
+            # already tunes for frame rate.
+            ambience.update(world.hud.speed_kmh,
+                            throttle=getattr(
+                                getattr(controller, '_control', None),
+                                'throttle', 0.0))
             world.render(display)
             pygame.display.flip()
 
@@ -3391,15 +3397,16 @@ def main():
              'against -- so if it is used at all it should be used for EVERY '
              'participant and both study arms.')
     argparser.add_argument(
-        '--ambient-gain', dest='ambient_gain', type=float, default=0.0,
-        help='Play synthesised road/cabin noise at this gain, 0-1 (default: '
-             '%(default)s = silent, which is what CARLA gives you on its own -- '
-             'it has no audio at all). The level tracks vehicle speed and idles '
-             'at a standstill. Off by default because sound is an arousal '
-             'manipulation whether or not it is meant as one, and hr_delta / '
-             'rr_delta are model inputs: if it is used at all it must be used '
-             'for EVERY participant and BOTH study arms, at the same gain and '
-             'the same physical volume. This number is not a level -- set the '
+        '--ambient-gain', dest='ambient_gain', type=float,
+        default=DEFAULT_AMBIENT_GAIN,
+        help='Gain of the synthesised road/cabin noise, 0-1 (default: '
+             '%(default)s). ON by default: CARLA has no audio of its own in any '
+             'version, so without this the rig is silent. The level tracks '
+             'vehicle speed and idles at a standstill. Pass 0 for silence. '
+             'Sound is an arousal manipulation whether or not it is meant as '
+             'one, and hr_delta / rr_delta are model inputs, so this must be '
+             'IDENTICAL for every participant and both study arms -- gain and '
+             'physical volume alike. The number is not a level: set the '
              'amplifier once, measure dB(A) at the driver\'s head, and report '
              'that. Logged per label row as ambient_gain.')
     argparser.add_argument(
