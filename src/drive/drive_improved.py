@@ -1447,7 +1447,7 @@ FIXED_SPAWN_POINT_INDEX = 152
 # speed_ratio_* and indirectly the physiological features -- varying it would
 # confound the personalization comparison exactly as a varying --decision-hz
 # would.
-BRAKE_ASSIST_TARGET_DECEL = 9.0    # m/s^2 at full brake on dry asphalt (~0.9 g)
+BRAKE_ASSIST_TARGET_DECEL = 8.5    # m/s^2 at full brake on dry asphalt (~0.9 g)
 BRAKE_ASSIST_WET_CEILING = 0.65    # ceiling multiplier at 100% precipitation
 BRAKE_ASSIST_MIN_SPEED = 1.0       # m/s; below this the stock brakes hold the car
 BRAKE_ASSIST_WEATHER_PERIOD = 40   # ticks between weather refreshes (one RPC each)
@@ -1547,28 +1547,11 @@ class World(object):
         if not blueprint_list:
             raise ValueError("Couldn't find any blueprints with the specified filters")
         # blueprint = random.choice(blueprint_list)
-        # for vehicle_model in blueprint_list:
-        #     print(vehicle_model)
-        # Use a fixed vehicle blueprint -- the Lincoln MKZ.
-        #
-        # Chosen for its brakes. Braking strength is baked into each blueprint's
-        # wheel asset and cannot be changed at runtime: on CARLA 0.10 the
-        # per-wheel fields of VehiclePhysicsControl are effectively read-only
-        # (apply_physics_control accepts the write, ticks, and leaves the wheels
-        # array unchanged -- verified with scripts/check_braking.py probe). So
-        # the blueprint IS the setting. Measured stock peak deceleration across
-        # the whole fleet (scripts/check_braking.py blueprints):
-        #     vehicle.dodge.charger   5.7 m/s^2  (0.58 g)  -- previous car
-        #     vehicle.lincoln.mkz*    6.6 m/s^2  (0.68 g)  -- best sedan
-        # Same vehicle class, so sight lines and body size are unchanged. Still
-        # short of the 8-10 m/s^2 a real car does; that gap is not closable by
-        # blueprint choice.
-        #
-        # Matched by prefix because the id carries a year suffix that differs
-        # between CARLA releases (mkz_2017 / mkz_2020).
-        mkz = self.world.get_blueprint_library().filter('vehicle.lincoln.mkz*')
+        # vehicle selection
+        #mkz = self.world.get_blueprint_library().filter('vehicle.lincoln.mkz*')
+        mkz = self.world.get_blueprint_library().filter('vehicle.dodge.charger')
         if not mkz:
-            raise ValueError("Couldn't find a 'vehicle.lincoln.mkz*' blueprint")
+            raise ValueError("Couldn't find a 'vehicle.dodge.charger*' blueprint")
         blueprint = mkz[0]
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('terramechanics'):
