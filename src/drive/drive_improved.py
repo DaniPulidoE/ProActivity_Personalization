@@ -1676,6 +1676,17 @@ class World(object):
     def _apply_precipitation(self, pct):
         """Push a precipitation level to CARLA, skipping negligible changes.
 
+        Precipitation alone renders rain particles under whatever sky the map
+        started with, which -- if that base weather is a clear/sunny preset --
+        makes the ramp barely visible. CARLA's own presets never move
+        precipitation on its own: cloudiness and wind_intensity track it
+        ~1:1 (MidRainyNoon: cloudiness=wind_intensity=precipitation=60;
+        HardRainNoon: 100/100/100) and fog_density rises with it too
+        (ClearNoon 2.0 -> HardRainNoon 7.0), while `wetness` stays 0.0 in
+        every single built-in preset including the rain ones -- so it is
+        dropped here rather than set to `pct` as before, which was doing
+        nothing CARLA's own presets don't also leave at zero.
+
         One RPC (get + set) per call that actually moves the needle. A 0-80%
         ramp over CONDITION_RAMP_MINUTES only crosses CONDITION_PRECIP_STEP
         every few seconds, so this naturally throttles itself to about the
@@ -1689,7 +1700,9 @@ class World(object):
         weather = self.world.get_weather()
         weather.precipitation = pct
         weather.precipitation_deposits = pct
-        weather.wetness = pct
+        weather.cloudiness = pct
+        weather.wind_intensity = pct
+        weather.fog_density = 2.0 + (pct / 100.0) * 5.0
         self.world.set_weather(weather)
         self._precip_last_pct = pct
 
