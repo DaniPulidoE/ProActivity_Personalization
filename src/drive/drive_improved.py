@@ -1172,6 +1172,14 @@ class LoASelectionPopup(object):
             display.blit(surface, rect)
             y += 45
 
+        # separate header from LoA's
+        text ="- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
+        surface = self._small_font.render(text, True, colour)
+        rect = surface.get_rect(center=(self.width // 2, y))
+        display.blit(surface, rect)
+        y+=45
+
         # Markers as well as colour, so the state survives a projector or a
         # colour-blind participant: [x] is ticked, '>' is the cursor.
         for idx, label in enumerate(LOA_LABELS):
@@ -1198,14 +1206,19 @@ class LoASelectionPopup(object):
         # instruction aimed at the experimenter on a screen the participant is
         # reading — it gets the invalid-frame tick box instead.
         if self.input_mode != POPUP_INPUT_WHEEL:
-            # Same tick box as the levels, because it is answered the same way:
-            # N ticks it, ENTER commits it. Amber rather than the levels' green
-            # so a ticked discard never looks like a recorded answer at a
-            # glance, and grey while untouched so it does not invite a press.
-            text ="- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - \n%s Invalid window" % ('[x]' if self.invalid_frame else '[ ]')
+            # separator
+            text ="- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
             colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
             surface = self._small_font.render(text, True, colour)
-            rect = surface.get_rect(center=(self.width // 2, y + 12))
+            rect = surface.get_rect(center=(self.width // 2, y))
+            display.blit(surface, rect)
+            y+=45
+            
+            # no input with a [x] option for selection
+            text ="%s Invalid window" % ('[x]' if self.invalid_frame else '[ ]')
+            colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
+            surface = self._small_font.render(text, True, colour)
+            rect = surface.get_rect(center=(self.width // 2, y))
             display.blit(surface, rect)
             return
 
