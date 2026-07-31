@@ -630,11 +630,11 @@ WHEEL_BUTTON_QUIT = 7
 
 # Index == the LoA value that gets logged.
 LOA_LABELS = (
-    '0: None (No assistive action is taken)',
-    '1: Suggest (Give Suggestion)',
-    '2: Ask Approval (Ask for user confirmation)',
-    '3: Auto with Veto (Execute automatically but user can veto)',
-    '4: Auto (Fully automatic)',
+    '1: No assistive action is taken',
+    '2: Give Suggestion',
+    '3: Ask for user confirmation',
+    '4: Execute automatically but user can veto',
+    '5: Fully automatic',
 )
 
 # Cursor position of the trailing "confirm" row. The driver may mark SEVERAL
@@ -1004,7 +1004,7 @@ class LoASelectionPopup(object):
             self.chosen.discard(loa)
         else:
             self.chosen.add(loa)
-            # A level and "invalid frame" are contradictory answers about the
+            # A level and "invalid window" are contradictory answers about the
             # same 20 s, so the later press wins rather than leaving both ticked
             # and ENTER having to guess which one was meant.
             self.invalid_frame = False
@@ -1046,15 +1046,15 @@ class LoASelectionPopup(object):
         if event.type == pygame.KEYDOWN:
             if event.key == K_ESCAPE:
                 return 'quit', None
-            if event.unicode in ('0', '1', '2', '3', '4'):
+            if event.unicode in ('1', '2', '3', '4', '5'):
                 # Number keys toggle rather than submit — otherwise a second LoA
                 # could never be added, and pressing the same number again is
                 # how a level is taken back off the list.
-                self._toggle(int(event.unicode))
+                self._toggle(int(event.unicode)-1)
                 return None, None
             if event.key in (K_RETURN, K_KP_ENTER):
                 # One key commits whatever is ticked: the levels as a label, or
-                # the invalid-frame row as a discard. Nothing ticked is a no-op,
+                # the invalid-window row as a discard. Nothing ticked is a no-op,
                 # because submitting nothing would write an empty label.
                 if self.invalid_frame:
                     return 'skip', None
@@ -1150,13 +1150,13 @@ class LoASelectionPopup(object):
                             'for the last 20 seconds.')
 
         header = [
-            (self._title_font, 'Level of Proactivity Selection Required', (255, 255, 255)),
+            (self._title_font, 'Level of Proactivity Selection', (255, 255, 255)),
         ]
         if self.function_name:
             # Blue, not the yellow/green used for the cursor and the ticks: this
             # line is context, never something that can be selected.
             header.append(
-                (self._text_font, 'FUNCTION: %s' % self.function_name, (140, 200, 255)))
+                (self._text_font, 'Function: %s' % self.function_name.upper(), (140, 200, 255)))
         header.append((self._text_font, instruction, (255, 255, 255)))
         if hint:
             header.append((self._text_font, hint, (255, 255, 255)))
@@ -1202,7 +1202,7 @@ class LoASelectionPopup(object):
             # N ticks it, ENTER commits it. Amber rather than the levels' green
             # so a ticked discard never looks like a recorded answer at a
             # glance, and grey while untouched so it does not invite a press.
-            text = '%s Invalid frame' % ('[x]' if self.invalid_frame else '[ ]')
+            text = '%s Invalid window' % ('[x]' if self.invalid_frame else '[ ]')
             colour = (255, 170, 90) if self.invalid_frame else (140, 140, 140)
             surface = self._small_font.render(text, True, colour)
             rect = surface.get_rect(center=(self.width // 2, y + 12))

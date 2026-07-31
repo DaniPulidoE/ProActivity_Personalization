@@ -1383,8 +1383,8 @@ def main():
     popup_input.add_argument("--keyboard-input", dest="popup_input", action="store_const",
                              const="keyboard",
                              help="Answer the LoA popups from the keyboard: number keys "
-                                  "0-4 tick a level, the same number again unticks it, "
-                                  "N ticks INVALID FRAME instead, and ENTER commits "
+                                  "1-5 tick a level, the same number again unticks it, "
+                                  "N ticks INVALID WINDOW instead, and ENTER commits "
                                   "whatever is ticked. The popup ignores the wheel, "
                                   "which still steers. THE DEFAULT - the flag only "
                                   "states it explicitly.")
