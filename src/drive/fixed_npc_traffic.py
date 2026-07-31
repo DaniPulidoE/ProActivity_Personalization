@@ -185,6 +185,20 @@ def main():
                              "[SYNC] report now measures and prints; only raise "
                              "--delta if it shows real headroom. Must stay <= "
                              "max_substep_delta_time * max_substeps.")
+    parser.add_argument("--allow-long-vehicles", action="store_true",
+                        help="Keep the vans and trucks (sprinter, ambulance, "
+                             "firetruck, fuso, carlacola) instead of substituting "
+                             "cars for them. OFF by default because they "
+                             "off-track: the traffic manager steers a reference "
+                             "point down the lane centreline without modelling "
+                             "the body behind it, so on tight corners their tails "
+                             "sweep through the parked cars at the kerb, block the "
+                             "road and collect the rest of the fleet behind them. "
+                             "Parked cars are scenery rather than actors, so the "
+                             "traffic manager cannot see them and no setting "
+                             "prevents this. Substitution keeps the fleet at the "
+                             "same size and spawn points, so traffic density is "
+                             "unchanged.")
     parser.add_argument("--num-vehicles", type=int, default=0,
                         help="Spawn only the first N of the configured NPCs (0 = "
                              "all of them). THE DIAGNOSTIC FOR SLOW MOTION, and "
@@ -308,6 +322,47 @@ def main():
         "vehicle.carlacola.actors",
         "vehicle.nissan.patrol",
     }
+
+    # LONG is a different property from HEAVY, and this is the one that made the
+    # vans and trucks pile into parked cars at one particular corner.
+    #
+    # The traffic manager steers a vehicle's reference point down the lane
+    # centreline. It does not model the body being dragged behind that point, so
+    # a long vehicle OFF-TRACKS: on a tight corner the rear sweeps a tighter arc
+    # than the front and ends up outside the lane while the front is still
+    # tracking perfectly. Where the map has cars parked against the kerb, the
+    # tail goes through them.
+    #
+    # Nothing in the traffic manager can prevent this. Parked cars in the CARLA
+    # towns are scenery, not registered actors, so its collision avoidance is
+    # blind to them by construction -- and even if it could see them, it has no
+    # notion of its own swept path. It is also NOT a --sync problem: an exact
+    # world snapshot does not make the planner length-aware, which is why it
+    # persisted after the lane-change fix and happens with no lane change at all.
+    #
+    # So the only real remedy is not to run vehicles the map cannot accommodate.
+    # nissan.patrol stays: it is tall and heavy (hence HEAVY above, for the speed
+    # penalty) but it is car-length, so it does not off-track.
+    LONG_BLUEPRINTS = {
+        "vehicle.sprinter.mercedes",
+        "vehicle.ambulance.ford",
+        "vehicle.firetruck.actors",
+        "vehicle.fuso.mitsubishi",
+        "vehicle.carlacola.actors",
+    }
+
+    # Long vehicles are SUBSTITUTED rather than dropped, so the fleet stays at
+    # eleven cars on the same eleven spawn points. Traffic density is part of the
+    # scene the participant drives in and part of what they are judging the
+    # assistant against, so it must not quietly change as a side effect of a
+    # stability fix.
+    SUBSTITUTE_CARS = [
+        "vehicle.lincoln.mkz",
+        "vehicle.dodge.charger",
+        "vehicle.mini.cooper",
+        "vehicle.taxi.ford",
+        "vehicle.dodgecop.charger",
+    ]
 
     # =========================
     # CONNECT
@@ -464,11 +519,30 @@ def main():
     # which exists only so the cleanup handler can destroy everything.
     spawned = []
 
-    wanted = VEHICLE_CONFIGS
-    if args.num_vehicles and args.num_vehicles < len(VEHICLE_CONFIGS):
-        wanted = VEHICLE_CONFIGS[:args.num_vehicles]
-        print("Spawning only %d of %d configured NPCs (--num-vehicles)."
-              % (len(wanted), len(VEHICLE_CONFIGS)))
+    wanted = list(VEHICLE_CONFIGS)
+
+    if not args.allow_long_vehicles:
+        swapped = []
+        for i, (spawn_index, blueprint_id) in enumerate(wanted):
+            if blueprint_id in LONG_BLUEPRINTS:
+                replacement = SUBSTITUTE_CARS[len(swapped) % len(SUBSTITUTE_CARS)]
+                wanted[i] = (spawn_index, replacement)
+                swapped.append((blueprint_id, replacement))
+        if swapped:
+            print("Substituting %d long vehicle(s) that off-track into parked "
+                  "cars (--allow-long-vehicles to keep them):" % len(swapped))
+            for old, new in swapped:
+                print(f"  {old} -> {new}")
+
+    if args.num_vehicles and args.num_vehicles < len(wanted):
+        # Evenly spaced, NOT the first N. The list is ordered with the biggest
+        # vehicles first, so a prefix would hand back a fleet of nothing but
+        # trucks -- the opposite of a representative sample, and useless for the
+        # physics-load comparison --num-vehicles exists to support.
+        step = len(wanted) / float(args.num_vehicles)
+        wanted = [wanted[int(i * step)] for i in range(args.num_vehicles)]
+        print("Spawning only %d of %d configured NPCs, evenly spaced "
+              "(--num-vehicles)." % (len(wanted), len(VEHICLE_CONFIGS)))
 
     print("Spawning fixed NPC vehicles...")
 
@@ -528,23 +602,34 @@ def main():
 
             vehicle.set_autopilot(True, TM_PORT)
 
-            # Lane changes: OFF under the free-running clock, ON under --sync.
+            # Lane changes: allowed for CARS under --sync, never for the long
+            # heavy vehicles, never under the free-running clock.
             #
-            # Two separate things made traffic-manager lane changes collide here.
-            # One was the time step: it committed to a gap measured from a world
-            # snapshot up to a full frame stale, and at the frame times this rig
-            # hits in async the gap had already moved. --sync removes that
-            # entirely -- the snapshot is exact and the reaction deterministic.
-            # The other is that its gap check is imperfect in any mode.
+            # Three findings, each from a live drive, and the split is what
+            # satisfies all of them:
             #
-            # Under --sync the first cause is gone and the remaining risk is
-            # worth taking, because switching them off had a consequence that
-            # only shows up in a live drive: with no overtaking, one slow heavy
-            # vehicle turns into a permanent rolling roadblock and the entire
-            # fleet queues behind it. That reads as far more unnatural to a
-            # participant than an occasional imperfect merge, and a queue of
-            # stationary traffic is its own confound.
-            tm.auto_lane_change(vehicle, SYNC_MODE)
+            #  1. Async collided because the traffic manager committed to a gap
+            #     measured from a world snapshot up to a full frame stale. --sync
+            #     removes that cause: the snapshot is exact.
+            #  2. Switching them off entirely made the traffic crawl. With no
+            #     overtaking, one slow heavy vehicle becomes a permanent rolling
+            #     roadblock and the whole fleet queues behind it.
+            #  3. Switching them on for EVERYTHING then had the van/truck sized
+            #     vehicles sideswiping cars in the next lane and blocking the
+            #     road, with the rest of the fleet piling into the wreck.
+            #
+            # (3) is the decisive one and it is not a staleness problem, so --sync
+            # does not help: the traffic manager plans a lane change from a
+            # waypoint path without properly accounting for the length of what it
+            # is steering, so a long vehicle's tail is still in the old lane when
+            # its nose commits to the new one. Short vehicles have the slack to
+            # get away with it; a Sprinter or a Fuso does not.
+            #
+            # Cars keep the ability to overtake, which is what fixes (2) -- and
+            # since the heavy vehicles are also the slow ones, they are exactly
+            # what the cars now flow around instead of queueing behind.
+            tm.auto_lane_change(vehicle,
+                                SYNC_MODE and blueprint_id not in HEAVY_BLUEPRINTS)
 
             # 8 m, independent of the time step: 5 m is under a 0.4 s headway at
             # urban speeds, where real following distances are 1-2 s, so any

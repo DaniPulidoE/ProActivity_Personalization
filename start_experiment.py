@@ -1242,6 +1242,21 @@ def main():
                         help="Always spawn the ego at the same map spawn point instead "
                              "of a random one. For calibration runs, which have to start "
                              "from an identical position.")
+    parser.add_argument("--allow-long-vehicles", dest="allow_long_vehicles",
+                        action="store_true",
+                        help="Put the vans and trucks back into the NPC fleet "
+                             "(sprinter, ambulance, firetruck, fuso, carlacola). "
+                             "They are replaced by cars by default because they "
+                             "OFF-TRACK: the traffic manager steers a reference "
+                             "point along the lane centreline and does not model "
+                             "the body behind it, so on tight corners their tails "
+                             "sweep through the parked cars at the kerb, block the "
+                             "road, and the rest of the fleet piles into them. "
+                             "Parked cars are scenery, not actors, so the traffic "
+                             "manager cannot see them and no setting avoids this. "
+                             "The substitution keeps the same number of vehicles "
+                             "at the same spawn points, so traffic density -- part "
+                             "of the driving task -- is unchanged.")
     parser.add_argument("--num-vehicles", dest="num_vehicles", type=int, default=0,
                         help="Spawn only the first N NPC vehicles (0 = all 11). A "
                              "DIAGNOSTIC for --sync slow motion: this rig spends "
@@ -1704,6 +1719,7 @@ def main():
                  "--tm-port", str(TM_PORT),
                  *(["--num-vehicles", str(args.num_vehicles)]
                    if args.num_vehicles else []),
+                 *(["--allow-long-vehicles"] if args.allow_long_vehicles else []),
                  # This child owns the simulation clock under --sync. It is
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.
