@@ -304,6 +304,17 @@ def _build_parser() -> ap.ArgumentParser:
                         "is loaded or run, and the live calibration is skipped (this "
                         "participant's stored baseline is reused, or neutral defaults "
                         "if there is none). Mutually exclusive with --calibration-only.")
+    p.add_argument("--data-collection-timeout", dest="data_collection_timeout",
+                   type=float, default=None,
+                   help="Hard wall-clock limit, in seconds, on a --data-collection run. "
+                        "Once it elapses this process stops itself exactly as "
+                        "--calibration-only does when its baseline finishes: the "
+                        "collector is stopped and 'provoice_ended' is posted to "
+                        "status_url (see _calibration_finished / the shutdown finally "
+                        "block), which is what makes Drive show its end-of-session "
+                        "screen on a --remote run. Ignored without --data-collection. "
+                        "Set by start_experiment.py's --experiment-data-collection-"
+                        "provoice-remote preset (900 = 15 min); unset otherwise.")
     return p
 
 
@@ -989,6 +1000,28 @@ def main():
             server.should_exit = True
         data_collector.on_calibration_complete = _calibration_finished
 
+    # Hard wall-clock cap on a --data-collection run (start_experiment.py's
+    # --experiment-data-collection-provoice-remote preset sets 900s = 15 min).
+    # Started once collection actually begins, right after data_collector.start()
+    # below, and stops this process THE SAME WAY --calibration-only stops itself
+    # above: data_collector.stop() + server.should_exit = True, which the
+    # shutdown `finally` turns into the identical 'provoice_ended' post — so a
+    # --remote Drive shows its end-of-session screen exactly as it does at the
+    # end of calibration, with no separate signal path to keep in sync.
+    data_collection_timer = None
+    if args.data_collection and args.data_collection_timeout:
+        def _data_collection_timeout():
+            print(f"[main] --data-collection-timeout "
+                  f"({args.data_collection_timeout:.0f}s) elapsed — stopping "
+                  f"(--data-collection).")
+            data_collector.stop()
+            server.should_exit = True
+        data_collection_timer = threading.Timer(args.data_collection_timeout,
+                                                _data_collection_timeout)
+        data_collection_timer.daemon = True
+        print(f"[main] --data-collection-timeout: this run stops itself "
+              f"{args.data_collection_timeout:.0f}s after collection starts.")
+
     # --- Reverse channel to the CARLA machine --------------------------------
     # Locally, Drive watches raw_data.jsonl for this session's first line and
     # starts its LoA windows on it. Split across two machines that file is on
@@ -1016,6 +1049,8 @@ def main():
               "by hand.")
 
     data_collector.start()
+    if data_collection_timer is not None:
+        data_collection_timer.start()
 
     def handle_exit(_, __):
         print("[main] shutdown signal received — stopping cleanly.")
@@ -1042,6 +1077,11 @@ def main():
     try:
         server.run()
     finally:
+        if data_collection_timer is not None:
+            # Idempotent whether the timer already fired (it is what got us
+            # here) or not (some other exit path won the race) — cancel() on an
+            # already-fired Timer is a harmless no-op.
+            data_collection_timer.cancel()
         data_collector.stop()
         # Sent from the finally, so it covers EVERY way this process ends that
         # leaves Python running: a clean exit, Ctrl-C, the launcher's

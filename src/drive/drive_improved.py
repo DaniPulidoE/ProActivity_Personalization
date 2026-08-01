@@ -864,6 +864,14 @@ class ProVoiceEndWatcher(object):
 # participant can run through several attempts in under a minute.
 TEST_POPUP_INTERVAL_S = 8
 
+# Extra hold applied ON TOP of the first LoA window's 20 s wait, remote runs
+# only, once the remote ProVoice's collection_started signal is actually
+# received (not on the --popup-wait-timeout fallback). The rPPG pipeline's
+# first heart-rate reading isn't available until ~6 s into recording; the
+# other 4 s is slack for missed/dropped frames. Without this hold the first
+# window's early frames would have no hr_delta/rr_delta yet.
+PROVOICE_READY_POPUP_DELAY_S = 10
+
 
 class LoASelectionPopup(object):
     def __init__(self, width, height, interval_seconds=20, enabled=True,
@@ -3191,6 +3199,13 @@ def game_loop(args):
         started = False
         wait_for_provoice = _should_wait_for_provoice(args)
         popups_armed = False
+        # Set once the remote collection_started signal is seen; the extra
+        # PROVOICE_READY_POPUP_DELAY_S hold runs from provoice_ready_ms, after
+        # which loa_popup.start() actually fires. Local runs and the
+        # --popup-wait-timeout fallback never set this — they arm immediately,
+        # as before.
+        provoice_ready_pending = False
+        provoice_ready_ms = 0
         session_id = _current_session_id(getattr(args, 'session_id', ''))
         # Same id the labels are written under, which is exactly what has to be
         # matched in ProVoice's log — a second _current_session_id() call would
@@ -3202,6 +3217,12 @@ def game_loop(args):
                                                 status_path=status_path)
         end_watcher = ProVoiceEndWatcher(session_id, status_path)
         end_overlay = None
+        # Set the moment 'provoice_ended' is read while a LoA prompt is on
+        # screen: the window it belongs to still gets to finish (both prompts
+        # answered or skipped) before the exit screen appears, so ending the
+        # session never discards a label the driver was already answering.
+        provoice_end_pending = False
+        pending_end_reason = ''
         skipped_prompts = 0
         label_context = {
             'session_id': session_id,
@@ -3238,8 +3259,8 @@ def game_loop(args):
             print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
         if status_path:
             print("[INFO] Remote ProVoice signals read from %s: the LoA windows "
-                  "start on collection_started, and the drive ends on "
-                  "provoice_ended." % status_path)
+                  "start %.0f s after collection_started, and the drive ends on "
+                  "provoice_ended." % (status_path, PROVOICE_READY_POPUP_DELAY_S))
         if not args.no_popup:
             print("[INFO] LoA popup input: %s" % (
                 'steering wheel (paddles move, front button ticks, CONFIRM submits)'
@@ -3320,18 +3341,33 @@ def game_loop(args):
             # opens, no label is taken and no input is applied for a stretch of
             # driving that nothing is recording. Once entered, this state is
             # terminal -- the only way out is quitting.
-            if end_overlay is None and end_watcher.poll(now_ms):
-                reason = end_watcher.reason()
-                print("[INFO] Remote ProVoice reported it has ended%s — stopping "
-                      "the vehicle and closing the session."
-                      % (" (%s)" % reason if reason else ""))
-                end_overlay = SessionEndedOverlay(args.width, args.height, reason)
-                if loa_popup.active:
-                    # A prompt open at this moment is about a window ProVoice
-                    # already stopped recording; closing it unanswered is
-                    # correct, and _set_world_frozen below keeps the car still
-                    # either way.
-                    loa_popup.close(now_ms)
+            if end_overlay is None and not provoice_end_pending and end_watcher.poll(now_ms):
+                provoice_end_pending = True
+                pending_end_reason = end_watcher.reason()
+                if not loa_popup.active:
+                    print("[INFO] Remote ProVoice reported it has ended%s — "
+                          "stopping the vehicle and closing the session."
+                          % (" (%s)" % pending_end_reason if pending_end_reason else ""))
+                    end_overlay = SessionEndedOverlay(args.width, args.height,
+                                                      pending_end_reason)
+                    _set_world_frozen(world, True)
+                else:
+                    # A prompt is on screen for the window: let the driver
+                    # finish answering (or skipping) BOTH of its prompts
+                    # normally, exactly as if ProVoice had not signalled yet.
+                    # The scene is already frozen for the popup, so nothing
+                    # drives on in the meantime; the exit screen appears the
+                    # instant the popup itself closes, below.
+                    print("[INFO] Remote ProVoice reported it has ended%s — a "
+                          "LoA prompt is on screen; finishing it before closing "
+                          "the session."
+                          % (" (%s)" % pending_end_reason if pending_end_reason else ""))
+            elif end_overlay is None and provoice_end_pending and not loa_popup.active:
+                print("[INFO] Remote ProVoice ended while a LoA prompt was open; "
+                      "the prompt is answered — closing the session now%s."
+                      % (" (%s)" % pending_end_reason if pending_end_reason else ""))
+                end_overlay = SessionEndedOverlay(args.width, args.height,
+                                                  pending_end_reason)
                 _set_world_frozen(world, True)
 
             if end_overlay is not None:
@@ -3383,29 +3419,54 @@ def game_loop(args):
                 continue
 
             if not popups_armed:
-                # Driving is already live — only the label windows wait, so the
-                # hold doubles as the driver's adaptation time.
-                state = provoice_watcher.poll(now_ms)
-                if state in ('ready', 'timeout'):
-                    loa_popup.start()
-                    popups_armed = True
-                    waited = provoice_watcher.waited_s(now_ms)
-                    if state == 'ready':
-                        print("[INFO] ProVoice is logging after %.1f s; first window "
-                              "starts now and its popup opens in %.0f s, so the whole "
-                              "window has driver-state data."
-                              % (waited, loa_popup.interval_ms / 1000.0))
+                if provoice_ready_pending:
+                    # Extra hold past the collection_started signal itself —
+                    # see PROVOICE_READY_POPUP_DELAY_S.
+                    if now_ms >= provoice_ready_ms + PROVOICE_READY_POPUP_DELAY_S * 1000.0:
+                        loa_popup.start()
+                        popups_armed = True
+                        provoice_ready_pending = False
+                        print("[INFO] %.0f s past ProVoice's collection_started signal; "
+                              "first window starts now and its popup opens in %.0f s, "
+                              "so the whole window has driver-state data."
+                              % (PROVOICE_READY_POPUP_DELAY_S, loa_popup.interval_ms / 1000.0))
                         world.hud.notification('Recording started', seconds=4.0)
-                    else:
-                        print("[WARN] No ProVoice frame for this session after %.0f s "
-                              "— starting the LoA windows anyway. Early windows may "
-                              "have no driver-state data, and scripts/"
-                              "build_loa_dataset.py will drop those labels."
-                              % waited)
-                        world.hud.notification(
-                            'ProVoice not logging - labels may be unusable', seconds=8.0)
+                else:
+                    # Driving is already live — only the label windows wait, so the
+                    # hold doubles as the driver's adaptation time.
+                    state = provoice_watcher.poll(now_ms)
+                    if state == 'ready' and status_path:
+                        # Remote run and the signal itself (not the timeout
+                        # fallback): hold PROVOICE_READY_POPUP_DELAY_S more
+                        # before arming, on top of the usual 20 s window wait.
+                        provoice_ready_pending = True
+                        provoice_ready_ms = now_ms
+                        waited = provoice_watcher.waited_s(now_ms)
+                        print("[INFO] ProVoice is logging after %.1f s; holding %.0f s "
+                              "more before the first window starts."
+                              % (waited, PROVOICE_READY_POPUP_DELAY_S))
+                        world.hud.notification('Recording started - stabilizing...',
+                                               seconds=4.0)
+                    elif state in ('ready', 'timeout'):
+                        loa_popup.start()
+                        popups_armed = True
+                        waited = provoice_watcher.waited_s(now_ms)
+                        if state == 'ready':
+                            print("[INFO] ProVoice is logging after %.1f s; first window "
+                                  "starts now and its popup opens in %.0f s, so the whole "
+                                  "window has driver-state data."
+                                  % (waited, loa_popup.interval_ms / 1000.0))
+                            world.hud.notification('Recording started', seconds=4.0)
+                        else:
+                            print("[WARN] No ProVoice frame for this session after %.0f s "
+                                  "— starting the LoA windows anyway. Early windows may "
+                                  "have no driver-state data, and scripts/"
+                                  "build_loa_dataset.py will drop those labels."
+                                  % waited)
+                            world.hud.notification(
+                                'ProVoice not logging - labels may be unusable', seconds=8.0)
 
-            if loa_popup.should_open(now_ms):
+            if not provoice_end_pending and loa_popup.should_open(now_ms):
                 loa_popup.open(now_ms)
                 # Freeze the whole scene (ego + NPC traffic) so nothing moves
                 # while the driver deliberates over the LoA for the last 20 s.
@@ -3430,7 +3491,16 @@ def game_loop(args):
                                  loa_popup.function_name, skipped_prompts))
                         world.hud.notification('No input recorded for that question',
                                                seconds=3.0)
-                        _advance_or_close(loa_popup, world, now_ms)
+                        if loa_popup.prompt_in_window == 1 and loa_popup.prompts_per_window > 1:
+                            # NO INPUT on the FIRST prompt means the driver could
+                            # not honestly answer for this 20 s at all, which makes
+                            # the whole window invalid -- the second prompt would
+                            # just be asking about the same unusable stretch, so
+                            # skip it too instead of opening it.
+                            loa_popup.close(now_ms)
+                            _set_world_frozen(world, False)
+                        else:
+                            _advance_or_close(loa_popup, world, now_ms)
                         break
                     if action == 'select':
                         if args.test_popup:

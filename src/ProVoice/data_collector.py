@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import datetime
 import os
 import re
@@ -121,6 +122,10 @@ def _resolve_face_landmarker_model() -> Optional[str]:
 # ── Per-driver calibration persistence ───────────────────────────────────────
 # Store per-driver baselines after calibration - to be reused in other runs
 _CALIBRATION_DIR = os.path.join('.', 'data', 'calibration_data')
+# Per-tick raw measures collected during calibration (one CSV row per tick),
+# distinct from _CALIBRATION_DIR which holds only the aggregated baseline.
+_CALIBRATION_LOG_DIR = os.path.join(_CALIBRATION_DIR, 'calibration_logs')
+_CALIBRATION_LOG_FIELDS = ('timestamp', 'elapsed_s', 'gaze_score', 'ear', 'mar', 'bpm', 'rr')
 # key -> required numeric fields (mirrors what compute_calibration() writes)
 _CALIBRATION_SCHEMA: Dict[str, Tuple[str, ...]] = {
     'gaze_score': ('mean', 'std', 'threshold'),
@@ -500,6 +505,12 @@ class DataCollector:
         # detection, not loop cadence. See compute_calibration() for why the
         # achieved rate is worth recording.
         self._calibration_tick_ts: List[float] = []
+        # Per-tick raw log (see calibration_log_file()); opened lazily on the
+        # first tick of a live calibration, closed once compute_calibration()
+        # finishes.
+        self.calibration_log_dir = _CALIBRATION_LOG_DIR
+        self._calibration_log_fh = None
+        self._calibration_log_writer = None
 
         # Calibration: 180 s time-based, collects gaze/EAR/MAR/HR/RR.
         # 3 minutes is set by the BLINK-RATE baseline, not by rPPG: a blink count
@@ -831,10 +842,14 @@ class DataCollector:
         face_present = bool(landmarks)
 
         gaze_score = self.get_gaze_score(frame, landmarks)
+        log_gaze = None
         if gaze_score > 0.0:
             self._calibration_data['gaze_score'].append(gaze_score)
+            log_gaze = gaze_score
 
         # EAR/MAR from the SAME landmarks (only when a face is actually present).
+        log_ear = None
+        log_mar = None
         if face_present:
             try:
                 eye, mouth = _perception.eye_mouth_aspect_ratios(landmarks, w_img, h_img)
@@ -842,6 +857,7 @@ class DataCollector:
                 self._calibration_data['mar'].append(mouth)
                 self._calibration_ear_ts.append((now, eye))
                 self._calibration_mar_ts.append((now, mouth))
+                log_ear, log_mar = eye, mouth
             except Exception as e:  # noqa: BLE001
                 print(e, "Error computing EAR/MAR")
 
@@ -849,6 +865,8 @@ class DataCollector:
         # reading TIMESTAMP so each estimate is counted once — polling the held
         # value every tick would append the same number over and over (a reading
         # lands every 6 s, the loop ticks 20x/s) and collapse the baseline std.
+        log_bpm = None
+        log_rr = None
         if self.rppg_estimator is not None:
             with self._rppg_lock:
                 last_hr, last_hr_t = self._last_hr, self._last_hr_t
@@ -856,11 +874,15 @@ class DataCollector:
             if last_hr is not None and last_hr_t > self._cal_last_hr_t:
                 self._cal_last_hr_t = last_hr_t
                 self._calibration_data['bpm'].append(float(last_hr))
+                log_bpm = float(last_hr)
                 print(f"[Calibration] rPPG: HR={last_hr}")
             if last_rr is not None and last_rr_t > self._cal_last_rr_t:
                 self._cal_last_rr_t = last_rr_t
                 self._calibration_data['rr'].append(float(last_rr))
+                log_rr = float(last_rr)
                 print(f"[Calibration] rPPG: RR={last_rr}")
+
+        self._log_calibration_sample(now, log_gaze, log_ear, log_mar, log_bpm, log_rr)
 
         self.latest_frame = frame
         #print(f"[Calibration] {now - self._calibration_start_t:.1f}/{self._calibration_duration_s:.1f} s elapsed. ")
@@ -1013,6 +1035,8 @@ class DataCollector:
         if save:
             self.save_calibration()
 
+        self._close_calibration_log()
+
     def _calibration_rate_stats(self) -> Dict[str, float]:
         """Loop-rate statistics over the calibration ticks.
 
@@ -1056,6 +1080,61 @@ class DataCollector:
             return None
         safe_pid = re.sub(r'[^A-Za-z0-9_.-]', '_', pid)
         return os.path.join(self.calibration_dir, f"calibration_{safe_pid}.json")
+
+    def calibration_log_file(self) -> Optional[str]:
+        """Path of this participant's per-tick calibration log, or None without an ID.
+
+        Distinct from ``calibration_file()``: that file holds the aggregated
+        mean/std/threshold baseline; this one holds the raw per-tick samples
+        (gaze score, EAR, MAR, HR, RR) the baseline was computed from.
+        """
+        pid = str(self.static_context.get('participantid') or '').strip()
+        if not pid:
+            return None
+        safe_pid = re.sub(r'[^A-Za-z0-9_.-]', '_', pid)
+        return os.path.join(self.calibration_log_dir, f"log_calibration_{safe_pid}.csv")
+
+    def _open_calibration_log(self) -> None:
+        """Lazily open the per-tick calibration log for writing (idempotent)."""
+        if self._calibration_log_writer is not None:
+            return
+        path = self.calibration_log_file()
+        if path is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._calibration_log_fh = open(path, 'w', newline='', encoding='utf-8')
+            self._calibration_log_writer = csv.writer(self._calibration_log_fh)
+            self._calibration_log_writer.writerow(_CALIBRATION_LOG_FIELDS)
+        except Exception as e:  # a failed log must never abort calibration
+            print(e, f"Error opening calibration log at {path}")
+            self._calibration_log_fh = None
+            self._calibration_log_writer = None
+
+    def _log_calibration_sample(
+        self, now: float, gaze_score: Optional[float], ear: Optional[float],
+        mar: Optional[float], bpm: Optional[float], rr: Optional[float],
+    ) -> None:
+        """Append one row of raw calibration measures; blank where not sampled this tick."""
+        self._open_calibration_log()
+        if self._calibration_log_writer is None:
+            return
+        try:
+            self._calibration_log_writer.writerow([
+                now, round(now - self._calibration_start_t, 3),
+                gaze_score, ear, mar, bpm, rr,
+            ])
+        except Exception as e:  # noqa: BLE001
+            print(e, "Error writing calibration log row")
+
+    def _close_calibration_log(self) -> None:
+        if self._calibration_log_fh is not None:
+            try:
+                self._calibration_log_fh.close()
+            except Exception:
+                pass
+        self._calibration_log_fh = None
+        self._calibration_log_writer = None
 
     @staticmethod
     def _validate_calibration(cal: Any) -> Optional[str]:

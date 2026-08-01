@@ -115,10 +115,16 @@ mode for "ProVoice alone". They start ProVoice and nothing else:
           also what ends the drive on the other machine. Nothing is written to
           raw_data.jsonl.
     --experiment-data-collection-provoice-remote [URL]
-        = ProVoice with --data-collection --webcam, same id handling. Records
-          raw_data.jsonl only: no decision engine, no interventions, and the
-          participant's stored baseline is reused rather than re-measured.
-          Its first logged frame is what opens the LoA windows over there.
+        = ProVoice with --data-collection --webcam --data-collection-timeout 900,
+          same id handling. Records raw_data.jsonl only: no decision engine, no
+          interventions, and the participant's stored baseline is reused rather
+          than re-measured. Its first logged frame is what opens the LoA
+          windows over there. After 15 minutes it stops itself exactly as
+          --calibration-only stops itself when its baseline finishes, which
+          posts 'provoice_ended' and makes Drive show the same end-of-session
+          screen it shows at the end of calibration -- deferred until any LoA
+          prompt on screen at that moment has been answered (or skipped), so
+          the cutoff never discards a label mid-window.
 
     [URL] defaults to PV_BRIDGE_URL and then to CARLA_MACHINE_IP, so on the
     rig neither preset takes an argument at all. Give one to point at a
@@ -603,6 +609,8 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
         # tokens through untouched.
         *(["--calibration-only"] if args.calibration_only else []),
         *(["--data-collection"] if args.data_collection else []),
+        *(["--data-collection-timeout", str(args.data_collection_timeout)]
+          if args.data_collection_timeout is not None else []),
         # Forwarded rather than resolved here on purpose: ProVoice owns the
         # camera, and probing an index means OPENING the device. Doing that in
         # this process would leave the launcher holding a handle that Windows
@@ -661,7 +669,8 @@ _PROVOICE_PRESETS = {
     "experiment_calibration_provoice_remote": {"calibration_only": True,
                                                "webcam": True},
     "experiment_data_collection_provoice_remote": {"data_collection": True,
-                                                   "webcam": True},
+                                                   "webcam": True,
+                                                   "data_collection_timeout": 900.0},
 }
 
 
@@ -738,12 +747,13 @@ def apply_experiment_presets(parser, args) -> None:
 
     applied = []
     for flag, value in overrides.items():
-        if isinstance(value, str) and getattr(args, flag) is not None:
+        if (isinstance(value, (str, int, float)) and not isinstance(value, bool)
+                and getattr(args, flag) is not None):
             # A VALUE the operator typed beats the preset's. Switches cannot
             # collide this way -- a preset only ever turns one on, and the
             # operator asking for the same thing is not a disagreement -- but
-            # an address is a real choice, and re-addressing the rig for one
-            # run must not need the source edited.
+            # an address or a timeout is a real choice, and overriding it for
+            # one run must not need the source edited.
             print("[PRESET] keeping --%s=%s from the command line (preset "
                   "would have used %s)"
                   % (flag.replace("_", "-"), getattr(args, flag), value))
@@ -1127,6 +1137,16 @@ def main():
                              "no decision engine and no interventions. The live "
                              "calibration is skipped (the participant's stored baseline "
                              "is reused, or neutral defaults if there is none).")
+    parser.add_argument("--data-collection-timeout", dest="data_collection_timeout",
+                        type=float, default=None,
+                        help="Hard wall-clock limit, in seconds, on a --data-collection "
+                             "run. Once it elapses, ProVoice stops itself exactly as it "
+                             "does at the end of --calibration-only, which (under "
+                             "--remote) posts 'provoice_ended' and makes Drive show the "
+                             "same end-of-session screen it shows after calibration. "
+                             "Unset = unlimited, which is the default for a plain "
+                             "--data-collection run; --experiment-data-collection-"
+                             "provoice-remote sets it to 900 (15 min) unless given here.")
     parser.add_argument("--vehicle-bridge", dest="vehicle_bridge",
                         action="store_true",
                         help="Run scripts/vehicle_state_file_bridge.py in its own "
@@ -1298,15 +1318,16 @@ def main():
                              "The image gets softer, not smaller. Read the effect off "
                              "the [SYNC] 'ceiling ~N Hz' line, then set --delta to "
                              "match. Fix it across all participants once chosen.")
-    parser.add_argument("--speed", action="store_true",
+    parser.add_argument("--speed", action=argparse.BooleanOptionalAction, default=True,
                         help="Show the vehicle speed in km/h on screen, bottom-right. "
                              "A single large readout, not the F1 debug panel, so it "
-                             "is safe to have in front of a participant. Off by "
-                             "default because it changes the driving task: a precise "
-                             "speed instrument is something the driver can regulate "
-                             "against, and it plausibly shifts how they judge the "
-                             "assistant's autonomy. If you use it, use it for EVERY "
-                             "participant and BOTH study arms.")
+                             "is safe to have in front of a participant. ON by "
+                             "default, and it must be either on or off identically "
+                             "for EVERY participant and BOTH study arms, since a "
+                             "precise speed instrument is something the driver can "
+                             "regulate against and plausibly shifts how they judge "
+                             "the assistant's autonomy. Pass --no-speed to turn it "
+                             "off.")
     parser.add_argument("--ambient-gain", dest="ambient_gain", type=float,
                         default=None,
                         help="Gain of the synthesised engine/road cabin sound, "
@@ -1359,20 +1380,22 @@ def main():
                              "THE LABELS IT PRODUCES ARE NOT PARTICIPANT DATA: the "
                              "windows cover driving no ProVoice was recording. Use "
                              "with --experiment-data-collection-carla-remote.")
-    parser.add_argument("--sync", action="store_true",
+    parser.add_argument("--sync", action=argparse.BooleanOptionalAction, default=None,
                         help="SYNCHRONOUS mode: run the simulation on a fixed time "
                              "step (--delta) driven by the NPC-traffic process, which "
-                             "paces it against the wall clock. Fixes the two things "
-                             "the free-running default cannot: physics is integrated "
-                             "at a constant step, so NPCs stop spinning out under "
-                             "machine load, and the traffic manager's seed actually "
-                             "makes the traffic identical for every participant. "
-                             "Costs real-time fidelity IF the rig cannot hold the "
-                             "step -- the run then goes into slow motion rather than "
-                             "dropping physics accuracy, and NPC_TRAFFIC prints the "
-                             "achieved rate every 30 s so you can tell. Sets up both "
-                             "children correctly; do not pass --sync to either by "
-                             "hand.")
+                             "paces it against the wall clock. ON by default (except "
+                             "under --test-popup, which starts no NPC_TRAFFIC to own "
+                             "the clock). Fixes the two things the free-running mode "
+                             "cannot: physics is integrated at a constant step, so "
+                             "NPCs stop spinning out under machine load, and the "
+                             "traffic manager's seed actually makes the traffic "
+                             "identical for every participant. Costs real-time "
+                             "fidelity IF the rig cannot hold the step -- the run "
+                             "then goes into slow motion rather than dropping physics "
+                             "accuracy, and NPC_TRAFFIC prints the achieved rate "
+                             "every 30 s so you can tell. Sets up both children "
+                             "correctly; do not pass --sync to either by hand. Pass "
+                             "--no-sync to fall back to the free-running clock.")
     parser.add_argument("--delta", type=float, default=0.05,
                         help="Fixed time step in seconds for --sync (default 0.05 = "
                              "20 Hz). This is a DEMAND on the CARLA server, not a "
@@ -1503,6 +1526,14 @@ def main():
     # explicit --remote-bind and only fill in the former.
     if args.remote_bind is None:
         args.remote_bind = "0.0.0.0"
+
+    # --sync default resolved here rather than at the argparse default itself:
+    # it is ON for a normal launch, but --test-popup starts no NPC_TRAFFIC, so
+    # nothing would own the clock and the explicit-vs-default distinction
+    # matters -- an operator who types --sync --test-popup by hand still hits
+    # the parser.error below, only an unset --sync is auto-resolved.
+    if args.sync is None:
+        args.sync = not args.test_popup
 
     if args.provoice_only:
         # Nothing else in main() applies on the ProVoice machine: no CARLA
