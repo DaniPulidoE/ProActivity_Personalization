@@ -2,7 +2,7 @@
 # first-order as ablation via --order).
 #
 # ANIL (Raghu et al. 2020) = MAML with the inner loop restricted to the output
-# head. The inner loop here is a few PROXIMAL SGD steps on the CORN/softmax
+# head. The inner loop here is a few PROXIMAL SGD steps on the soft-CORN/softmax
 # head *including the L2-SP anchor term* — i.e. exactly the adaptation that is
 # deployed per-driver by fine_tune_XLSTM.py — so meta-training optimizes the
 # initialization for the adaptation procedure actually used at test time.
@@ -93,9 +93,10 @@ from ProVoice.models.xlstm_model import (
     STATE_NUM,
     STATE_CARLA,
     STATE_CAT,
+    levels_to_distribution,
+    soft_corn_loss,
 )
 from ProVoice.models.xlstm_model import _as01
-from coral_pytorch.losses import corn_loss
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
@@ -113,7 +114,10 @@ LEVELS = [f"Level_{i}" for i in range(1, 6)]
 # tasks) and the one-hot / length-encoded categoricals are not continuous.
 _JITTER_SLICE = slice(len(FCD_NAMES), len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA))
 
-Segment = Tuple[np.ndarray, int]  # (frames (T, D_IN) float32, LoA class 0-4)
+# (frames (T, D_IN) float32, argmax LoA class 0-4, multi-hot marked levels).
+# The int is what the ordinal METRICS need; the multi-hot is the training
+# target, so a driver who marks several acceptable LoAs is not collapsed.
+Segment = Tuple[np.ndarray, int, np.ndarray]
 
 
 def build_driver_segments(
@@ -121,7 +125,7 @@ def build_driver_segments(
     window_seconds: float | None,
     resample_hz: float | None = None,
 ) -> Dict[str, List[Segment]]:
-    """Encode one (X, y) pair per segment, grouped per driver, in chronological order.
+    """Encode one (X, y, levels) triple per segment, grouped per driver, chronologically.
 
     Chronology = first appearance in the JSONL (groupby(sort=False)), NOT the
     lexicographic order of segment_id strings — episode supports must be
@@ -140,23 +144,17 @@ def build_driver_segments(
             if np.isnan(lv).any() or lv.sum() <= 0:
                 skipped.append(gid)
                 continue
-            if (lv > 0).sum() > 1:
-                # MAML adapts a functional head with corn_loss/CE on integer
-                # targets; argmax'ing a marked SET here would silently train on
-                # a label the driver never gave.
-                raise SystemExit(
-                    f"Segment {gid!r} marks several acceptable LoAs, which the MAML "
-                    f"path cannot represent. Train the population model with "
-                    f"`train_XLSTM.py --loss coral` instead, or restrict this run to "
-                    f"single-label sessions."
-                )
+            # Both losses take the marked SET, so a multi-label segment trains
+            # on what the driver gave instead of being rejected. The argmax int
+            # rides along only for the ordinal metrics.
+            levels = (lv > 0).astype(np.float32)
             y = int(np.argmax(lv))
             rows = [g.iloc[i].to_dict() for i in range(len(g))]
             rows = truncate_frames_by_seconds(rows, window_seconds)
             # Same fixed grid as train_XLSTM.SeqDataset — the meta-learner must
             # see the segments exactly as the population model did.
             X = encode_and_resample(rows, resample_hz, window_seconds)
-            segs.append((X, y))
+            segs.append((X, y, levels))
         if segs:
             drivers[str(pid)] = segs
     if skipped:
@@ -204,7 +202,7 @@ def embed(model, xb: torch.Tensor, lb: torch.Tensor, device: str,
         return h[torch.arange(h.size(0), device=h.device), idx]
 
 
-def adapt_head(Z: torch.Tensor, y: torch.Tensor,
+def adapt_head(Z: torch.Tensor, target: torch.Tensor,
                w0: torch.Tensor, b0: torch.Tensor,
                loss_fn, inner_steps: int, inner_lr: float, l2sp: float,
                second_order: bool = False,
@@ -231,7 +229,7 @@ def adapt_head(Z: torch.Tensor, y: torch.Tensor,
         b = anchor_b.clone().requires_grad_(True)
     for _ in range(inner_steps):
         logits = F.linear(Z, w, b)
-        loss = loss_fn(logits, y)
+        loss = loss_fn(logits, target)
         loss = loss + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum())
         gw, gb = torch.autograd.grad(loss, (w, b), create_graph=second_order)
         if second_order:
@@ -242,7 +240,7 @@ def adapt_head(Z: torch.Tensor, y: torch.Tensor,
     return w, b
 
 
-def solve_head_proximal(Z: torch.Tensor, y: torch.Tensor,
+def solve_head_proximal(Z: torch.Tensor, target: torch.Tensor,
                         w0: torch.Tensor, b0: torch.Tensor,
                         loss_fn, l2sp: float, max_iter: int, tol: float,
                         ) -> Tuple[torch.Tensor, torch.Tensor, float]:
@@ -259,7 +257,7 @@ def solve_head_proximal(Z: torch.Tensor, y: torch.Tensor,
     b = anchor_b.clone().requires_grad_(True)
 
     def objective():
-        return (loss_fn(F.linear(Z, w, b), y)
+        return (loss_fn(F.linear(Z, w, b), target)
                 + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum()))
 
     opt = torch.optim.LBFGS([w, b], lr=1.0, max_iter=max_iter,
@@ -278,8 +276,8 @@ def solve_head_proximal(Z: torch.Tensor, y: torch.Tensor,
     return w.detach(), b.detach(), residual
 
 
-def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
-                    Zq: torch.Tensor, yq: torch.Tensor,
+def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
+                    Zq: torch.Tensor, vq: torch.Tensor,
                     w0: torch.Tensor, b0: torch.Tensor,
                     loss_fn, l2sp: float, scale: float,
                     max_iter: int, tol: float) -> Tuple[float, float]:
@@ -300,13 +298,13 @@ def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
     loss (pass 1/meta_batch). Returns (scaled query loss, inner residual).
     """
     Zs_det = Zs.detach()
-    ws, bs, residual = solve_head_proximal(Zs_det, ys, w0, b0, loss_fn,
+    ws, bs, residual = solve_head_proximal(Zs_det, vs, w0, b0, loss_fn,
                                            l2sp, max_iter, tol)
 
     # Query pathway: backbone grads through Zq; g_q lands on the wl/bl leaves.
     wl = ws.clone().requires_grad_(True)
     bl = bs.clone().requires_grad_(True)
-    loss_q = loss_fn(F.linear(Zq, wl, bl), yq) * scale
+    loss_q = loss_fn(F.linear(Zq, wl, bl), vq) * scale
     loss_q.backward()
     gq = torch.cat([wl.grad.reshape(-1), bl.grad.reshape(-1)])
 
@@ -318,7 +316,7 @@ def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
 
     def flat_objective(t: torch.Tensor) -> torch.Tensor:
         wf, bf = t[:n_out * d].view(n_out, d), t[n_out * d:]
-        return (loss_fn(F.linear(Zs_det, wf, bf), ys)
+        return (loss_fn(F.linear(Zs_det, wf, bf), vs)
                 + l2sp * (((wf - anchor_w) ** 2).sum() + ((bf - anchor_b) ** 2).sum()))
 
     H = torch.autograd.functional.hessian(flat_objective, theta_star)
@@ -330,7 +328,7 @@ def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
     # pathway into the backbone through Zs's graph.
     wr = ws.clone().requires_grad_(True)
     br = bs.clone().requires_grad_(True)
-    inner = (loss_fn(F.linear(Zs, wr, br), ys)
+    inner = (loss_fn(F.linear(Zs, wr, br), vs)
              + l2sp * (((wr - w0) ** 2).sum() + ((br - b0) ** 2).sum()))
     rw, rb = torch.autograd.grad(inner, (wr, br), create_graph=True)
     corr = -((rw * vw).sum() + (rb * vb).sum())
@@ -338,7 +336,7 @@ def imaml_meta_step(Zs: torch.Tensor, ys: torch.Tensor,
     return float(loss_q.detach()), residual
 
 
-def adapt_head_deployed(Z: torch.Tensor, y: torch.Tensor,
+def adapt_head_deployed(Z: torch.Tensor, target: torch.Tensor,
                         w0: torch.Tensor, b0: torch.Tensor,
                         loss_fn, steps: int, lr: float, l2sp: float,
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -352,7 +350,7 @@ def adapt_head_deployed(Z: torch.Tensor, y: torch.Tensor,
     anchor_w, anchor_b = w0.detach(), b0.detach()
     opt = torch.optim.AdamW([w, b], lr=lr, weight_decay=0.0)
     for _ in range(steps):
-        loss = loss_fn(F.linear(Z, w, b), y)
+        loss = loss_fn(F.linear(Z, w, b), target)
         loss = loss + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum())
         opt.zero_grad()
         loss.backward()
@@ -379,11 +377,11 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
     fine_tune_XLSTM-style AdamW on the head over the driver's first K segments
     (true session prefix), then MAE/QWK on everything after — the same
     temporal protocol as the sweep script."""
-    xs, ys, ls, _ = collate(segs[:K])
+    xs, _ys, ls, vs = collate(segs[:K])
     Zs = embed(model, xs, ls, device)
-    w, b = adapt_head_deployed(Zs, ys.to(device), model.head.weight, model.head.bias,
+    w, b = adapt_head_deployed(Zs, vs.to(device), model.head.weight, model.head.bias,
                                loss_fn, steps, lr, l2sp)
-    xq, yq, lq, _ = collate(segs[K:])
+    xq, yq, lq, _vq = collate(segs[K:])
     Zq = embed(model, xq, lq, device)
     with torch.no_grad():
         pred = logits_to_probs(F.linear(Zq, w, b), head_type).argmax(dim=-1)
@@ -513,22 +511,13 @@ def main():
           f"resample_hz={resample_hz} order={args.order}"
           + (f" (first-order warm-up for {args.fo_warmup_epochs} epoch(s))"
              if args.fo_warmup_epochs > 0 and args.order != "first" else ""))
-    # CORN or softmax loss
-    if head_type == "coral":
-        # The CORAL head keeps its per-threshold biases outside model.head, but
-        # the inner loop adapts a functional head via F.linear(Z, w, b) — the
-        # shared weight vector is (1, emb), so that would produce one logit
-        # instead of K-1. Refuse rather than train something incoherent.
-        raise SystemExit(
-            "xlstm_maml does not support CORAL checkpoints (its functional inner "
-            "loop assumes one weight vector per threshold). Use --loss ce or "
-            "--loss corn for the population model, or fine_tune_XLSTM.py, which "
-            "does support CORAL."
-        )
+    # soft-CORN or softmax loss. Both take the multi-hot marked levels, so the
+    # inner loop, the iMAML solve and meta-validation all share one target type.
     if head_type == "corn":
-        loss_fn = lambda logits, target: corn_loss(logits, target, num_classes=model.n_classes)
+        loss_fn = lambda logits, lvl: soft_corn_loss(logits, lvl)
     else:
-        loss_fn = nn.CrossEntropyLoss()
+        _ce = nn.CrossEntropyLoss()
+        loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
 
     # --- data: one segment list per driver, chronological ---
     rows = [normalize_row(r) for r in read_jsonl(pathlib.Path(args.in_jsonl))]
@@ -622,17 +611,17 @@ def main():
                     drivers[pid], rng, args.k_min, args.k_max,
                     args.query_max, args.episode_start)
                 if args.crop_frac > 0.0 or args.jitter_std > 0.0: # jitter augmentation (if specified in arguments)
-                    support = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y)
-                               for X, y in support]
-                    query = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y)
-                             for X, y in query]
+                    support = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y, v)
+                               for X, y, v in support]
+                    query = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y, v)
+                             for X, y, v in query]
 
                 # Embed support/query. Support keeps its graph whenever the
                 # support pathway into the backbone is used (second/imaml);
                 # first order drops it. Query always keeps its graph.
-                xs, ys, ls, _ = collate(support)
+                xs, _ys, ls, vs = collate(support)
                 Zs = embed(model, xs, ls, device, grad=second or imaml)
-                xq, yq, lq, _ = collate(query)
+                xq, _yq, lq, vq = collate(query)
                 Zq = embed(model, xq, lq, device, grad=True)
 
                 if imaml:
@@ -640,7 +629,7 @@ def main():
                     # accumulate the exact implicit meta-gradients (anchor,
                     # support and query pathways) — see imaml_meta_step.
                     lq_val, res = imaml_meta_step(
-                        Zs, ys.to(device), Zq, yq.to(device),
+                        Zs, vs.to(device), Zq, vq.to(device),
                         model.head.weight, model.head.bias,
                         loss_fn, args.l2sp, 1.0 / nb,
                         args.imaml_max_iter, args.imaml_tol)
@@ -648,12 +637,12 @@ def main():
                     ep_res.append(res)
                 else:
                     # Inner: adapt the head on support with truncated proximal SGD.
-                    w, b = adapt_head(Zs, ys.to(device), model.head.weight, model.head.bias,
+                    w, b = adapt_head(Zs, vs.to(device), model.head.weight, model.head.bias,
                                       loss_fn, args.inner_steps, args.inner_lr, args.l2sp,
                                       second_order=second) # new weights and bias
 
                     # Outer: query loss under the ADAPTED head, backbone in the graph.
-                    loss_q = loss_fn(F.linear(Zq, w, b), yq.to(device)) / nb # loss with the new weights and bias on query
+                    loss_q = loss_fn(F.linear(Zq, w, b), vq.to(device)) / nb # loss with the new weights and bias on query
                     # Second order: this single backward computes everything exactly —
                     # head-init grads through the inner trajectory, backbone grads
                     # through BOTH the support and query pathways.

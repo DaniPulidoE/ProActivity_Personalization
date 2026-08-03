@@ -1,4 +1,4 @@
-"""Laplace posterior over the adapted CORN head — UQ Layer 1.
+"""Laplace posterior over the adapted soft-CORN head — UQ Layer 1.
 
 Strictly post-hoc: nothing in training or fine-tuning changes. L2-SP head
 fine-tuning is MAP estimation under a Gaussian prior centred on the population
@@ -7,22 +7,35 @@ trained head with the EXACT Hessian of the negative log-posterior (each CORN
 unit is a logistic regression with linear logits, so no GGN approximation is
 needed and the posterior is provably log-concave/unimodal).
 
+Why soft targets change nothing structural. For BCE with a linear logit the
+second derivative is sigma*(1-sigma) times the per-sample WEIGHT, independent
+of the target value — the canonical-link GLM property (Immer, Korzepa & Bauer,
+AISTATS 2021, is the reference for why this is the load-bearing assumption).
+Soft-CORN only moves the targets and the weights, so the Hessian keeps its
+exact closed form; what generalizes is the conditional subset. Hard CORN counts
+sample i in unit j iff y_i >= j; soft-CORN counts it with WEIGHT
+w_ij = P_i(y >= j), which is exactly ``levels_to_subset_weights``. A single
+marked level makes w_ij the old 0/1 indicator, so this reduces to the previous
+implementation exactly.
+
 Prior-precision scaling. ``fine_tune_XLSTM.py`` minimizes
-``corn_loss(...) + lam * ||theta - theta_pop||^2`` where ``corn_loss`` is
-normalized by M = the total number of conditional training examples
-(sum over units of |S_j|). Rescaling by M gives the un-normalized objective
-``NLL(theta) + M*lam*||theta - theta_pop||^2``, i.e. MAP under the prior
-N(theta_pop, (2*M*lam)^{-1} I). The Hessian of that negative log-posterior,
-per CORN unit j, is exact and block-diagonal across units (units share no
-parameters):
+``soft_corn_loss(...) + lam * ||theta - theta_pop||^2`` where
+``soft_corn_loss`` is normalized by N = the number of training segments (it
+sums over units and averages over the batch). Rescaling by N gives the
+un-normalized objective ``NLL(theta) + N*lam*||theta - theta_pop||^2``, i.e.
+MAP under the prior N(theta_pop, (2*N*lam)^{-1} I). The Hessian of that
+negative log-posterior, per CORN unit j, is exact and block-diagonal across
+units (units share no parameters):
 
-    H_j = sum_{i in S_j} sigma_i (1 - sigma_i) * z~_i z~_i^T  +  2*M*lam * I
+    H_j = sum_i w_ij * sigma_ij (1 - sigma_ij) * z~_i z~_i^T  +  2*N*lam * I
 
-with z~ = [z; 1] the bias-augmented embedding, sigma_i the unit's sigmoid at
-the MAP logits, and S_j = {i : y_i >= j} the conditional subset unit j is
-trained on (target 1[y > j]) — the same subsets ``coral_pytorch.losses
-.corn_loss`` uses. Units whose subset is empty (labels never reach level j)
-keep the pure prior H_j = 2*M*lam*I: no data, prior-width uncertainty.
+with z~ = [z; 1] the bias-augmented embedding and sigma_ij the unit's sigmoid
+at the MAP logits. Units with no weight at all (labels never reach level j)
+keep the pure prior H_j = 2*N*lam*I: no data, prior-width uncertainty.
+
+NOTE the normalizer changed from M (hard CORN's total subset memberships) to N
+with the switch to ``soft_corn_loss``; posteriors fitted by earlier revisions
+used tau = 2*M*lam and are not comparable.
 
 Both study arms (L2-SP baseline and ANIL) end in the same head fine-tune, so
 fitting here applies the identical UQ mechanism to both arms by construction.
@@ -34,7 +47,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from ProVoice.models.xlstm_model import logits_to_probs
+from ProVoice.models.xlstm_model import logits_to_probs, levels_to_subset_weights
 
 # Checkpoint key under which the serialized posterior rides alongside "arch"
 # and "state_dict" in the .pt file (absent on checkpoints fit without UQ).
@@ -51,9 +64,12 @@ class LaplacePosterior:
         mean:            (K-1, E+1) MAP head, row j = [w_j; b_j]
         chol_prec:       (K-1, E+1, E+1) lower Cholesky L of the Hessian H=LL^T
         n_classes:       K (PMF length after CORN decoding)
-        prior_precision: tau = 2*M*lam actually used in H
+        prior_precision: tau = 2*N*lam actually used in H
         l2sp:            the lambda the head was fine-tuned with
-        n_cond_examples: M, the corn_loss normalizer
+        n_examples:      N, the soft_corn_loss normalizer (defines tau)
+        n_cond_examples: sum of the soft subset weights — a diagnostic of how
+                         much data each threshold actually saw (equals hard
+                         CORN's M when every segment marks one level)
     """
 
     def __init__(
@@ -63,14 +79,16 @@ class LaplacePosterior:
         n_classes: int,
         prior_precision: float,
         l2sp: float,
-        n_cond_examples: int,
+        n_examples: int,
+        n_cond_examples: float,
     ):
         self.mean = mean
         self.chol_prec = chol_prec
         self.n_classes = int(n_classes)
         self.prior_precision = float(prior_precision)
         self.l2sp = float(l2sp)
-        self.n_cond_examples = int(n_cond_examples)
+        self.n_examples = int(n_examples)
+        self.n_cond_examples = float(n_cond_examples)
 
     # ------------------------------------------------------------------ fit
     @classmethod
@@ -79,7 +97,7 @@ class LaplacePosterior:
         cls,
         head: nn.Linear,
         Z: torch.Tensor,
-        y: torch.Tensor,
+        levels: torch.Tensor,
         l2sp: float,
         n_classes: int = 5,
     ) -> "LaplacePosterior":
@@ -91,11 +109,13 @@ class LaplacePosterior:
                        intermediate epoch — the expansion is only valid at the
                        mode of the objective.
             Z:         (N, E) precomputed embeddings the head was trained on
-            y:         (N,) integer labels 0..n_classes-1
+            levels:    (N, n_classes) multi-hot marked levels — the same target
+                       ``soft_corn_loss`` was trained on. A one-hot row is the
+                       single-label case and reproduces hard-CORN subsets.
             l2sp:      the L2-SP strength lambda used during fine-tuning. Must
                        be > 0: the Laplace layer is defined by the L2-SP prior;
-                       without it the prior precision is 0 and units with few
-                       (or no) conditional examples have a singular Hessian.
+                       without it the prior precision is 0 and units with little
+                       (or no) conditional weight have a singular Hessian.
             n_classes: K (5 LoA levels)
         """
         # verify inputs
@@ -112,35 +132,44 @@ class LaplacePosterior:
                 "the softmax, so the per-unit GLM decomposition does not apply)."
             )
         Z = Z.detach().to("cpu", torch.float64)
-        y = y.detach().to("cpu", torch.long)
-        if Z.ndim != 2 or Z.shape[0] != y.shape[0]:
-            raise ValueError(f"Shape mismatch: Z {tuple(Z.shape)} vs y {tuple(y.shape)}")
+        levels = levels.detach().to("cpu", torch.float64)
+        if Z.ndim != 2 or levels.ndim != 2 or Z.shape[0] != levels.shape[0]:
+            raise ValueError(
+                f"Shape mismatch: Z {tuple(Z.shape)} vs levels {tuple(levels.shape)}")
+        if levels.shape[1] != n_classes:
+            raise ValueError(
+                f"levels has {levels.shape[1]} columns, expected n_classes={n_classes}")
         if Z.shape[1] != head.in_features:
             raise ValueError(f"Z dim {Z.shape[1]} != head.in_features {head.in_features}")
+
+        N = Z.shape[0]
+        if N == 0:
+            raise ValueError("No training examples — cannot fit a posterior.")
 
         # weights
         W = head.weight.detach().to("cpu", torch.float64)          # (K-1, E)
         b = head.bias.detach().to("cpu", torch.float64)            # (K-1,)
         mean = torch.cat([W, b.unsqueeze(1)], dim=1)               # (K-1, E+1)
 
-        # Conditional subsets of corn_loss: unit j trains on {y >= j}.
-        subsets = [y >= j for j in range(K1)]
-        M = int(sum(int(s.sum()) for s in subsets))
-        if M == 0:
-            raise ValueError("No training examples — cannot fit a posterior.")
-        tau = 2.0 * M * float(l2sp)
+        # Soft conditional-subset weights: w_ij = P_i(y >= j). Reduces to the
+        # hard indicator 1[y_i >= j] when exactly one level is marked.
+        Wt = levels_to_subset_weights(levels)                      # (N, K-1)
+        soft_M = float(Wt.sum())
+        # soft_corn_loss averages over the batch, so the un-normalized objective
+        # is recovered by multiplying by N — that N is the prior scale.
+        tau = 2.0 * N * float(l2sp)
 
         P = Z.shape[1] + 1
         eye = torch.eye(P, dtype=torch.float64)
+        Zt = torch.cat([Z, torch.ones(N, 1, dtype=torch.float64)], dim=1)   # (N, E+1)
         H = torch.empty(K1, P, P, dtype=torch.float64)
         for j in range(K1):
-            Hj = tau * eye # prior covariance
-            s = subsets[j]
-            if bool(s.any()): # update prior with likelihood
-                Zj = torch.cat([Z[s], torch.ones(int(s.sum()), 1, dtype=torch.float64)], dim=1)
-                sig = torch.sigmoid(Zj @ mean[j])                  # (|S_j|,)
-                w = sig * (1.0 - sig)
-                Hj = Hj + (Zj * w.unsqueeze(1)).T @ Zj
+            Hj = tau * eye # prior precision
+            wj = Wt[:, j]
+            if bool((wj > 0).any()): # update prior with likelihood
+                sig = torch.sigmoid(Zt @ mean[j])                  # (N,)
+                w = wj * sig * (1.0 - sig)                         # weighted GLM curvature
+                Hj = Hj + (Zt * w.unsqueeze(1)).T @ Zt
             H[j] = Hj
         chol_prec = torch.linalg.cholesky(H)                       # PD: tau > 0
 
@@ -150,7 +179,8 @@ class LaplacePosterior:
             n_classes=n_classes,
             prior_precision=tau,
             l2sp=l2sp,
-            n_cond_examples=M,
+            n_examples=N,
+            n_cond_examples=soft_M,
         )
 
     # ------------------------------------------------------------- sampling
@@ -223,6 +253,7 @@ class LaplacePosterior:
             "n_classes": self.n_classes,
             "prior_precision": self.prior_precision,
             "l2sp": self.l2sp,
+            "n_examples": self.n_examples,
             "n_cond_examples": self.n_cond_examples,
         }
 

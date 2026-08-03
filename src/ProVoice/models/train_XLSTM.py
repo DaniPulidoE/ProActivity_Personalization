@@ -22,34 +22,15 @@ from ProVoice.models.xlstm_model import (
     FEATURE_NAMES,
     log_encoded_frames,
     logits_to_probs,
+    levels_to_distribution,
+    levels_to_cumulative,
+    soft_corn_loss,
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.decision_engine import truncate_frames_by_seconds
-from coral_pytorch.losses import coral_loss, corn_loss
 
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
-
-
-def levels_to_distribution(lvl: torch.Tensor) -> torch.Tensor:
-    """Multi-hot (B, K) -> PMF (B, K), uniform over the marked levels.
-
-    A single marked level yields the usual one-hot, so single-label data is
-    numerically unchanged.
-    """
-    return lvl / lvl.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-
-def levels_to_cumulative(lvl: torch.Tensor) -> torch.Tensor:
-    """Multi-hot (B, K) -> CORAL target (B, K-1) with q_k = P(y > k).
-
-    This is what lets CORAL take more than one label: the driver's marked set
-    becomes a distribution, and its complementary CDF is a valid soft target for
-    coral_loss (which is a sum of BCEs, so targets need only lie in [0, 1]).
-    The mapping is invertible, so nothing about which levels were marked is lost.
-    """
-    p = levels_to_distribution(lvl)
-    return p.flip(-1).cumsum(-1).flip(-1)[..., 1:]
 SPLIT_VARIABLE = "participantid"
 
 
@@ -151,8 +132,8 @@ class SeqDataset(Dataset):
             if np.isnan(level_vec).any() or level_vec.sum() <= 0:
                 skipped.append(gid)
                 continue
-            # Keep BOTH representations: the multi-hot drives CORAL/CE (which
-            # accept soft targets), while the argmax int is what CORN and the
+            # Keep BOTH representations: the multi-hot is the training target
+            # (every loss now accepts a set), while the argmax int is what the
             # legacy single-label metrics need.
             lvl = (level_vec > 0).astype(np.float32)
             y = int(np.argmax(level_vec))
@@ -314,16 +295,16 @@ def main():
                          "xlstm_model.RESAMPLE_GAP_S are held rather than interpolated. "
                          "0 disables. Stored in the checkpoint so fine-tuning and "
                          "inference inherit it.")
-    ap.add_argument("--loss", choices=["ce", "corn", "coral"], default="ce",
-                    help="'ce': softmax head + cross-entropy (nominal). 'corn': rank-consistent "
-                         "ordinal head (K-1 conditional logits) + CORN loss (Shi et al. 2023). "
-                         "'coral': ordinal head with ONE shared weight vector + K-1 biases + "
-                         "CORAL loss (Cao et al. 2020) — the only option that accepts more than "
-                         "one marked LoA per window, since its target is a cumulative vector. "
-                         "The choice is baked into the checkpoint and picked up automatically "
-                         "by fine_tune_XLSTM.py and the decision engine.")
+    ap.add_argument("--loss", choices=["ce", "corn"], default="ce",
+                    help="'ce': softmax head + cross-entropy (nominal — blind to ordinal "
+                         "distance). 'corn': rank-consistent ordinal head (K-1 conditional "
+                         "logits) trained with soft-CORN (Shi et al. 2023, generalized to a "
+                         "SET of marked LoAs; see docs/soft_corn_and_oldl.md). Both accept "
+                         "multi-label windows. The choice is baked into the checkpoint and "
+                         "picked up automatically by fine_tune_XLSTM.py and the decision "
+                         "engine; only 'corn' supports the Laplace UQ layer.")
     args = ap.parse_args()
-    head_type = {"corn": "corn", "coral": "coral"}.get(args.loss, "softmax")
+    head_type = "corn" if args.loss == "corn" else "softmax"
 
     # Derive the sequence cap from the grid unless it was given explicitly. With
     # resampling on, window_seconds * resample_hz IS the sequence length, so any
@@ -431,30 +412,16 @@ def main():
         head_type=head_type,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # Reject multi-label data on the CORN path rather than training on a
-    # silently-thresholded label: corn_loss partitions samples into HARD
-    # conditional subsets, and it does not error on a soft target — it just
-    # rounds it, which would corrupt the run without any warning.
     multi = int(sum(1 for _, _, lvl in train_ds.groups if float(np.sum(lvl)) > 1))
-    if multi and head_type == "corn":
-        raise SystemExit(
-            f"--loss corn cannot represent multiple marked LoAs, but {multi} training "
-            f"segment(s) mark more than one. Use --loss coral (ordinal, accepts a set) "
-            f"or --loss ce (nominal, treats the set as a uniform distribution)."
-        )
     if multi:
         print(f"[info] {multi}/{len(train_ds.groups)} training segment(s) mark several "
               f"acceptable LoAs; targets become a distribution over them.")
 
     if head_type == "corn":
-        # CORN trains each of the K-1 logits as P(y>k | y>k-1) on its
-        # conditional subset; corn_loss builds those subsets internally.
-        loss_fn = lambda logits, yb, lvl: corn_loss(logits, yb, num_classes=5)
-    elif head_type == "coral":
-        # CORAL's target is the complementary CDF of the marked set, so a
-        # single mark gives the standard 0/1 extended label and several marks
-        # give intermediate values. No chain rule, no hard subsets.
-        loss_fn = lambda logits, yb, lvl: coral_loss(logits, levels_to_cumulative(lvl))
+        # soft-CORN: each of the K-1 logits models P(y>k | y>k-1), trained on
+        # its conditional subset weighted by P(y >= k). A single marked level
+        # recovers the original CORN loss exactly (up to the normalizer).
+        loss_fn = lambda logits, yb, lvl: soft_corn_loss(logits, lvl)
     else:
         _ce = nn.CrossEntropyLoss()
         # Soft (B, K) targets — supported since torch 1.10 and numerically
@@ -491,7 +458,7 @@ def main():
                 xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
                 logits = model(xb, lengths=lb)
                 # logits_to_probs maps every head type to a 5-class PMF, so
-                # argmax decoding is identical for CE, CORN and CORAL.
+                # argmax decoding is identical for CE and CORN.
                 pred = logits_to_probs(logits, head_type).argmax(dim=-1)
                 y_true.append(yb.cpu().numpy()); y_pred.append(pred.cpu().numpy())
                 y_lvl.append(vb.numpy())

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
 
@@ -446,16 +447,8 @@ class XLSTMSequenceClassifier(nn.Module):
       - 'corn':    ``Linear(embedding_dim, n_classes - 1)`` logits, where logit k
         models the conditional P(y > k | y > k-1) (Shi, Cao & Raschka 2023).
         Class probabilities are recovered with :func:`logits_to_probs`; train
-        with ``coral_pytorch.losses.corn_loss``.
-      - 'coral':   ONE shared weight vector plus ``n_classes - 1`` independent
-        biases (Cao, Mirjalili & Raschka 2020), so logit k is ``w·h + b_k`` and
-        ``sigmoid`` of it is the unconditional P(y > k). Sharing w is what makes
-        the thresholds rank-consistent — an independent Linear per threshold
-        (as 'corn' uses) would not be CORAL. Train with
-        ``coral_pytorch.losses.coral_loss``, which takes a cumulative target
-        vector and therefore accepts SOFT targets: a driver who marks several
-        acceptable LoAs becomes q_k = P(y > k) of the uniform distribution over
-        that set. Single-label data yields the usual 0/1 vector unchanged.
+        with :func:`soft_corn_loss`, which accepts a driver's SET of acceptable
+        LoAs and reduces exactly to the original CORN loss on single-label data.
     """
 
     def __init__(
@@ -479,9 +472,9 @@ class XLSTMSequenceClassifier(nn.Module):
                 f"embedding_dim ({embedding_dim}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
-        if head_type not in ('softmax', 'corn', 'coral'):
+        if head_type not in ('softmax', 'corn'):
             raise ValueError(
-                f"head_type must be 'softmax', 'corn' or 'coral', got {head_type!r}")
+                f"head_type must be 'softmax' or 'corn', got {head_type!r}")
         self.d_in = d_in
         self.n_classes = n_classes
         self.embedding_dim = embedding_dim
@@ -495,16 +488,8 @@ class XLSTMSequenceClassifier(nn.Module):
         self.backbone = xLSTMBlockStack(
             _stack_cfg(embedding_dim, num_blocks, num_heads, context_length)
         )
-        if head_type == 'coral':
-            # Shared weight vector, one bias per threshold. This is the whole
-            # point of CORAL: identical w across thresholds means their ordering
-            # is the same for every input, so the model cannot emit
-            # contradictory ranks.
-            self.head = nn.Linear(embedding_dim, 1, bias=False)
-            self.coral_bias = nn.Parameter(torch.zeros(n_classes - 1))
-        else:
-            n_out = n_classes - 1 if head_type == 'corn' else n_classes
-            self.head = nn.Linear(embedding_dim, n_out)
+        n_out = n_classes - 1 if head_type == 'corn' else n_classes
+        self.head = nn.Linear(embedding_dim, n_out)
         self.backbone.reset_parameters()
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -524,10 +509,7 @@ class XLSTMSequenceClassifier(nn.Module):
         else:
             idx = (lengths.to(h.device).long() - 1).clamp(min=0)
             pooled = h[torch.arange(h.size(0), device=h.device), idx]
-        out = self.head(pooled)
-        if self.head_type == 'coral':
-            out = out + self.coral_bias   # (B, 1) + (K-1,) -> (B, K-1)
-        return out
+        return self.head(pooled)
 
 
 def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
@@ -544,20 +526,114 @@ def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.T
     """
     if head_type == 'softmax':
         return torch.softmax(logits, dim=-1)
-    if head_type in ('corn', 'coral'):
-        if head_type == 'corn':
-            q = torch.cumprod(torch.sigmoid(logits), dim=-1)  # (B, K-1), q_k = P(y > k-1)
-        else:
-            # CORAL logits are UNCONDITIONAL P(y > k), so no chain rule. The
-            # shared weight vector makes the thresholds rank-consistent, but the
-            # learned biases are not constrained to be ordered; take a running
-            # minimum so differencing can never produce a negative probability.
-            q = torch.cummin(torch.sigmoid(logits), dim=-1).values
+    if head_type == 'corn':
+        q = torch.cumprod(torch.sigmoid(logits), dim=-1)       # (B, K-1), q_k = P(y > k)
         ones = torch.ones_like(q[..., :1])
-        upper = torch.cat([ones, q], dim=-1)                  # [1, q_1, ..., q_{K-1}]
-        lower = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)  # [q_1, ..., q_{K-1}, 0]
-        return upper - lower                                  # non-negative because q is monotone
+        upper = torch.cat([ones, q], dim=-1)                   # [1, q_0, ..., q_{K-2}]
+        lower = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)  # [q_0, ..., q_{K-2}, 0]
+        return upper - lower                                   # non-negative because q is monotone
     raise ValueError(f"Unknown head_type: {head_type!r}")
+
+
+# --------------------------------------------------------------------------- #
+# Ordinal targets and the soft-CORN loss.
+#
+# The driver may mark SEVERAL acceptable LoAs per 20 s window, so the label is a
+# multi-hot vector over the K levels rather than one integer. These three
+# functions are the single home for turning that vector into training signal;
+# `logits_to_probs` above is their decoding counterpart.
+#
+# Derivation of soft_corn_loss (full write-up: docs/soft_corn_and_oldl.md).
+# CORN (Shi, Cao & Raschka 2023) trains unit k as a logistic regression on the
+# HARD conditional subset {i : y_i >= k} with binary target 1[y_i > k]. Taking
+# the expectation of that per-unit BCE under the label distribution -- weight
+# each sample's membership in unit k's subset by P(y >= k) and use the
+# conditional target P(y > k | y >= k) -- makes the weights telescope, and the
+# whole thing collapses to
+#
+#     L = - sum_k [ q_k * log sigma(z_k)  +  p_k * log(1 - sigma(z_k)) ]
+#
+# with q_k = P(y > k) and p_k = P(y = k). It is a strict generalization: when a
+# single level is marked, q_k and p_k are 0/1 and this IS the CORN loss, up to
+# the normalizer (CORN divides by total subset memberships, this by batch size
+# -- a constant factor, i.e. an effective learning-rate rescaling).
+# --------------------------------------------------------------------------- #
+def levels_to_distribution(levels: torch.Tensor) -> torch.Tensor:
+    """Multi-hot (B, K) -> PMF (B, K), uniform over the marked levels.
+
+    A single marked level yields the usual one-hot, so single-label data is
+    numerically unchanged.
+    """
+    return levels / levels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def levels_to_cumulative(levels: torch.Tensor) -> torch.Tensor:
+    """Multi-hot (B, K) -> complementary CDF (B, K-1) with ``q_k = P(y > k)``.
+
+    Monotone non-increasing by construction, and the mapping is invertible, so
+    nothing about which levels were marked is lost.
+    """
+    p = levels_to_distribution(levels)
+    return p.flip(-1).cumsum(-1).flip(-1)[..., 1:]
+
+
+def levels_to_subset_weights(levels: torch.Tensor) -> torch.Tensor:
+    """Multi-hot (B, K) -> (B, K-1) soft conditional-subset weights ``P(y >= k)``.
+
+    How much sample i counts toward CORN unit k. In hard CORN this is the
+    indicator ``1[y_i >= k]`` of the subset unit k is trained on; under a label
+    distribution it is the probability of that event, ``q_{k-1}`` (with
+    ``q_{-1} = 1``). This is exactly the per-unit weight that appears in the
+    soft-CORN Hessian, so :mod:`ProVoice.models.laplace_head` consumes it too.
+    """
+    q = levels_to_cumulative(levels)                           # (B, K-1) = q_0..q_{K-2}
+    ones = torch.ones_like(q[..., :1])
+    return torch.cat([ones, q], dim=-1)[..., :-1]              # [1, q_0, ..., q_{K-3}]
+
+
+# Saturation bound on the logits. `logsigmoid` is exactly linear below about
+# -20 and flat above +20 in float32, so |z| = 1e4 is far outside the range where
+# either the loss or its gradient can still change: clamping here is numerically
+# INERT (verified bit-identical over 5000 random batches at logit scales up to
+# 1e3, in both value and gradient). What it buys is a total-function guarantee.
+# Without it a non-finite logit produces NaN rather than a large number, because
+# q_k is exactly 0 for every threshold above the marked level and 0 * (-inf) is
+# NaN, not 0 — one inf would silently poison the whole batch. A genuine NaN in
+# the logits still propagates, so real upstream failures stay visible.
+_LOGIT_SATURATION = 1e4
+
+
+def soft_corn_loss(logits: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
+    """CORN loss generalized to a SET of acceptable levels.
+
+    Args:
+        logits: (B, K-1) CORN conditional logits.
+        levels: (B, K) multi-hot mark vector (a single mark => original CORN).
+
+    Returns the batch-mean loss. Unlike ``coral_pytorch.losses.corn_loss`` this
+    needs no hard integer label, so multi-label windows train on what the driver
+    actually marked instead of being rejected or silently thresholded.
+
+    Numerics: ``logsigmoid`` rather than ``log(sigmoid(.))`` — the latter
+    underflows to ``log(0) = -inf`` around a logit of -100 in float32. The
+    gradient is ``q_{k-1}*sigma(z_k) - q_k``, bounded by 1 in absolute value, so
+    this loss cannot itself explode gradients regardless of how extreme the
+    logits get.
+    """
+    if logits.shape[-1] != levels.shape[-1] - 1:
+        raise ValueError(
+            f"soft_corn_loss expects (B, K-1) logits and (B, K) levels, got "
+            f"{tuple(logits.shape)} and {tuple(levels.shape)}")
+    # Build the targets in at least float32 even under autocast: the
+    # normalization in levels_to_distribution clamps the row sum at 1e-8, which
+    # underflows to 0 in float16 and would turn a degenerate all-zero row into
+    # 0/0 = NaN instead of a harmless zero contribution.
+    levels = levels.to(torch.promote_types(levels.dtype, torch.float32))
+    p = levels_to_distribution(levels).to(logits.dtype)         # (B, K)   P(y = k)
+    q = levels_to_cumulative(levels).to(logits.dtype)           # (B, K-1) P(y > k)
+    z = logits.clamp(-_LOGIT_SATURATION, _LOGIT_SATURATION)
+    return -(q * F.logsigmoid(z)
+             + p[..., :-1] * F.logsigmoid(-z)).sum(-1).mean()
 
 
 def save_checkpoint(model: XLSTMSequenceClassifier, path: str, arch: Dict[str, Any]) -> None:
