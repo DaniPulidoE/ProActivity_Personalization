@@ -1518,9 +1518,13 @@ def main():
                              "from an identical position.")
     parser.add_argument("--allow-long-vehicles", dest="allow_long_vehicles",
                         action="store_true",
-                        help="Put the vans and trucks back into the NPC fleet "
-                             "(sprinter, ambulance, firetruck, fuso, carlacola). "
-                             "They are replaced by cars by default because they "
+                        help="Put the three off-tracking vehicles back into the "
+                             "NPC fleet (firetruck, fuso, carlacola). The sprinter "
+                             "and ambulance are no longer among them -- they were "
+                             "driven without off-tracking, so they stay in the "
+                             "fleet regardless and serve as substitutes for the "
+                             "three that do. Those three are replaced by default "
+                             "because they "
                              "OFF-TRACK: the traffic manager steers a reference "
                              "point along the lane centreline and does not model "
                              "the body behind it, so on tight corners their tails "
@@ -1532,7 +1536,9 @@ def main():
                              "at the same spawn points, so traffic density -- part "
                              "of the driving task -- is unchanged.")
     parser.add_argument("--num-vehicles", dest="num_vehicles", type=int, default=0,
-                        help="Spawn only the first N NPC vehicles (0 = all 11). A "
+                        help="Spawn only N of the configured NPC vehicles, evenly "
+                             "spaced through the list (0 = all of them; the fleet "
+                             "is 15 at the time of writing). A "
                              "DIAGNOSTIC for --sync slow motion: this rig spends "
                              "~1.17 s of server work per SIMULATED second, which no "
                              "tick rate can outrun. Run once with --num-vehicles 3 "

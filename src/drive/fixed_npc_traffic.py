@@ -18,7 +18,7 @@ becomes a passive client that paces itself with world.wait_for_tick().
 
 A previous attempt put --sync on Drive alone. That set the world synchronous and
 synchronised Drive's own traffic manager on port 8000 -- which has no NPC
-registered to it -- while the traffic manager actually driving the eleven cars,
+registered to it -- while the traffic manager actually driving the NPC fleet,
 on port 9000 here, was never ticked at all. Every NPC stopped dead. That episode
 is recorded as a "nonexistent sync mismatch" in start_experiment.py; it was a
 real mismatch, and it was this one.
@@ -133,6 +133,16 @@ DEFAULT_TRAFFIC_SEED = 42
 #                      this knob is not the free one it looks like.
 #   *_lanechange, keep_right, ignore_*
 #                      0-100, the percent of the time the behaviour applies.
+#
+# ONE KNOB IS ALMOST ALWAYS WRONG HERE, and it does not look it:
+# random_left_lanechange / random_right_lanechange are UNCONDITIONAL. They are
+# not "overtake more readily" -- the traffic manager evaluates them continuously
+# and without reference to whether anything is in the way, so a vehicle with
+# them set weaves between lanes on an empty road. The knob that makes a vehicle
+# pass a slower one is auto_lane_change, and the way to make a vehicle pass more
+# often is to make it faster. Both random knobs are pinned to 0 in
+# _baseline_profile; setting one in a profile is opting a vehicle out of
+# behaving purposefully, so do it only if that is genuinely the intent.
 TM_KNOBS = {
     "auto_lane_change":        "auto_lane_change",
     "distance_to_leading":     "distance_to_leading_vehicle",
@@ -167,7 +177,7 @@ DRIVING_PROFILES = {
     # off for the WHOLE fleet made the traffic crawl, so use this in ones and
     # twos, not everywhere.
     "cautious": {
-        "speed_difference": (15.0, 30.0),
+        "speed_difference": (5.0, 25.0),
         "distance_to_leading": 12.0,
         "auto_lane_change": False,
         "keep_right": 80.0,
@@ -175,13 +185,26 @@ DRIVING_PROFILES = {
     # Follows close and will take a gap. Deliberately NOT a red-light runner:
     # everything here stays inside the rules of the road, so it changes how the
     # traffic feels without changing what it yields to.
+    #
+    # It overtakes more than the rest of the fleet, and it does so for the right
+    # reason -- it is faster, so it catches slower vehicles sooner and more
+    # often. It does NOT set the random lane-change knobs. An earlier version
+    # did, at 15%, and that is what made the traffic look like it was changing
+    # lanes for no reason: those percentages are unconditional, so the vehicle
+    # wandered between lanes on an empty road as readily as it passed anyone.
+    # The behaviour wanted here is a consequence of the speed, not a dice roll
+    # laid on top of it.
+    #
+    # keep_right is 40 rather than the baseline 60: it returns to the right
+    # lane, just less promptly than the rest of the fleet, which is what an
+    # assertive driver looks like. It was 10, which is not assertive -- it is a
+    # car that overtakes once and then sits in the overtaking lane for the rest
+    # of the route with a queue behind it.
     "assertive": {
-        "speed_difference": (-10.0, 0.0),
-        "distance_to_leading": 5.0,
+        "speed_difference": (-15.0, -5.0),
+        "distance_to_leading": (4.0,7.0),
         "auto_lane_change": True,
-        "random_left_lanechange": 15.0,
-        "random_right_lanechange": 15.0,
-        "keep_right": 10.0,
+        "keep_right": 40.0,
     },
     # Sits off the lane centreline for the whole run. A CONSTANT bias, not a
     # wander -- the offset is drawn once, so this is the driver who habitually
@@ -227,17 +250,258 @@ DRIVING_PROFILES = {
     # relative to the participant's you actually know, and never to the whole
     # fleet. A collision with the ego does not just add a hazard, it invalidates
     # everything measured after it.
+    # WHAT ignore_vehicles WAS DOING, and why it is gone. At 10% the traffic
+    # manager's collision avoidance was switched off a tenth of the time, which
+    # is not "drives badly" -- it is "is briefly blind". The vehicle it fails to
+    # see can be the participant's, in any geometry, on open road, with no
+    # warning and nothing the participant could have read from the scene. That
+    # is not a hazard a driver can respond to, so it produces no interpretable
+    # behaviour and costs a session when it lands.
+    #
+    # Without it the car still runs lights and signs, but the traffic manager is
+    # steering defensively the whole time, so it brakes for what is in front of
+    # it -- including the ego.
+    #
+    # WHAT THAT DOES NOT MAKE SAFE:
+    #
+    #  1. Junctions. Collision avoidance reduces the risk of running a red, it
+    #     does not remove it: it acts on the NPC's own path with a finite
+    #     lookahead, and a crossing conflict at speed is where that is weakest.
+    #     More to the point, the participant is NOT traffic-manager controlled
+    #     and has no avoidance at all -- a human on green who sees a car come
+    #     from the side may brake late or not at all. The NPC being defensive
+    #     protects the NPC's plan, not the participant's.
+    #  2. The behaviour becomes strange rather than dangerous. A car that enters
+    #     a junction on red and then brakes for cross traffic does not sail
+    #     through -- it stops dead in the middle of the junction. That reads as
+    #     a broken vehicle, not a reckless one, and it blocks the junction for
+    #     everyone including the participant.
+    #
+    # So this is now the honest description: a car that speeds and disregards
+    # signals, and that will try not to hit anyone while doing it. Treat it as
+    # UNVERIFIED -- nothing here has been driven -- and check it on a rehearsal
+    # run before it is in front of a participant.
     "reckless": {
         "speed_difference": (-25.0, -10.0),
-        "distance_to_leading": 3.0,
+        # WAS 3.0, which was below a value this file already records as a
+        # collision cause: see the following-distance note in the apply pass,
+        # where 5 m produced rear-end hits at urban speeds and 8 m fixed them.
+        # A profile that ships a documented failure as its default is not a
+        # driving style, it is a bug with a name.
+        "distance_to_leading": 8.0,
         "ignore_lights": 30.0,
         "ignore_signs": 50.0,
-        "ignore_vehicles": 10.0,
         "auto_lane_change": True,
-        "random_left_lanechange": 30.0,
-        "random_right_lanechange": 30.0,
+        # No random lane changes here either, for the same reason as
+        # "assertive". What makes this profile a hazard is that it ignores
+        # lights and signs -- adding arbitrary lane changes on top does not make
+        # it more dangerous in any way a participant could interpret, it just
+        # makes it incoherent.
     },
 }
+
+
+# =========================
+# ROAD WORKS (SCENERY ONLY)
+# =========================
+#
+# SCENERY, and the word is load-bearing: none of this is in a driving lane and
+# none of it changes what any vehicle does. That is not a limitation that could
+# be tuned away, it is the only arrangement that works, so it is worth stating
+# why before someone moves a cone.
+#
+# The traffic manager cannot see props. static.prop.* actors are not vehicles or
+# walkers, so its collision avoidance does not consider them -- the same reason
+# it drives through the parked cars at the kerb (see LONG_BLUEPRINTS). Nothing
+# fixes that; there is no setting.
+#
+# So a cone in a live lane is driven over by every NPC that reaches it, in front
+# of the participant. Anchoring the closure on a parked VEHICLE, which the
+# traffic manager does see, only moves the problem: the taper is by definition
+# upstream of the thing being detected, so the cones leading in are flattened
+# before the lane change begins, and keep_right (60 baseline, 80 cautious)
+# pulls vehicles back into whatever is coned off behind it.
+#
+# On the shoulder, "the traffic manager ignores them" costs nothing, because no
+# vehicle was ever going to be there. The participant sees a work site; the
+# traffic behaves exactly as it would without one.
+#
+# THIS DOES NOT CHANGE THE DRIVING TASK. It varies what the drive looks like
+# between scenarios, nothing more. A work zone that actually closes a lane needs
+# NPCs routed around it with tm.set_path(), and needs to account for the ten
+# heavy vehicles that cannot lane-change at all and would queue behind it
+# forever.
+
+# Wide enough to hold a work site clear of the carriageway. Town10HD's driving
+# lanes are all 3.50 m and its shoulders come in at 0.5, 0.6, 2.0, 2.5 and
+# 3.5 m; this keeps only the 2.0 m and wider, which is 67 of the map's 153
+# shoulder segments -- plenty of choice, and no chance of a prop overhanging a
+# lane because the shoulder was 0.6 m wide.
+ROADWORKS_MIN_SHOULDER_M = 1.8
+
+# Sampling resolution when scanning the map for candidate sites, and the minimum
+# gap enforced between two chosen sites. The gap matters: sites are drawn from a
+# pool of adjacent waypoints, so without it a "random" choice happily returns
+# five spots along the same fifty metres of kerb.
+ROADWORKS_SCAN_STEP_M = 5.0
+ROADWORKS_MIN_SITE_SPACING_M = 80.0
+
+# How long one site is, and how far apart the props stand along it.
+ROADWORKS_SITE_LENGTH_M = 12.0
+ROADWORKS_PROP_SPACING_M = 2.0
+
+# Lifted slightly so a prop resting exactly on the surface does not z-fight with
+# the road or clip through it. Physics is disabled immediately after spawning,
+# so it stays where it is put rather than falling.
+ROADWORKS_Z_OFFSET_M = 0.05
+
+# How many sites a scenario gets, drawn per seed. Small: this is meant to be
+# something the participant passes occasionally, not a construction corridor.
+ROADWORKS_SITES_RANGE = (2, 4)
+
+# role_name stamped on every prop this script spawns, so cleanup can find its
+# own work and nothing else. Blanket-destroying static.prop.* would be the
+# obvious alternative and is not safe -- it is not this script's business to
+# remove props another tool put in the world.
+ROADWORKS_ROLE = "npc_roadworks"
+
+# The layout of one site, walked along the shoulder from its start. Ordered as
+# traffic meets it: the warning board first, then the taper of cones, then the
+# heavier furniture. Each entry is a list of candidate blueprint ids tried in
+# order, because 0.10's prop set is not guaranteed to carry every id and a
+# missing one should cost that prop, not the site.
+ROADWORKS_LAYOUT = [
+    ["static.prop.warningconstruction", "static.prop.trafficwarning"],
+    ["static.prop.constructioncone", "static.prop.trafficcone01"],
+    ["static.prop.constructioncone", "static.prop.trafficcone01"],
+    ["static.prop.trafficcone01", "static.prop.constructioncone"],
+    ["static.prop.streetbarrier", "static.prop.barrel"],
+    ["static.prop.trafficcone02", "static.prop.trafficcone01"],
+    ["static.prop.barrel", "static.prop.constructioncone"],
+]
+
+
+def _find_prop_blueprint(blueprint_library, candidates):
+    """First candidate id that exists in this build, or None."""
+    for blueprint_id in candidates:
+        try:
+            return blueprint_library.find(blueprint_id)
+        except Exception:
+            continue
+    return None
+
+
+def _shoulder_sites(carla_map, rng, count):
+    """Pick ``count`` well-separated shoulder waypoints to build sites on.
+
+    Map queries only -- generate_waypoints, get_right_lane and next are all
+    client-side against the map downloaded once at connect, so this costs no
+    RPCs and no simulation time however many candidates it walks.
+
+    The shoulder is reached from a DRIVING lane via get_right_lane() rather than
+    by asking the map for shoulder waypoints directly, because that is what
+    guarantees the site is beside a road traffic actually uses. An isolated
+    shoulder somewhere off the route would be a work site nobody ever sees.
+    """
+    candidates = []
+    for waypoint in carla_map.generate_waypoints(ROADWORKS_SCAN_STEP_M):
+        if waypoint.lane_type != carla.LaneType.Driving or waypoint.is_junction:
+            continue
+        shoulder = waypoint.get_right_lane()
+        if shoulder is None:
+            continue
+        if shoulder.lane_type != carla.LaneType.Shoulder:
+            continue
+        if shoulder.lane_width < ROADWORKS_MIN_SHOULDER_M:
+            continue
+        # Room for the whole site before the shoulder ends.
+        if not shoulder.next(ROADWORKS_SITE_LENGTH_M):
+            continue
+        candidates.append(shoulder)
+
+    if not candidates:
+        return []
+
+    rng.shuffle(candidates)
+    chosen = []
+    for shoulder in candidates:
+        location = shoulder.transform.location
+        if any(location.distance(c.transform.location) < ROADWORKS_MIN_SITE_SPACING_M
+               for c in chosen):
+            continue
+        chosen.append(shoulder)
+        if len(chosen) >= count:
+            break
+    return chosen
+
+
+def _spawn_roadworks(world, blueprint_library, carla_map, seed):
+    """Place a few shoulder work sites, varied by scenario. Returns the actors.
+
+    Seeded from its OWN Random rather than the module-level one. The fleet's
+    per-vehicle draws come off the module stream in a fixed order, so drawing
+    prop placement from it would shift every vehicle's speed and following
+    distance -- turning "scenery was added" into "the traffic changed", which is
+    exactly the confound the seeded fleet exists to remove. A separate stream
+    keeps the two independent while both stay a function of the scenario.
+    """
+    rng = random.Random(seed)
+    sites = _shoulder_sites(carla_map, rng, rng.randint(*ROADWORKS_SITES_RANGE))
+    if not sites:
+        print("[ROADWORKS] no shoulder wide enough (>= %.1f m) on this map; "
+              "no work sites placed." % ROADWORKS_MIN_SHOULDER_M)
+        return []
+
+    spawned = []
+    for site_number, shoulder in enumerate(sites, 1):
+        placed = 0
+        waypoint = shoulder
+        for candidates in ROADWORKS_LAYOUT:
+            blueprint = _find_prop_blueprint(blueprint_library, candidates)
+            if blueprint is None:
+                print("[ROADWORKS] none of %s exists in this build; skipping "
+                      "that prop." % ", ".join(candidates))
+                continue
+            if blueprint.has_attribute("role_name"):
+                blueprint.set_attribute("role_name", ROADWORKS_ROLE)
+
+            transform = waypoint.transform
+            transform.location.z += ROADWORKS_Z_OFFSET_M
+            prop = world.try_spawn_actor(blueprint, transform)
+            if prop is not None:
+                try:
+                    # Static furniture. Without this a prop is a physics body
+                    # that the participant can punt across the map, and that any
+                    # NPC clipping the kerb can scatter -- neither of which
+                    # looks like road works.
+                    prop.set_simulate_physics(False)
+                except Exception:
+                    pass
+                spawned.append(prop)
+                placed += 1
+
+            nxt = waypoint.next(ROADWORKS_PROP_SPACING_M)
+            if not nxt:
+                break
+            waypoint = nxt[0]
+
+        loc = shoulder.transform.location
+        print("[ROADWORKS] site %d: %d prop(s) on the shoulder at "
+              "(%.1f, %.1f), lane %.1f m wide."
+              % (site_number, placed, loc.x, loc.y, shoulder.lane_width))
+
+    print("[ROADWORKS] %d prop(s) across %d site(s), scenario %d. Scenery only "
+          "-- nothing is in a driving lane and no vehicle reacts to it."
+          % (len(spawned), len(sites), seed))
+    return spawned
+
+
+# PEDESTRIANS WERE TRIED HERE AND REMOVED. Two runs on this rig spawned none at
+# all, so walker support is not usable on this CARLA 0.10 build/map as it
+# stands; the experiment runs without them. Anyone re-attempting it should first
+# confirm that world.get_random_location_from_navigation() actually returns
+# points -- if it returns None the map has no pedestrian navmesh loaded and no
+# amount of spawn code will help.
 
 
 def _is_range(value):
@@ -272,9 +536,46 @@ def _baseline_profile(heavy, sync_mode):
     else:
         speed = (35.0, 55.0) if heavy else (15.0, 35.0)
     return {
+        # THE OVERTAKE. This is the obstruction-driven lane change: the traffic
+        # manager takes it when the vehicle is held up by a slower leader and an
+        # adjacent lane is clear. It is the only lane change that has a reason
+        # behind it, and it is the only one this fleet is allowed to make.
         "auto_lane_change": sync_mode and not heavy,
         "distance_to_leading": 8.0,
         "speed_difference": speed,
+        # LANE CHANGES FOR NO REASON, pinned OFF for the whole fleet.
+        #
+        # These are a probability the traffic manager evaluates continuously and
+        # independently of whether anything is actually in the way, so a vehicle
+        # with them set drifts between lanes on an empty road. No human drives
+        # like that, and in a study where the participant is judging an
+        # assistant against the scene around them, traffic that behaves
+        # arbitrarily is not neutral scenery -- it is a distraction with no
+        # experimental purpose.
+        #
+        # Pinned rather than left to CARLA's default, so a profile cannot
+        # reintroduce them by inheriting one, and so the value is visible in the
+        # fleet summary at startup instead of being whatever the API happens to
+        # start at.
+        #
+        # If a vehicle should overtake MORE, make it faster: a quicker car meets
+        # more slow leaders and overtakes more often as a consequence, which is
+        # how overtaking arises in real traffic. Rolling dice for it produces
+        # the same lane-change COUNT and none of the causation.
+        "random_left_lanechange": 0.0,
+        "random_right_lanechange": 0.0,
+        # RETURNING AFTER THE OVERTAKE, and the other half of making lane
+        # changes look purposeful. Without it a vehicle that pulls out to pass
+        # simply stays in the left lane for the rest of the route, which reads
+        # as just as odd as changing lanes at random -- and it fills the
+        # overtaking lane, so the cars behind cannot pass either.
+        #
+        # Also pinned rather than inherited: this one governs whether the fleet
+        # looks like traffic or like a queue, so it should not depend on an API
+        # default nobody has checked. 60 is a starting value, not a measured
+        # one -- it is the first thing to adjust if the fleet either camps in
+        # the left lane or snaps right the instant it finishes a pass.
+        "keep_right": 60.0,
     }
 
 
@@ -504,9 +805,13 @@ def main():
                              "--delta if it shows real headroom. Must stay <= "
                              "max_substep_delta_time * max_substeps.")
     parser.add_argument("--allow-long-vehicles", action="store_true",
-                        help="Keep the vans and trucks (sprinter, ambulance, "
-                             "firetruck, fuso, carlacola) instead of substituting "
-                             "cars for them. OFF by default because they "
+                        help="Keep the three off-tracking vehicles (firetruck, "
+                             "fuso, carlacola) instead of substituting for them. "
+                             "The sprinter and the ambulance are NOT in this set "
+                             "any more -- they were driven and did not off-track, "
+                             "so they now stay in the fleet unconditionally and "
+                             "are themselves used as substitutes. OFF by default "
+                             "because the remaining three do "
                              "off-track: the traffic manager steers a reference "
                              "point down the lane centreline without modelling "
                              "the body behind it, so on tight corners their tails "
@@ -547,6 +852,18 @@ def main():
                         help="Cap on physics substeps per tick (default 24). Only "
                              "binds when --delta is large; it is the substep SIZE "
                              "above, not this cap, that sets the cost.")
+    parser.add_argument("--roadworks", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Place a few road-works sites ON THE SHOULDER, "
+                             "varied by --traffic-seed. Scenery only: nothing "
+                             "goes in a driving lane and no vehicle reacts to "
+                             "it, because the traffic manager cannot see props "
+                             "at all (see the ROAD WORKS block at the top of "
+                             "this file for why that makes the shoulder the "
+                             "only workable placement). ON by default. "
+                             "--no-roadworks removes them, which is the control "
+                             "condition if the sites are ever suspected of "
+                             "affecting anything.")
     parser.add_argument("--traffic-seed", type=int, default=DEFAULT_TRAFFIC_SEED,
                         help="Seed for the traffic manager and for the "
                              "per-vehicle draws in VEHICLE_TM_OVERRIDES "
@@ -653,73 +970,186 @@ def main():
     VEHICLE_CONFIGS = [
         (0, "vehicle.sprinter.mercedes"),
         (5, "vehicle.ambulance.ford"),
-        (10, "vehicle.firetruck.actors"),
+        (10, "vehicle.sprinter.mercedes"),
         (15, "vehicle.lincoln.mkz"),
         (20, "vehicle.dodgecop.charger"),
         (25, "vehicle.mini.cooper"),
         (30, "vehicle.dodge.charger"),
-        (35, "vehicle.fuso.mitsubishi"),
+        (35, "vehicle.ambulance.ford"),
         (40, "vehicle.nissan.patrol"),
-        (45, "vehicle.carlacola.actors"),
+        (45, "vehicle.ambulance.ford"),
         (50, "vehicle.taxi.ford"),
+        # ---- everything below EXTENDS the fleet; the eleven above are the
+        # original one and their order must not change. ----
+        #
+        # ORDER IS THE MECHANISM for the density scenarios. A fleet of N is the
+        # FIRST N ENTRIES of this list, so the densities are NESTED: 20 cars is
+        # the 15-car fleet plus five more, not a different fleet of 20. Two
+        # things follow, and both matter:
+        #
+        #  - the per-vehicle ranges are drawn from one seeded stream in list
+        #    order, so vehicle k gets the same speed and following distance at
+        #    every fleet size. Density changes HOW MUCH traffic there is and
+        #    nothing about how any individual car drives.
+        #  - the eleven original vehicles keep their spawn points, so
+        #    VEHICLE_TM_OVERRIDES still addresses the cars it was written for,
+        #    and the study scenario (seed 42, eleven cars) stays bit-identical
+        #    to every session run so far.
+        #
+        # Inserting an entry above this line would break both.
+        #
+        # All cars, no vans or trucks. At forty vehicles the off-tracking under
+        # LONG_BLUEPRINTS stops being one vehicle clipping the parked cars and
+        # becomes a blocked road with a queue behind it.
+        #
+        # Indices step by 3 from 55, so the largest fleet needs the map to have
+        # at least 140 spawn points. If it has fewer, the shortfall warning
+        # after the spawn loop names the missing ones and prints the real count
+        # -- shrink the stride, do not drop cars.
+        #
+        # None of these carry a VEHICLE_TM_OVERRIDES entry, so they run the
+        # class baseline. Give them profiles if the larger fleets are kept.
+        (55, "vehicle.lincoln.mkz"),
+        (58, "vehicle.dodge.charger"),
+        (61, "vehicle.mini.cooper"),
+        (64, "vehicle.taxi.ford"),
+        (67, "vehicle.dodgecop.charger"),
+        (70, "vehicle.nissan.patrol"),
+        (73, "vehicle.lincoln.mkz"),
+        (76, "vehicle.dodge.charger"),
+        (79, "vehicle.mini.cooper"),
+        (82, "vehicle.taxi.ford"),
+        (85, "vehicle.dodgecop.charger"),
+        (88, "vehicle.nissan.patrol"),
+        (91, "vehicle.lincoln.mkz"),
+        (94, "vehicle.dodge.charger"),
+        (97, "vehicle.mini.cooper"),
+        (100, "vehicle.taxi.ford"),
+        (103, "vehicle.dodgecop.charger"),
+        (106, "vehicle.nissan.patrol"),
+        (109, "vehicle.lincoln.mkz"),
+        (112, "vehicle.dodge.charger"),
+        (115, "vehicle.mini.cooper"),
+        (118, "vehicle.taxi.ford"),
+        (121, "vehicle.dodgecop.charger"),
+        (124, "vehicle.nissan.patrol"),
+        (127, "vehicle.lincoln.mkz"),
+        (130, "vehicle.dodge.charger"),
+        (133, "vehicle.mini.cooper"),
+        (136, "vehicle.taxi.ford"),
+        (139, "vehicle.dodgecop.charger"),
     ]
 
     # =========================
-    # PER-VEHICLE BEHAVIOUR -- EDIT THIS TABLE
+    # SCENARIO DENSITY
     # =========================
     #
-    # Keyed by SPAWN POINT INDEX, the left column of VEHICLE_CONFIGS above, and
-    # not by blueprint id. Two reasons, both of which have bitten:
-    #   - the same blueprint appears more than once in a fleet, so a blueprint
-    #     key cannot address one vehicle;
-    #   - --allow-long-vehicles is off by default, which SUBSTITUTES a car for
-    #     each long vehicle. The blueprint at a given spawn point therefore
-    #     changes with a command-line flag, while the spawn point does not.
+    # How many of VEHICLE_CONFIGS each scenario spawns. This is what makes the
+    # seed identify a WHOLE SCENARIO rather than just an RNG stream: one number
+    # fixes both how much traffic there is and how it behaves, so a session is
+    # described completely by the value already on every raw_data.jsonl frame,
+    # with nothing else to join against.
     #
-    # Each entry is a partial dict layered on top of the class-based baseline
-    # (heavy/car x sync/async), so state only what should differ. Either form
-    # works and they can be combined -- the named profile is applied first, then
-    # the explicit knobs on top of it:
+    # 42 IS PINNED AT 11 AND MUST STAY THERE. It is the calibration/adaptation
+    # condition; those participants are compared against each other, and it has
+    # run at eleven vehicles for every session so far. Leaving it out of this
+    # table would have silently promoted the study arm to forty cars the moment
+    # the list grew, changing a fixed condition mid-study without a single line
+    # of output saying so.
     #
-    #     20: {"profile": "cautious"},
-    #     25: {"profile": "assertive", "distance_to_leading": 4.0},
-    #     30: {"speed_difference": (-5.0, 5.0), "lane_offset": 0.3},
+    # THE DENSITIES ARE ORDERED, which changes what the five collection
+    # scenarios are: not five interchangeable draws but a dose series from 15 to
+    # 40 vehicles. That suits a population model that cannot see traffic --
+    # congestion is a main determinant of the labels and the model has to be
+    # robust to it unseen -- and the counterbalancing in start_experiment.py's
+    # TRAFFIC_SEED_PLAN survives unchanged, because relabelling seeds does not
+    # disturb it: each density is still driven four times, twice as a first run
+    # and twice as a second, and every pair of densities occurs exactly once.
     #
-    # Profiles: see DRIVING_PROFILES at the top of the file -- cautious,
-    # assertive, lane_bias, reckless. Individual knobs: see TM_KNOBS, next to it,
-    # which also documents the units and the two sign traps.
+    # CHECK BEFORE USING THIS FOR REAL: that all five sizes hold the same
+    # simulated-time rate, which the [SYNC] line reports every 30 s. "It spawns
+    # fine" is not the same measurement as "it runs at real time". If 40 cars
+    # runs at 0.5x and 15 at 0.85x, the amount of driving inside each 20 s label
+    # window varies with the scenario -- an artefact perfectly correlated with
+    # the manipulation, and one that also moves ProVoice's achieved frame rate,
+    # which xlstm_model.py already identifies as a leakage channel.
+    SCENARIO_FLEET_SIZE = {
+        42: 11,   # study: calibration and adaptation. Do not change.
+        11: 40,
+        22: 30,
+        33: 25,
+        44: 20,
+        55: 15,
+    }
+
+    # THE ASSIGNMENT: the 30 cars split evenly three ways -- 10 baseline, 10
+    # cautious, 10 assertive -- cycled through the list in spawn order so the
+    # three kinds are mixed along the route rather than grouped into stretches
+    # of one behaviour.
     #
-    # A two-element (low, high) range means "draw once from the seeded RNG",
-    # which is how the baseline speeds already work.
+    # THE 10 HEAVY VEHICLES GET NOTHING, and that is deliberate rather than an
+    # omission. "assertive" sets auto_lane_change True, which on a heavy
+    # blueprint overrides the baseline's refusal and re-enters finding (3) in
+    # the apply pass: van- and truck-sized vehicles sideswiping into the next
+    # lane, blocking the road, the rest of the fleet piling in. They are also
+    # the vehicles whose corner entry speed the lateral controller gets wrong,
+    # which is what the baseline's larger speed penalty is for. Both properties
+    # are exactly what a profile written for cars would overwrite.
     #
-    # Empty by default: with no entries the fleet behaves exactly as it did
-    # before this table existed, so turning it on is a deliberate act rather
-    # than something a merge can do quietly.
+    # Belt and braces: _resolve_profile's caller now forces auto_lane_change off
+    # for heavy blueprints whatever a profile says, and prints when it does. So
+    # a profile landing on a heavy vehicle is survivable rather than a wreck --
+    # this table just avoids relying on that.
     #
-    # WHAT NOT TO DO, given what this rig is for. The fleet is meant to be
-    # identical for every participant -- that is what the seed and the fixed
-    # time step buy (see --sync). So treat this table as part of the STUDY
-    # DESIGN, not as scenery: fix it before the first participant and change it
-    # only between conditions, never between runs of the same condition. The
-    # ignore_* knobs and the "reckless" profile additionally create real
-    # collision risk for the participant's own car, which is a different and
-    # larger decision than making the traffic look more varied.
+    # THE COMMENTS ARE THE POINT for the baseline entries. A spawn point absent
+    # from this dict looks identical to one nobody has thought about, so every
+    # vehicle in the fleet is listed either as an entry or as a comment saying
+    # which class it is in.
+    #
+    # NOT ASSIGNED: "lane_bias" and "reckless". lane_bias was here on two
+    # vehicles and is dropped by this three-way split -- add it back on a car if
+    # the lateral variation is still wanted. reckless remains unassigned.
     VEHICLE_TM_OVERRIDES = {
-        0:  {"profile": "cautious"},
-        5: {"profile": "assertive"},
-        #10: {"profile": "assertive"},
-        15: {"profile": "cautious"},
-        20: {"profile": "assertive"},
-        25: {"profile": "lane_bias"},
-        30: {"profile": "cautious"},
-        35: {"profile": "assertive"},
-        # sp40 is the nissan.patrol -- the widest vehicle left in the fleet once
-        # the long ones are substituted, so it has the least lane margin to give
-        # away. It is the one to watch first on the kerbside of a tight corner,
-        # and the first candidate to drop back to no offset if anything touches.
-        40: {"profile": "assertive"},
-        #45: {"profile": "lane_bias"},
-        50: {"profile": "lane_bias"},
+        # sp0   sprinter.mercedes      HEAVY -- baseline only, see note above
+        # sp5   ambulance.ford         HEAVY -- baseline only, see note above
+        # sp10  sprinter.mercedes      HEAVY -- baseline only, see note above
+        # sp15  lincoln.mkz            baseline
+        20:   {"profile": "cautious"},   # dodgecop.charger
+        25:   {"profile": "assertive"},  # mini.cooper
+        # sp30  dodge.charger          baseline
+        # sp35  ambulance.ford         HEAVY -- baseline only, see note above
+        # sp40  nissan.patrol          HEAVY -- baseline only, see note above
+        # sp45  ambulance.ford         HEAVY -- baseline only, see note above
+        50:   {"profile": "cautious"},   # taxi.ford
+        55:   {"profile": "lane_bias"},  # lincoln.mkz
+        # sp58  dodge.charger          baseline
+        61:   {"profile": "cautious"},   # mini.cooper
+        64:   {"profile": "assertive"},  # taxi.ford
+        # sp67  dodgecop.charger       baseline
+        # sp70  nissan.patrol          HEAVY -- baseline only, see note above
+        73:   {"profile": "cautious"},   # lincoln.mkz
+        76:   {"profile": "assertive"},  # dodge.charger
+        # sp79  mini.cooper            baseline
+        82:   {"profile": "lane_bias"},   # taxi.ford
+        85:   {"profile": "assertive"},  # dodgecop.charger
+        # sp88  nissan.patrol          HEAVY -- baseline only, see note above
+        # sp91  lincoln.mkz            baseline
+        94:   {"profile": "lane_bias"},   # dodge.charger
+        97:   {"profile": "assertive"},  # mini.cooper
+        # sp100 taxi.ford              baseline
+        103:  {"profile": "cautious"},   # dodgecop.charger
+        # sp106 nissan.patrol          HEAVY -- baseline only, see note above
+        109:  {"profile": "assertive"},  # lincoln.mkz
+        # sp112 dodge.charger          baseline
+        115:  {"profile": "cautious"},   # mini.cooper
+        118:  {"profile": "assertive"},  # taxi.ford
+        # sp121 dodgecop.charger       baseline
+        # sp124 nissan.patrol          HEAVY -- baseline only, see note above
+        127:  {"profile": "cautious"},   # lincoln.mkz
+        130:  {"profile": "assertive"},  # dodge.charger
+        # sp133 mini.cooper            baseline
+        136:  {"profile": "cautious"},   # taxi.ford
+        139:  {"profile": "lane_bias"},  # dodgecop.charger
     }
 
     # Fails here, before the CARLA connection below, for the same reason the
@@ -731,7 +1161,7 @@ def main():
     # Vans, trucks and the big SUV. The traffic manager's lateral controller is
     # tuned for a sedan-sized vehicle: it picks a corner entry speed from the
     # road geometry, not from the mass and centre-of-gravity height of the thing
-    # it is steering. Five of the eleven blueprints above are heavy and tall, and
+    # it is steering. Six of the blueprints above are heavy and tall, and
     # they are the ones that understeer wide, catch a kerb and then drift. They
     # get a much larger speed penalty below rather than being removed, because
     # the mix of vehicle types is part of the scene the participant is driving in.
@@ -764,20 +1194,49 @@ def main():
     # So the only real remedy is not to run vehicles the map cannot accommodate.
     # nissan.patrol stays: it is tall and heavy (hence HEAVY above, for the speed
     # penalty) but it is car-length, so it does not off-track.
+    # NARROWED after live observation. The sprinter and the ambulance were in
+    # this set on the original reasoning that a long body off-tracks, but they
+    # were then driven and did not: neither collected the parked cars on the
+    # tight corners that the firetruck, the fuso and the carlacola do. They are
+    # long, but evidently not long enough for this map's geometry.
+    #
+    # So they are no longer substituted away -- they stay in the fleet as
+    # themselves, and they are available as substitutes for the three that are
+    # genuinely too big (see SUBSTITUTE_VEHICLES below).
+    #
+    # They remain in HEAVY_BLUEPRINTS. That is a separate property and the
+    # reason for it is unchanged: they are tall and heavy, the lateral
+    # controller picks a corner entry speed from road geometry without
+    # consulting mass, so they keep the larger speed penalty and stay out of
+    # lane changes.
     LONG_BLUEPRINTS = {
-        "vehicle.sprinter.mercedes",
-        "vehicle.ambulance.ford",
         "vehicle.firetruck.actors",
         "vehicle.fuso.mitsubishi",
         "vehicle.carlacola.actors",
     }
 
     # Long vehicles are SUBSTITUTED rather than dropped, so the fleet stays at
-    # eleven cars on the same eleven spawn points. Traffic density is part of the
+    # the same size on the same spawn points. Traffic density is part of the
     # scene the participant drives in and part of what they are judging the
     # assistant against, so it must not quietly change as a side effect of a
     # stability fix.
-    SUBSTITUTE_CARS = [
+    #
+    # THE SPRINTER AND THE AMBULANCE ARE SUBSTITUTES NOW, not just cars. The
+    # original list was all sedans, which meant every stability substitution
+    # also made the fleet smaller-looking: a firetruck became a Mini and the
+    # scene lost a large vehicle. Both of these were driven and did not
+    # off-track (see LONG_BLUEPRINTS), so they put the size back without putting
+    # the failure back.
+    #
+    # They are first in the list because the substitution walks it in order, so
+    # the earliest swaps -- and on the current config that is all of them --
+    # become large vehicles rather than sedans.
+    #
+    # Renamed from SUBSTITUTE_CARS: two entries are not cars, and a name that
+    # says otherwise is the kind of thing that gets trusted at a glance.
+    SUBSTITUTE_VEHICLES = [
+        "vehicle.sprinter.mercedes",
+        "vehicle.ambulance.ford",
         "vehicle.lincoln.mkz",
         "vehicle.dodge.charger",
         "vehicle.mini.cooper",
@@ -880,9 +1339,10 @@ def main():
     # and exactly the kind of actor-state churn that is faulting.
     #
     # Why turning it off is nearly free: it exists to make fleets of HUNDREDS of
-    # vehicles affordable. This script spawns 11 (VEHICLE_CONFIGS has 11 entries;
-    # the NUM_VEHICLES = 50 above is dead -- the spawn loop never reads it). Full
-    # physics on 11 cars costs almost nothing, so this trades a feature we do not
+    # vehicles affordable. This script spawns what VEHICLE_CONFIGS lists -- 15 at
+    # the time of writing, raised from 11 to measure headroom (the NUM_VEHICLES =
+    # 50 above is dead; the spawn loop never reads it). Full physics on a fleet
+    # this size costs little, so this trades a feature we do not
     # need for the removal of the most complex thing the traffic manager does.
     #
     # Evidence this is the right area: freezing the traffic manager entirely
@@ -923,6 +1383,21 @@ def main():
         except:
             pass
 
+    # Work sites from a previous run of THIS script, and only those. Matched on
+    # the role_name stamped at spawn rather than by filtering static.prop.*,
+    # because that filter would also catch props another tool put in the world
+    # and removing those is not this script's business.
+    old_props = [p for p in actors.filter('static.prop.*')
+                 if p.attributes.get('role_name') == ROADWORKS_ROLE]
+    for prop in old_props:
+        try:
+            prop.destroy()
+        except:
+            pass
+    if old_props:
+        print("Destroyed %d road-works prop(s) left by a previous run."
+              % len(old_props))
+
     # Ticks under --sync, sleeps otherwise -- see _advance_world. A bare sleep
     # here is what left a wrecked car on the start line.
     _advance_world(world, SETTLE_S, SYNC_MODE, FIXED_DELTA_SECONDS)
@@ -933,7 +1408,16 @@ def main():
 
     blueprint_library = world.get_blueprint_library()
 
-    spawn_points = world.get_map().get_spawn_points()
+    carla_map = world.get_map()
+    spawn_points = carla_map.get_spawn_points()
+
+    # Scenery, placed BEFORE the fleet so a prop can never land on a car that is
+    # already there -- try_spawn_actor would refuse it and the site would come
+    # out short for a reason nothing records. Nothing about it interacts with
+    # the traffic, so the ordering costs nothing else.
+    props_list = []
+    if args.roadworks:
+        props_list = _spawn_roadworks(world, blueprint_library, carla_map, SEED)
 
     vehicles_list = []
     # (actor, spawn_index, blueprint_id, resolved_profile) for the second pass.
@@ -947,12 +1431,14 @@ def main():
         swapped = []
         for i, (spawn_index, blueprint_id) in enumerate(wanted):
             if blueprint_id in LONG_BLUEPRINTS:
-                replacement = SUBSTITUTE_CARS[len(swapped) % len(SUBSTITUTE_CARS)]
+                replacement = SUBSTITUTE_VEHICLES[
+                    len(swapped) % len(SUBSTITUTE_VEHICLES)]
                 wanted[i] = (spawn_index, replacement)
                 swapped.append((blueprint_id, replacement))
         if swapped:
-            print("Substituting %d long vehicle(s) that off-track into parked "
-                  "cars (--allow-long-vehicles to keep them):" % len(swapped))
+            print("Substituting %d off-tracking vehicle(s) that sweep through "
+                  "the parked cars (--allow-long-vehicles to keep them):"
+                  % len(swapped))
             for old, new in swapped:
                 print(f"  {old} -> {new}")
 
@@ -992,15 +1478,47 @@ def main():
             % (len(conflicts),
                "\n  ".join("spawn point %d: %s" % c for c in conflicts)))
 
+    # FLEET SIZE. Two mechanisms with deliberately different semantics, because
+    # they answer different questions:
+    #
+    #   scenario density  a PREFIX. "How much traffic does this scenario have."
+    #                     Nested, so vehicle k is the same car with the same
+    #                     drawn behaviour at every size and only the amount of
+    #                     traffic changes -- which is what makes density a clean
+    #                     manipulation rather than a wholesale different fleet.
+    #   --num-vehicles    EVENLY SPACED. "Does the rig slow down with fewer
+    #                     cars." A prefix would be wrong here: the list starts
+    #                     with the biggest vehicles, so --num-vehicles 3 would
+    #                     hand back three trucks, which is not a representative
+    #                     sample of the load being measured.
+    #
+    # --num-vehicles wins when both apply, since it is the diagnostic and the
+    # operator typed it on purpose.
     if args.num_vehicles and args.num_vehicles < len(wanted):
-        # Evenly spaced, NOT the first N. The list is ordered with the biggest
-        # vehicles first, so a prefix would hand back a fleet of nothing but
-        # trucks -- the opposite of a representative sample, and useless for the
-        # physics-load comparison --num-vehicles exists to support.
         step = len(wanted) / float(args.num_vehicles)
         wanted = [wanted[int(i * step)] for i in range(args.num_vehicles)]
         print("Spawning only %d of %d configured NPCs, evenly spaced "
-              "(--num-vehicles)." % (len(wanted), len(VEHICLE_CONFIGS)))
+              "(--num-vehicles overrides this scenario's density)."
+              % (len(wanted), len(VEHICLE_CONFIGS)))
+    elif SEED in SCENARIO_FLEET_SIZE:
+        size = SCENARIO_FLEET_SIZE[SEED]
+        if size > len(wanted):
+            raise SystemExit(
+                "Scenario %d asks for %d vehicles but VEHICLE_CONFIGS only "
+                "lists %d. Add entries to the end of the list -- never in the "
+                "middle, which would shift every seeded draw after the "
+                "insertion point and change how the existing cars drive."
+                % (SEED, size, len(wanted)))
+        wanted = wanted[:size]
+        print("Scenario %d: %d vehicles." % (SEED, len(wanted)))
+    else:
+        # An unlisted seed is a tuning run, not one of the study's scenarios.
+        # Said out loud because the density is then whatever the list happens to
+        # be long enough for, which is not a property anyone chose.
+        print("[WARN] seed %d has no SCENARIO_FLEET_SIZE entry, so all %d "
+              "configured NPCs will spawn. Fine for tuning; a session whose "
+              "data is kept should use a scenario from the table."
+              % (SEED, len(wanted)))
 
     # =========================
     # RESOLVE PER-VEHICLE BEHAVIOUR
@@ -1021,12 +1539,46 @@ def main():
     # configuration alone. The blueprint is read after the long-vehicle
     # substitution above, so the heavy/car baseline follows the vehicle that
     # will really be there.
-    fleet = [
-        (spawn_index, blueprint_id,
-         _resolve_profile(blueprint_id in HEAVY_BLUEPRINTS, SYNC_MODE,
-                          VEHICLE_TM_OVERRIDES.get(spawn_index, {})))
-        for spawn_index, blueprint_id in wanted
-    ]
+    fleet = []
+    forced = []
+    for spawn_index, blueprint_id in wanted:
+        heavy = blueprint_id in HEAVY_BLUEPRINTS
+        profile = _resolve_profile(heavy, SYNC_MODE,
+                                   VEHICLE_TM_OVERRIDES.get(spawn_index, {}))
+
+        # THE CLASSIFICATION WINS OVER THE PROFILE, for this one knob.
+        #
+        # VEHICLE_TM_OVERRIDES is keyed by spawn point, but the BLUEPRINT at a
+        # spawn point is not fixed: --allow-long-vehicles decides whether an
+        # off-tracking vehicle is substituted, so a profile written for the car
+        # that is normally there can land on a van instead. That is not
+        # hypothetical -- it happened twice, and the second time was after the
+        # first had been fixed by hand, which is what made a per-entry fix
+        # obviously insufficient.
+        #
+        # What it costs when it lands is not a slightly wrong driving style: a
+        # heavy vehicle changing lanes is finding (3) in the apply pass, the one
+        # that ends with the road blocked and the fleet piled into the wreck.
+        # Physical class is a property of the vehicle and a profile is a
+        # preference about it, so the class wins.
+        #
+        # Announced rather than silent. A setting that disappears without a word
+        # is how someone spends an afternoon wondering why "assertive" does
+        # nothing.
+        if heavy and profile.get("auto_lane_change"):
+            profile["auto_lane_change"] = False
+            forced.append((spawn_index, blueprint_id))
+
+        fleet.append((spawn_index, blueprint_id, profile))
+
+    if forced:
+        print("Lane changes forced OFF on %d heavy vehicle(s) whose profile "
+              "asked for them:" % len(forced))
+        for spawn_index, blueprint_id in forced:
+            print("  spawn point %d: %s" % (spawn_index, blueprint_id))
+        print("  (heavy vehicles sideswipe when they change lanes -- see the "
+              "lane-change findings in the apply pass. Move the profile to a "
+              "car if the behaviour was wanted.)")
 
     print("Spawning fixed NPC vehicles...")
 
@@ -1068,6 +1620,29 @@ def main():
 
         except Exception as e:
             print(e)
+
+    # A SHORT FLEET IS A LOUD FAILURE, because the two ways it happens are both
+    # silent and both invalidate whatever the run was for.
+    #
+    # try_spawn_actor returns None when a spawn point is occupied -- by leftover
+    # traffic, or by a participant parked on one -- and a spawn index past the
+    # end of the map's list is skipped with a one-line note that scrolls past.
+    # Either way the run continues with fewer cars than configured. For a
+    # capacity measurement that is the worst possible outcome: the number being
+    # measured IS the fleet size, so a quiet shortfall reads as headroom the rig
+    # does not have.
+    if len(spawned) != len(fleet):
+        print("[WARN] %d of %d configured NPCs spawned. Missing spawn point(s): %s."
+              % (len(spawned), len(fleet),
+                 ", ".join(str(i) for i in
+                           sorted(set(i for i, _, _ in fleet)
+                                  - set(i for _, i, _, _ in spawned)))))
+        print("[WARN]   The map has %d spawn points, so indices at or above "
+              "that are unusable. Anything below it was occupied at spawn time "
+              "-- destroy leftover traffic and re-run."
+              % len(spawn_points))
+        print("[WARN]   Do NOT read a capacity or sim-speed number off this "
+              "run: the fleet is not the size it is being compared at.")
 
     # Let the fleet drop, settle on its suspension and come to rest BEFORE the
     # traffic manager touches it.
@@ -1114,6 +1689,16 @@ def main():
     #
     # (2) is also the trap in the "cautious" profile, and (3) the trap in setting
     # auto_lane_change True on a heavy vehicle by hand.
+    #
+    # A FOURTH finding, from a live drive after the per-vehicle profiles went in:
+    # the lane changes read as unnatural, and the cause was not this setting but
+    # random_left/right_lanechange, which two profiles were setting at 15-30%.
+    # Those are unconditional -- evaluated whether or not anything is ahead -- so
+    # the fleet changed lanes on empty road as readily as it overtook, and no
+    # amount of tuning auto_lane_change could have fixed it. They are now pinned
+    # to 0 for the whole fleet in _baseline_profile, and the fleet's only
+    # remaining reason to leave its lane is a slower vehicle in front of it,
+    # plus keep_right bringing it back afterwards.
     #
     # FOLLOWING DISTANCE: 8 m, independent of the time step. 5 m is under a 0.4 s
     # headway at urban speeds, where real following distances are 1-2 s, so any
@@ -1471,6 +2056,19 @@ def main():
                 vehicle.destroy()
             except:
                 pass
+
+        # Props outlive the process just as vehicles did before this block
+        # existed, and a CARLA world outlives the run -- so without this every
+        # session would leave its work sites behind and the next one would drive
+        # past all of them. The startup sweep above is the backstop for a run
+        # that dies before reaching here, not a substitute for it.
+        if props_list:
+            print("Cleaning up %d road-works prop(s)..." % len(props_list))
+            for prop in props_list:
+                try:
+                    prop.destroy()
+                except:
+                    pass
 
         print("Done.")
 
