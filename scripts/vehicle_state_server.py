@@ -468,6 +468,14 @@ def main() -> None:
                              "/session so ProVoice learns where to post its "
                              "started/ended signals. One address is typed on the "
                              "ProVoice machine, not two.")
+    parser.add_argument("--traffic-seed", dest="traffic_seed", type=int,
+                        default=None,
+                        help="Traffic scenario this session is running, published "
+                             "at /session so the ProVoice on the other machine "
+                             "records it without anyone retyping it. Same "
+                             "reasoning as --session-id: the value exists only on "
+                             "this machine, and it is the only thing that "
+                             "identifies which traffic produced a session's data.")
     parser.add_argument("--connect-timeout", type=float, default=60.0,
                         help="How long to wait for vehicle_id.txt when --vehicle-id "
                              "is not given.")
@@ -501,6 +509,9 @@ def main() -> None:
         "session_id": args.session_id or None,
         "participantid": args.participantid or None,
         "status_url": args.status_url or None,
+        # Not `or None`: 0 is a valid seed and would be erased by the idiom the
+        # three strings above use.
+        "traffic_seed": args.traffic_seed,
     }
 
     httpd = BridgeServer((args.bind, args.port), Handler, sampler, stats, session)
@@ -513,10 +524,13 @@ def main() -> None:
     print(f"[httpbridge] serving on http://{args.bind}:{args.port}/ "
           f"(HTTP/1.1 keep-alive, sampling CARLA at {args.hz:.1f} Hz)", flush=True)
     print(f"[httpbridge] endpoints: / (state), /health, /session", flush=True)
-    if any(session.values()):
+    # `is not None` rather than any(): a run whose only published field is
+    # traffic_seed=0 has something to say, and any() would call it empty.
+    if any(v is not None for v in session.values()):
         print(f"[httpbridge] /session publishes session_id={session['session_id']} "
               f"participantid={session['participantid']} "
-              f"status_url={session['status_url']}", flush=True)
+              f"status_url={session['status_url']} "
+              f"traffic_seed={session['traffic_seed']}", flush=True)
     else:
         print("[httpbridge] /session has nothing to publish (no --session-id / "
               "--participantid given); the ProVoice end will fall back to its own "

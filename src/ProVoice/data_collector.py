@@ -190,6 +190,7 @@ class DataCollector:
         decision_hz: float = 4.0,
         calibration_only: bool = False,
         data_collection: bool = False,
+        traffic_seed: Optional[int] = None,
     ) -> None:
         # Everything stop()/__del__ touches is set FIRST, so a constructor
         # that fails part-way still leaves a safely destructible object.
@@ -310,6 +311,22 @@ class DataCollector:
         self._cached_fog_light: bool = False
         self._cached_left_indicator: bool = False
         self._cached_right_indicator: bool = False
+        # None rather than 0, unlike every cached field above. These two are
+        # computed by the bridge (scripts/vehicle_state_file_bridge.py:
+        # lead_and_headway) and None is a real reading -- no leader within
+        # range, or a headway that is undefined because the ego is stopped.
+        # Zero would say the opposite of both: bumper to bumper, closing now.
+        self._cached_lead_distance: Optional[float] = None
+        self._cached_headway_s: Optional[float] = None
+        self._warned_no_headway: bool = False
+
+        # Which traffic scenario this session ran. Set by the launcher, or read
+        # off the bridge's /session under --remote; None means nobody told this
+        # process, which is a real state and is logged as null rather than
+        # guessed at. Do NOT default it to 42 here: a wrong seed recorded
+        # confidently is worse than an absent one, because only the absent one
+        # is visible as a problem later.
+        self.traffic_seed: Optional[int] = traffic_seed
 
         # If a CARLA actor is present, attempt to retrieve the vehicle_id
         self.vehicle_id = None
@@ -1514,6 +1531,10 @@ class DataCollector:
         throttle = gear = hand_brake = reverse = acceleration = None
         fog_density = traffic_light_state = None
         headlight = fog_light = left_indicator = right_indicator = None
+        # Bridge-only, so None here covers the direct-CARLA path and the
+        # no-CARLA fallback; the bridge branch below overwrites both. See the
+        # warning in the direct path for why it is not computed there.
+        lead_distance_m = headway_s = None
 
         if self.carla_vehicle is not None:
             
@@ -1592,6 +1613,30 @@ class DataCollector:
                 self._cached_reverse = reverse
                 self._cached_acceleration = acceleration
                 self._cached_fog_density = fog_density
+
+                # Headway is NOT computed on this path, and the gap is loud
+                # rather than silent because a null column looks like "the road
+                # was clear for the whole session" instead of "this was never
+                # measured".
+                #
+                # It lives in the bridge (vehicle_state_file_bridge.py:
+                # lead_and_headway) because that is where the ONE definition of
+                # the record lives -- the same reason collect() is shared
+                # between the file and HTTP bridges. Reimplementing it here
+                # would give the same column two definitions that could drift.
+                # This path is also the one that "reliably corrupts its heap"
+                # (see --vehicle-bridge in start_experiment.py), so it is not
+                # the path a data-collection run should be on: adding a
+                # per-frame world snapshot and lane walk to it would be adding
+                # CARLA traffic to the process that must not hold a CARLA
+                # client.
+                if not self._warned_no_headway:
+                    self._warned_no_headway = True
+                    print("[DataCollector] WARNING: reading CARLA directly, so "
+                          "lead_distance_m and headway_s will be null for this "
+                          "whole session. Use --vehicle-bridge for any run "
+                          "whose data will be kept.")
+
                 if traffic_light_state is not None:
                     self._cached_traffic_light_state = traffic_light_state
                 if headlight is not None:
@@ -1641,6 +1686,8 @@ class DataCollector:
             fog_light = self._cached_fog_light
             left_indicator = self._cached_left_indicator
             right_indicator = self._cached_right_indicator
+            lead_distance_m = self._cached_lead_distance
+            headway_s = self._cached_headway_s
 
         else:
             # No CARLA actor or bridge — minimal env-var fallback.
@@ -1674,6 +1721,17 @@ class DataCollector:
         data['fog_light']           = fog_light
         data['left_indicator']      = left_indicator
         data['right_indicator']     = right_indicator
+        # Traffic context. null means "no vehicle ahead in this lane within
+        # 100 m" for the distance, and additionally "ego below walking pace" for
+        # the headway -- neither is a missing value to be imputed, and neither
+        # should be filled with 0 (a 0 s headway is a collision).
+        data['lead_distance_m']     = lead_distance_m
+        data['headway_s']           = headway_s
+        # Static for the session, repeated per frame so a raw_data.jsonl line is
+        # self-describing: which traffic scenario produced it is not recoverable
+        # from any other field, and joining to a separate manifest is one more
+        # thing that can be lost between the two machines.
+        data['traffic_seed']        = self.traffic_seed
 
     def collect_data(self) -> Tuple[Dict[str, Any], bool]:
         """Collect one multimodal frame.
@@ -2486,7 +2544,20 @@ class DataCollector:
                 self._cached_headlight           = bool(state.get("headlight", self._cached_headlight))
                 self._cached_fog_light           = bool(state.get("fog_light", self._cached_fog_light))
                 self._cached_left_indicator      = bool(state.get("left_indicator", self._cached_left_indicator))
-                self._cached_right_indicator     = bool(state.get("right_indicator", self._cached_right_indicator))
+                # NOT coerced, and NOT defaulted to the last value like the
+                # fields above. None is a meaningful reading here -- "no vehicle
+                # ahead in my lane" -- so it has to survive as None rather than
+                # be replaced by the last real gap, which would leave a stale
+                # leader in the data for the rest of the drive after the road
+                # cleared. float(None) would also raise, taking the whole poll
+                # with it. .get(key, cached) cannot express this: the key is
+                # PRESENT and its value is null.
+                if "lead_distance_m" in state:
+                    v = state["lead_distance_m"]
+                    self._cached_lead_distance = float(v) if v is not None else None
+                if "headway_s" in state:
+                    v = state["headway_s"]
+                    self._cached_headway_s = float(v) if v is not None else None
                 if _fail_streak:
                     print(f"[DataCollector] Vehicle-state bridge back after "
                           f"{_fail_streak} failed poll(s) "

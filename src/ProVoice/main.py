@@ -244,6 +244,14 @@ def _build_parser() -> ap.ArgumentParser:
                    help="classic | xlstm")
     p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.7)
     p.add_argument("--session-id", dest="session_id", default=None)
+    p.add_argument("--traffic-seed", dest="traffic_seed", type=int, default=None,
+                   help="Traffic scenario this session is running, recorded on "
+                        "every raw_data.jsonl frame. Set by start_experiment.py "
+                        "on a local run; under --remote the CARLA machine "
+                        "publishes it at the bridge's /session and this is left "
+                        "unset. Unset is logged as null -- nothing else in the "
+                        "data identifies the scenario, so a null column means "
+                        "that session cannot be split out by traffic later.")
     p.add_argument("--window", type=int, default=400,
                    help="Frame-count cap on the model input window (safety bound).")
     p.add_argument("--window-seconds", dest="window_seconds", type=float, default=None,
@@ -369,6 +377,20 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
     return None
 
 
+def _as_int(value) -> "int | None":
+    """int(value), or None for anything that is not one.
+
+    Separate from the `or None` normalisation used for the id strings because
+    0 is a legitimate seed and `0 or None` is None.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_bridge_session(url: str, timeout: float = 10.0,
                          request_timeout: float = 3.0) -> dict | None:
     """Wait up to ``timeout`` for {session_id, participantid} from /session.
@@ -418,6 +440,14 @@ def fetch_bridge_session(url: str, timeout: float = 10.0,
                 "session_id": (info.get("session_id") or None),
                 "participantid": (info.get("participantid") or None),
                 "status_url": (info.get("status_url") or None),
+                # Which traffic scenario the CARLA machine is running. Same
+                # channel and same reason as the ids: the value exists only on
+                # that machine, and a human retyping it into this terminal is
+                # the failure mode /session was added to remove. NOT part of
+                # the readiness test below -- a bridge that knows both ids is
+                # ready even if it predates this field, and blocking on it
+                # would turn an older bridge into a startup hang.
+                "traffic_seed": _as_int(info.get("traffic_seed")),
             }
             if last_info["session_id"] and last_info["participantid"]:
                 return last_info
@@ -618,6 +648,42 @@ def resolve_session_identity(session_id_local: str | None,
     return resolved[0], resolved[1]
 
 
+def resolve_traffic_seed(local: "int | None",
+                         bridge: dict | None) -> "int | None":
+    """Same reconciliation as the ids above, for the traffic scenario.
+
+    Kept separate rather than folded into resolve_session_identity because the
+    seed is an int (0 is a valid value, so the `or None` idiom there is wrong
+    for it) and because a missing seed is survivable where a missing session id
+    is not -- this returns None and lets the run continue with a null column,
+    while a disagreement still stops the session.
+
+    A DISAGREEMENT is fatal for the same reason an id mismatch is: the two
+    machines would be describing the same session differently, and the copy
+    that lands in raw_data.jsonl is the one used to split the corpus by
+    scenario. Training on a mislabelled scenario is not recoverable and not
+    detectable after the fact.
+    """
+    remote = (bridge or {}).get("traffic_seed")
+    if remote is not None and local is not None and remote != local:
+        raise SystemExit(
+            f"[FATAL] traffic_seed mismatch: this command line says {local}, the "
+            f"vehicle-state bridge says {remote}. The CARLA machine is the one "
+            f"actually running the traffic, so its value is the true one -- drop "
+            f"--traffic-seed from this command line and let the bridge supply it.")
+    if remote is not None and local is None:
+        print(f"[bridge] adopting traffic_seed={remote} from the bridge.")
+        return remote
+    if remote is not None and local is not None:
+        print(f"[bridge] traffic_seed={local} confirmed by the bridge.")
+        return local
+    if local is None:
+        print("[bridge] no traffic_seed from the bridge or the command line; "
+              "raw_data.jsonl will record it as null. Nothing else identifies "
+              "which traffic scenario this session ran.")
+    return local
+
+
 def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 2000, timeout: float = 2.0, retries: int = 5):
     """
     Connect to CARLA and return the actor (or None).
@@ -676,6 +742,10 @@ def main():
     # invented until the bridge has had its say, or the adoption below could
     # never happen.
     session_id = args.session_id or os.getenv("PV_SESSION_ID") or None
+    # Not `or None`: 0 is a valid seed. Stays None when unset so the bridge can
+    # supply it below and, failing that, so the null in raw_data.jsonl is honest
+    # about nobody having said which scenario ran.
+    traffic_seed = args.traffic_seed
     window_sz = args.window  # frame-count cap on the model input (safety bound)
     # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
     # window the checkpoint was trained with (falling back to 20 s for legacy
@@ -702,6 +772,7 @@ def main():
                                       timeout=args.bridge_session_timeout)
         session_id, participantid = resolve_session_identity(
             session_id, participantid, bridge)
+        traffic_seed = resolve_traffic_seed(traffic_seed, bridge)
         # The reverse channel is an ADDRESS, not an identity: two spellings of
         # the same endpoint are not a session mismatch, so this adopts rather
         # than reconciling. An explicit --status-url still wins, which is what
@@ -981,6 +1052,7 @@ def main():
         decision_hz=args.decision_hz,
         calibration_only=args.calibration_only,
         data_collection=args.data_collection,
+        traffic_seed=traffic_seed,
     )
 
     dashboard.data_collector = data_collector

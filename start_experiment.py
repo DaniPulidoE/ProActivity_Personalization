@@ -50,7 +50,7 @@ EXPERIMENT SETUP (remote):
     CARLA MACHINE:    uv run python start_experiment.py --experiment-calibration-carla-remote --participantid <participantid>
     PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote
 4. Data collection:
-    CARLA MACHINE:    uv run python start_experiment.py --experiment-data-collection-carla-remote --participantid <participantid>
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-data-collection-carla-remote --participantid <participantid> --run <1|2>
     PROVOICE MACHINE: uv run python start_experiment.py --experiment-data-collection-provoice-remote
 
 No addresses anywhere: both machines run THIS file, so both take the link
@@ -95,6 +95,12 @@ the line beside it, and any flag they do not mention (--webcam, --environment,
     --experiment-data-collection-carla-remote
         = --remote --data-collection --random-function --fullscreen
           --remote-host <CARLA_MACHINE_IP> --remote-bind <CARLA_MACHINE_IP>
+
+    This one also needs --run (1 or 2). The traffic scenario is derived from
+    --participantid and --run through TRAFFIC_SEED_PLAN below, so the two
+    together are what say which session this is; there is no seed to look up
+    or retype. The calibration and adaptation presets take neither -- they
+    always run the study scenario.
 
     Both pin the study link's address, since it is a property of the rig
     rather than of the run: --remote-host is what gets published to the
@@ -195,6 +201,240 @@ DEFAULT_POPUP_WAIT_TIMEOUT = 180.0
 # (see src/drive/fixed_npc_traffic.py's module docstring). Passed to both
 # children so neither can drift from the other.
 TM_PORT = 9000
+
+# Traffic scenario for the CALIBRATION and ADAPTATION drives, and the default
+# everywhere. Pinned rather than varied, and pinned to the value the rig has
+# always run on, because those drives are a fixed condition: the participant is
+# being compared against other participants in the same arm, so the traffic they
+# are compared in has to be the same traffic. --traffic-seed is refused on those
+# runs for that reason, not merely ignored.
+#
+# Data collection is the opposite case and varies it deliberately -- see the
+# --traffic-seed help text. Keeping this value OUT of the collection seeds is
+# what makes the study a test on traffic the population model has never been
+# trained on, rather than a rerun of a scenario it has already seen.
+STUDY_TRAFFIC_SEED = 42
+
+# =========================
+# TRAFFIC SCENARIO PLAN (data collection)
+# =========================
+#
+# WHICH SCENARIO EACH PARTICIPANT DRIVES, decided once and written down, rather
+# than typed per session. The seed is DERIVED from --participantid and --run;
+# there is nothing to look up on the morning and nothing to mistype.
+#
+# That matters more than convenience. The assignment below is a counterbalanced
+# design, and a design is only a design if it is actually executed: one row read
+# off the wrong line of a notebook produces an unbalanced corpus, and nothing
+# downstream can detect it -- the run looks normal, the data looks normal, and
+# the imbalance is only ever visible to someone who reconstructs what should
+# have happened. Deriving it removes the step where that can go wrong.
+#
+# THE DESIGN. Five scenarios over ten participants x two runs. C(5,2) = 10, so
+# every participant gets a DIFFERENT PAIR and every pair of scenarios occurs
+# exactly once. Each scenario is then used four times: twice as a first run and
+# twice as a second. Verified at startup by _validate_traffic_plan().
+#
+#  - Pairs all distinct (lambda = 1) means the scenario effect is estimable and
+#    not tangled with any one participant.
+#  - The 2/2 split across run positions is the counterbalance that matters:
+#    run 2 differs from run 1 for everyone -- they have learned the rig, learned
+#    the route, and are fifteen minutes more tired. A scenario that always
+#    landed in run 1 would have that baked into it inseparably.
+#  - Holding out any single scenario removes exactly four runs spread over four
+#    different participants, which is an honest generalisation test for the
+#    population model rather than a test on one person.
+#
+# WHY 42 IS ABSENT. It is the calibration/adaptation scenario (STUDY_TRAFFIC_SEED
+# above). Keeping it out of collection is what makes the study a test on traffic
+# the model has never been trained on.
+#
+# THE RUN NUMBER IS NOT LOGGED SEPARATELY, and does not need to be: no
+# participant sees the same scenario twice (enforced below), so run number is
+# recoverable from the participantid and traffic_seed that every raw_data.jsonl
+# frame already carries.
+#
+# CHANGING THIS: edit before the first participant, then leave it alone. If
+# someone drops out, re-run THEIR row with the replacement rather than adding a
+# new one -- a fresh pair breaks lambda = 1. For an 11th participant onwards,
+# add reversed pairs (P11 = ("1"'s pair reversed)) so the balance keeps growing
+# evenly. A pilot or a re-run that should not follow the plan uses an explicit
+# --traffic-seed, which is honoured and announced.
+# The seed VALUES are arbitrary labels -- nothing is derived from the number and
+# any five distinct integers would do. They only have to be distinct, stable
+# once collection starts, and different from STUDY_TRAFFIC_SEED.
+COLLECTION_SEEDS = (11, 22, 33, 44, 55)
+
+TRAFFIC_SEED_PLAN = {
+    # participantid: (run 1 scenario, run 2 scenario)
+    "001": (22, 11),
+    "002": (33, 11),
+    "003": (11, 44),
+    "004": (11, 55),
+    "005": (33, 22),
+    "006": (44, 22),
+    "007": (22, 55),
+    "008": (44, 33),
+    "009": (55, 33),
+    "010": (55, 44),
+}
+
+RUNS_PER_PARTICIPANT = 2
+
+# Width the plan's participant ids are zero-padded to. Used ONLY to recognise
+# "1" and "01" as participant "001" at lookup time -- see _canonical_participant.
+PARTICIPANT_ID_WIDTH = 3
+
+
+def _canonical_participant(pid):
+    """The plan's spelling of a participant id, or the id unchanged.
+
+    "001" and "1" are different dict keys but the same person, and the operator
+    typing the short form at 9am is not a mistake worth failing a session over.
+    What IS worth avoiding is the two spellings both reaching the data: the
+    participant id is what the corpus is grouped by, so one session filed under
+    "1" and the next under "001" splits a participant in half, and nothing
+    downstream notices. Recognising the short form here and using the plan's
+    spelling from then on keeps every session for a participant under one name.
+    """
+    pid = (pid or "").strip()
+    if pid in TRAFFIC_SEED_PLAN:
+        return pid
+    if pid.isdigit():
+        padded = pid.zfill(PARTICIPANT_ID_WIDTH)
+        if padded in TRAFFIC_SEED_PLAN:
+            return padded
+    return pid
+
+
+def _validate_traffic_plan():
+    """Check the plan still is what its comment says, at every startup.
+
+    Cheap, and it guards the one failure this whole arrangement exists to
+    prevent: an edit that quietly breaks the balance. A plan that no longer
+    counterbalances looks exactly like one that does from inside a session, and
+    the damage is only visible once the corpus is complete.
+
+    Errors are fatal rather than warnings for the properties that are ALWAYS
+    wrong -- a participant driving one scenario twice (which would also make the
+    run number unrecoverable), a scenario outside COLLECTION_SEEDS, the study
+    seed leaking into collection. The count balance is reported rather than
+    enforced, because a plan is legitimately unbalanced while it is being
+    extended past ten participants.
+    """
+    problems = []
+    for pid, pair in TRAFFIC_SEED_PLAN.items():
+        if len(pair) != RUNS_PER_PARTICIPANT:
+            problems.append("participant %s has %d run(s), expected %d"
+                            % (pid, len(pair), RUNS_PER_PARTICIPANT))
+            continue
+        if len(set(pair)) != len(pair):
+            problems.append(
+                "participant %s drives scenario %d twice. Beyond wasting a run, "
+                "it makes the run number unrecoverable from the logged data, "
+                "which is the only reason --run is not recorded separately."
+                % (pid, pair[0]))
+        for seed in pair:
+            if seed == STUDY_TRAFFIC_SEED:
+                problems.append(
+                    "participant %s is assigned the study scenario %d. That is "
+                    "the calibration/adaptation condition; using it for "
+                    "collection means the study is evaluated on traffic the "
+                    "model was trained on." % (pid, seed))
+            elif seed not in COLLECTION_SEEDS:
+                problems.append("participant %s is assigned %d, which is not in "
+                                "COLLECTION_SEEDS" % (pid, seed))
+    if problems:
+        raise SystemExit("Bad TRAFFIC_SEED_PLAN in start_experiment.py:\n  "
+                         + "\n  ".join(problems))
+
+
+def traffic_plan_summary():
+    """One line per scenario: how often it is used, and in which run position."""
+    total, first = {}, {}
+    for pair in TRAFFIC_SEED_PLAN.values():
+        for i, seed in enumerate(pair):
+            total[seed] = total.get(seed, 0) + 1
+            if i == 0:
+                first[seed] = first.get(seed, 0) + 1
+    return ["scenario %d: %d run(s), %d as run 1, %d as run 2"
+            % (s, total[s], first.get(s, 0), total[s] - first.get(s, 0))
+            for s in sorted(total)]
+
+
+def resolve_traffic_seed(args, parser):
+    """The scenario for this session: derived from the plan, or overridden.
+
+    Order matters. An explicit --traffic-seed wins, because a pilot, a re-run
+    after a crash, or a one-off check has to be possible without editing the
+    plan -- but it says so out loud, since a session that silently departed from
+    the design would be indistinguishable afterwards from one that followed it.
+
+    SIDE EFFECT, deliberate and announced: on a planned run this rewrites
+    args.participantid to the plan's spelling of the id, so a participant typed
+    as "1" is recorded as "001" like their other session. See
+    _canonical_participant for why that matters more than it looks.
+    """
+    if not args.data_collection:
+        if args.traffic_seed is not None:
+            parser.error(
+                "--traffic-seed %d is only accepted on --data-collection runs; "
+                "this one is not. The calibration and adaptation drives are "
+                "pinned to scenario %d so every participant is measured in the "
+                "same traffic. Drop --traffic-seed, or add --data-collection if "
+                "this is a collection session."
+                % (args.traffic_seed, STUDY_TRAFFIC_SEED))
+        if args.run is not None:
+            parser.error(
+                "--run only selects a data-collection scenario and this is not a "
+                "--data-collection run. The calibration and adaptation drives "
+                "always use scenario %d." % STUDY_TRAFFIC_SEED)
+        return STUDY_TRAFFIC_SEED
+
+    if args.traffic_seed is not None:
+        print("[PLAN] OVERRIDE: --traffic-seed %d given, so the plan is NOT "
+              "being followed for this session." % args.traffic_seed)
+        if args.run is not None:
+            planned = TRAFFIC_SEED_PLAN.get(_canonical_participant(args.participantid))
+            if planned and 1 <= args.run <= len(planned) \
+                    and planned[args.run - 1] != args.traffic_seed:
+                print("[PLAN]   the plan says participant %s run %d is scenario "
+                      "%d." % (args.participantid, args.run,
+                               planned[args.run - 1]))
+        return args.traffic_seed
+
+    if args.run is None:
+        parser.error(
+            "--data-collection needs --run (1..%d): the traffic scenario is "
+            "derived from --participantid and --run via TRAFFIC_SEED_PLAN. Pass "
+            "--traffic-seed instead to run a scenario off-plan (a pilot, or a "
+            "re-run)." % RUNS_PER_PARTICIPANT)
+
+    pid = _canonical_participant(args.participantid)
+    if pid != (args.participantid or "").strip():
+        print("[PLAN] participant id %r -> %r, the plan's spelling, so this "
+              "session is filed with the participant's other run."
+              % ((args.participantid or "").strip(), pid))
+        args.participantid = pid
+    pair = TRAFFIC_SEED_PLAN.get(pid)
+    if pair is None:
+        parser.error(
+            "no TRAFFIC_SEED_PLAN entry for participant %r. Planned "
+            "participants are: %s. If this is a pilot or an extra participant, "
+            "either add a row to the plan in start_experiment.py or pass an "
+            "explicit --traffic-seed."
+            % (pid, ", ".join(sorted(TRAFFIC_SEED_PLAN, key=lambda k: (len(k), k)))))
+    if not 1 <= args.run <= len(pair):
+        parser.error("--run %d is out of range; participant %s has %d planned "
+                     "run(s)." % (args.run, pid, len(pair)))
+
+    seed = pair[args.run - 1]
+    print("[PLAN] participant %s, run %d -> traffic scenario %d "
+          "(the other run is %d)."
+          % (pid, args.run, seed,
+             pair[0] if args.run == 2 else pair[1]))
+    return seed
+
 
 # Under --sync, how Drive asks the clock owner to hold the simulation while a LoA
 # popup is open. Defined HERE and passed to both children, rather than agreed on
@@ -554,6 +794,12 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
             f"session_id={session}",
             f"vehicle_id={vehicle_id}",
             f"participantid={args.participantid}",
+            # Rides with the ids, and is omitted for the same reason they are:
+            # under --remote the bridge publishes all of them at /session and
+            # ProVoice adopts them there. Passing it here as well would give
+            # ProVoice two sources for one fact, and resolve_traffic_seed()
+            # treats a disagreement between them as fatal.
+            f"traffic_seed={args.traffic_seed}",
         ]),
         f"environment={args.environment}",
         f"secondary_task={args.secondary_task}",
@@ -1295,6 +1541,55 @@ def main():
                              "knob; no change rules it out. If you end up keeping a "
                              "reduced fleet, fix it across all participants: the "
                              "amount of traffic is part of the driving task.")
+    parser.add_argument("--run", dest="run", type=int, default=None,
+                        choices=tuple(range(1, RUNS_PER_PARTICIPANT + 1)),
+                        help="Which of this participant's %d data-collection runs "
+                             "this is. Together with --participantid it SELECTS "
+                             "THE TRAFFIC SCENARIO from TRAFFIC_SEED_PLAN at the "
+                             "top of this file, so the counterbalanced design is "
+                             "executed by the code rather than read off a sheet "
+                             "and retyped. Required on --data-collection runs "
+                             "unless --traffic-seed overrides the plan; refused "
+                             "on any other run, where the scenario is always %d.\n"
+                             "\n"
+                             "Not recorded separately, and does not need to be: "
+                             "no participant drives the same scenario twice, so "
+                             "the run number is recoverable from the "
+                             "participantid and traffic_seed already on every "
+                             "logged frame."
+                             % (RUNS_PER_PARTICIPANT, STUDY_TRAFFIC_SEED))
+    parser.add_argument("--traffic-seed", dest="traffic_seed", type=int,
+                        default=None,
+                        help="OVERRIDE the planned traffic scenario. Normally "
+                             "unset: on a --data-collection run the scenario "
+                             "comes from --participantid and --run via "
+                             "TRAFFIC_SEED_PLAN, and everything else runs "
+                             "scenario %d. Use this for a pilot, an unplanned "
+                             "participant, or a re-run that must not follow the "
+                             "plan -- it is honoured and announced, so a session "
+                             "that departed from the design says so in its log. "
+                             "Naming the scenario by hand on every session is "
+                             "exactly what the plan replaced, so reaching for "
+                             "this routinely means the plan is wrong and should "
+                             "be edited instead.\n"
+                             "\n"
+                             "REFUSED outside --data-collection. The calibration "
+                             "and adaptation drives are pinned to scenario %d so "
+                             "the study arms stay a fixed condition, comparable "
+                             "across participants.\n"
+                             "\n"
+                             "Whatever scenario is used -- planned or overridden "
+                             "-- the seed drives the traffic manager and the "
+                             "per-vehicle draws in fixed_npc_traffic.py's "
+                             "VEHICLE_TM_OVERRIDES, so one number identifies one "
+                             "scenario: the same seed reproduces the same traffic "
+                             "for every participant, a different one is a "
+                             "different scenario from the same configuration. It "
+                             "is carried to ProVoice and lands on every "
+                             "raw_data.jsonl frame, which is the only record of "
+                             "which scenario produced a session -- nothing else "
+                             "in the data identifies it after the fact."
+                             % (STUDY_TRAFFIC_SEED, STUDY_TRAFFIC_SEED))
     parser.add_argument("--substep-delta", dest="substep_delta", type=float,
                         default=0.01,
                         help="Maximum physics substep in seconds (default 0.01, "
@@ -1557,6 +1852,13 @@ def main():
         run_provoice_only(args)
         return
 
+    # The traffic scenario, resolved once and written back onto args so every
+    # child below is handed a plain integer and none of them has to know a plan
+    # exists. Fatal on a bad combination -- see resolve_traffic_seed for which
+    # combinations are bad and why.
+    _validate_traffic_plan()
+    args.traffic_seed = resolve_traffic_seed(args, parser)
+
     if args.calibration_only and args.data_collection:
         parser.error("--calibration-only and --data-collection are mutually exclusive.")
     if args.calibration_only and args.test_drive:
@@ -1778,6 +2080,12 @@ def main():
                  *(["--num-vehicles", str(args.num_vehicles)]
                    if args.num_vehicles else []),
                  *(["--allow-long-vehicles"] if args.allow_long_vehicles else []),
+                 # THE SCENARIO IDENTITY for this session. Always passed
+                 # explicitly, never left to the child's default, so the value
+                 # that reaches the traffic manager is the same one that
+                 # reaches ProVoice and the collected data -- a default agreed
+                 # in two places is a default that eventually disagrees.
+                 "--traffic-seed", str(args.traffic_seed),
                  # This child owns the simulation clock under --sync. It is
                  # started BEFORE Drive, which is what the arrangement needs:
                  # the clock has to be running by the time Drive waits on it.
@@ -1905,6 +2213,10 @@ def main():
                 # must surface at startup, not in the logs afterwards.
                 "--session-id", session,
                 "--participantid", args.participantid,
+                # Same channel, same reason: the seed is known only on this
+                # machine, and it is the only record of which traffic scenario
+                # produced the frames ProVoice is about to write.
+                "--traffic-seed", str(args.traffic_seed),
                 # And the address of the reverse bridge, so the whole pairing
                 # follows from the ONE url the ProVoice machine is given.
                 *(["--status-url", status_url] if status_url else []),
