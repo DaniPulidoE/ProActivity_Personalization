@@ -3382,7 +3382,10 @@ def game_loop(args):
                         return
                 # Same reason as the popup branch: no world.tick here, and the
                 # session is over -- the bed settles to idle rather than holding
-                # the speed the car had when ProVoice stopped.
+                # the speed the car had when ProVoice stopped. Not ducked (even
+                # if a popup closed straight into this overlay) -- an ended
+                # session should sound like the car stopping, not going mute.
+                ambience.set_ducked(False)
                 ambience.update(0.0)
                 world.render(display)
                 end_overlay.render(display)
@@ -3552,7 +3555,11 @@ def game_loop(args):
                 # Explicitly idle: this branch never reaches world.tick, so
                 # hud.speed_kmh still holds the speed the car was doing when the
                 # scene froze, and the bed would sit at motorway level over a
-                # motionless picture for the whole deliberation.
+                # motionless picture for the whole deliberation. Ducked to
+                # silence on top of that -- idle alone still leaves an idling
+                # engine under the prompt, which the deliberation should not
+                # have to compete with.
+                ambience.set_ducked(True)
                 ambience.update(0.0)
                 world.render(display)
                 loa_popup.render(display)
@@ -3571,6 +3578,7 @@ def game_loop(args):
             # -- a local field it just wrote, not an RPC to the server, so the
             # engine note follows the pedal for free on a loop this project
             # already tunes for frame rate.
+            ambience.set_ducked(False)
             ambience.update(world.hud.speed_kmh,
                             throttle=getattr(
                                 getattr(controller, '_control', None),

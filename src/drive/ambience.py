@@ -271,6 +271,13 @@ ASSET_LEVEL_EXPONENT = 0.7
 SPEED_TAU_S = 0.18
 THROTTLE_TAU_S = 0.12
 
+# Ducking is separate from the speed-derived idle bed. update(0.0) already
+# settles the mix to "engine idling, car stopped", which is correct for a
+# frozen scene but is not silence -- a stopped car still runs. Ducking is for
+# the popup itself, which is asked to go fully quiet. Its own tau, fast enough
+# to feel responsive to the popup opening but not an audible step.
+DUCK_TAU_S = 0.15
+
 
 def configure_mixer():
     """Request the mixer format. MUST be called BEFORE ``pygame.init()``.
@@ -612,6 +619,8 @@ class Ambience(object):
         self._voices = []         # [(speed_kmh, channel, sound)] when recorded
         self._speed = 0.0
         self._throttle = 0.0
+        self._duck = 1.0
+        self._duck_target = 1.0
         self._gear = 1
         self._last_ms = None
         self._started = False
@@ -772,6 +781,20 @@ class Ambience(object):
         """Current simulated engine speed. Diagnostic only."""
         return _rpm_for(self._speed, self._gear)
 
+    def set_ducked(self, ducked):
+        """Fade the whole bed toward silence (True) or its normal level (False).
+
+        Independent of speed: passing 0.0 to ``update`` settles the mix to
+        idle -- engine running, car stopped -- which is right for "the scene
+        is frozen" but not for "this should be silent". Call this every frame
+        from whichever branch is driving the call to ``update`` (popup open,
+        popup closed, session ended) rather than only on the transition, so
+        ducking always matches the current state and can never stick from a
+        state that was skipped (e.g. a popup that closes into a session-end
+        overlay without a normal-driving frame in between).
+        """
+        self._duck_target = 0.0 if ducked else 1.0
+
     def update(self, speed_kmh, throttle=0.0):
         """Track speed (km/h) and throttle [0,1]. Safe to call every frame.
 
@@ -799,6 +822,7 @@ class Ambience(object):
         if self._last_ms is None:
             self._speed = target_speed
             self._throttle = target_throttle
+            self._duck = self._duck_target
         else:
             dt = max(0, now - self._last_ms) / 1000.0
             if dt > 0.0:
@@ -806,6 +830,8 @@ class Ambience(object):
                     target_speed - self._speed)
                 self._throttle += (1.0 - math.exp(-dt / THROTTLE_TAU_S)) * (
                     target_throttle - self._throttle)
+                self._duck += (1.0 - math.exp(-dt / DUCK_TAU_S)) * (
+                    self._duck_target - self._duck)
         self._last_ms = now
 
         if self._voices:
@@ -818,11 +844,11 @@ class Ambience(object):
         for (ch, _sound, _rest, _full, _exp), level in zip(self._road,
                                                            road_levels):
             try:
-                ch.set_volume(self.effective_gain * level)
+                ch.set_volume(self.effective_gain * self._duck * level)
             except pygame.error:
                 pass
 
-        level = self.effective_gain * engine_level
+        level = self.effective_gain * self._duck * engine_level
         lo, hi, frac = engine_blend(rpm)
 
         # Buckets are assigned to slots BY PARITY, which is what makes the
@@ -860,7 +886,7 @@ class Ambience(object):
 
     def _update_recorded(self):
         """Crossfade the recorded clips bracketing the current speed."""
-        level = self.effective_gain * asset_level(self._speed)
+        level = self.effective_gain * self._duck * asset_level(self._speed)
         weights = asset_weights(self._speed, [s for s, _c, _s in self._voices])
         for (_speed, ch, _sound), weight in zip(self._voices, weights):
             try:
