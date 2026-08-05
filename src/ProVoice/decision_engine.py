@@ -10,18 +10,32 @@ from ProVoice.models.xlstm_model import (
     load_checkpoint,
     log_encoded_frames,
     logits_to_probs,
+    probs_to_label,
     secs_of_day as _secs_of_day,
 )
 import torch
 
 
-def _policy_from_loa(loa: int, conservative: bool = True) -> Tuple[str, str]:
-    loa = max(0, min(int(loa), 4))
-    if conservative:
-        mapping = {0: ("none", "low"), 1: ("suggest", "low"), 2: ("ask_approval", "medium"), 3: ("auto_with_veto", "high"), 4: ("auto", "high")}
-    else:
-        mapping = {0: ("none", "low"), 1: ("suggest", "medium"), 2: ("auto_with_veto", "medium"), 3: ("auto", "high"), 4: ("auto", "high")}
-    return mapping[loa]
+# LoA -> (action, level). One fixed policy: at every level the system asks
+# before it acts, and only full autonomy at LoA 4.
+#
+# There used to be a second, more aggressive mapping selected by a
+# `conservative` parameter that every caller passed as True and no CLI flag
+# ever set — dead configuration that made the policy look variable when it was
+# not. Removed rather than wired up: a study comparing personalization arms
+# needs the LoA->action mapping held FIXED across participants and arms, so a
+# switch here would be a confound, not a feature.
+_LOA_POLICY: Dict[int, Tuple[str, str]] = {
+    0: ("none",           "low"),
+    1: ("suggest",        "low"),
+    2: ("ask_approval",   "medium"),
+    3: ("auto_with_veto", "high"),
+    4: ("auto",           "high"),
+}
+
+
+def _policy_from_loa(loa: int) -> Tuple[str, str]:
+    return _LOA_POLICY[max(0, min(int(loa), 4))]
 
 def _softmax(logits: List[float]) -> List[float]:
     m = max(logits); exps = [math.exp(x - m) for x in logits]; S = sum(exps); return [x / S for x in exps]
@@ -93,7 +107,7 @@ def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]]
 
     fn_key = resolve_function_key(fn_key_or_name)
     fcd = fcd or get_fcd_for_function(fn_key)
-    action, level = _policy_from_loa(0, conservative=True)
+    action, level = _policy_from_loa(0)
     return {
         "action": action, "level": level, "LoA": 0,
         "message": f"fallback LoA0: {reason}",
@@ -109,7 +123,7 @@ class BaseStrategy(ABC):
 
 
 class XGBoostLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str,
                  temperature: float = 1.0, class_bias: Optional[List[float]] = None,
                  decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.model = None
@@ -121,7 +135,6 @@ class XGBoostLoAStrategy(BaseStrategy):
             print(f"Error loading FCD model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.temperature = float(os.getenv("PV_TEMP", str(temperature)))
         self.class_bias = class_bias if class_bias is not None else [0.0]*5
         self.decision_method = (os.getenv("PV_DECISION_METHOD", decision_method)).lower()
@@ -143,7 +156,7 @@ class XGBoostLoAStrategy(BaseStrategy):
                 probs = [0.0]*5; probs[max(0, min(4, k))] = 1.0
             probs_pp = _apply_temp_bias_probs(probs, self.temperature, self.class_bias)
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+            action, level = _policy_from_loa(loa)
             return {"action": action, "level": level, "LoA": loa, "message": "FCD xgboost", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
             fn = state.get("functionname") or self.default_key
@@ -153,7 +166,7 @@ _STATE_CAT = ['emotion','lab','environment','secondary_task']
 _STATE_NUM = ['drowsiness_alert','gaze_distracted','heart_rate']
 
 class StateLevelsLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str,
                  prob_threshold: Optional[float] = None, fcd_fallback: Optional[BaseStrategy] = None,
                  temperature: float = 1.0, class_bias: Optional[List[float]] = None,
                  decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
@@ -166,7 +179,6 @@ class StateLevelsLoAStrategy(BaseStrategy):
             print(f"Error loading state model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.prob_threshold = float(prob_threshold) if prob_threshold is not None else None
         self.fcd_fallback = fcd_fallback
         self.temperature = temperature
@@ -221,7 +233,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
                 return self._try_fcd_fallback(state, fn, fcd)
             probs_pp = _apply_temp_bias_probs(probs, self.temperature, self.class_bias)
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+            action, level = _policy_from_loa(loa)
             return {"action": action, "level": level, "LoA": loa, "message": "State model", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
             print(f"Error in state model: {e}")
@@ -231,9 +243,17 @@ class StateLevelsLoAStrategy(BaseStrategy):
 
 
 class StateXLSTMLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, window: int = 256, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str, window: int = 256,
                  fcd_fallback: Optional[BaseStrategy] = None, log_path: Optional[str] = None,
                  window_seconds: Optional[float] = None):
+        # FIRST statement: __del__ runs on any partially-constructed instance,
+        # and it reads this attribute. `load_checkpoint` below can raise (a
+        # corrupt or arch-incompatible .pt), and while that is caught here, an
+        # uncaught failure anywhere in __init__ would otherwise leave __del__
+        # raising AttributeError during garbage collection — where exceptions
+        # are printed and swallowed, masking the real error with a confusing
+        # second one.
+        self._log_fh = None
         self.model = None
         # `window` is only a fallback; the authoritative sequence length is
         # `context_length` taken from the loaded checkpoint's arch.
@@ -274,7 +294,6 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         _rs = arch.get("resample_hz")
         self.resample_hz = float(_rs) if _rs and float(_rs) > 0 else None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.fcd_fallback = fcd_fallback
         try:
             self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
@@ -283,15 +302,22 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             self._log_fh = None
 
     def close(self) -> None:
-        if self._log_fh is not None:
+        # getattr, not self._log_fh: belt-and-braces for the same reason the
+        # attribute is initialised first — close() must be safe to call on an
+        # instance whose __init__ did not finish.
+        fh = getattr(self, "_log_fh", None)
+        if fh is not None:
             try:
-                self._log_fh.close()
+                fh.close()
             except Exception:
                 pass
             self._log_fh = None
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass   # never raise from a finalizer
 
     def _try_fcd_fallback(self, state: Dict[str, Any], fn: str) -> Dict[str, Any]:
         fcd = get_fcd_for_function(fn)
@@ -335,9 +361,14 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             with torch.no_grad():
                 xb = torch.from_numpy(X)[None, ...]
                 logits = self.model(xb)
-                probs = logits_to_probs(logits, self.head_type).cpu().numpy()[0].tolist()
-            loa = _decide_from_probs(probs, "argmax")
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+                pmf = logits_to_probs(logits, self.head_type)
+                # Decode with the head's canonical rule — for CORN that is Shi
+                # et al.'s rank rule sum_k 1[q_k > 0.5] (the PMF's median), not
+                # argmax (its mode). Same function the trainers and the sweep
+                # use, so the LoA served is the LoA those curves measured.
+                loa = int(probs_to_label(pmf, self.head_type)[0])
+                probs = pmf.cpu().numpy()[0].tolist()
+            action, level = _policy_from_loa(loa)
             fcd = get_fcd_for_function(fn)
             return {"action": action, "level": level, "LoA": loa, "message": "State XLSTM", "fcd": fcd, "probs": probs, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
@@ -348,11 +379,10 @@ class StateXLSTMLoAStrategy(BaseStrategy):
 
 class CombinedFusionStrategy(BaseStrategy):
     def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.7,
-                 conservative: bool = True, decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
+                 decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.fcd_strategy = fcd_strategy
         self.state_strategy = state_strategy
         self.w_fcd = float(w_fcd); self.w_state = 1.0 - float(w_fcd)
-        self.conservative = conservative
         self.decision_method = decision_method
         self.expected_shift = expected_shift
         self.quantile_tau = quantile_tau
@@ -381,5 +411,5 @@ class CombinedFusionStrategy(BaseStrategy):
         probs = [self.w_fcd*pf[i] + self.w_state*ps[i] for i in range(5)]
         S = sum(probs); probs = [p / S if S>0 else 0.2 for p in probs]
         loa = _decide_from_probs(probs, self.decision_method, self.expected_shift, self.quantile_tau)
-        action, level = _policy_from_loa(loa, conservative=self.conservative)
+        action, level = _policy_from_loa(loa)
         return {"action": action, "level": level, "LoA": loa, "message": f"fusion w_fcd={self.w_fcd:.2f}", "fcd": of.get("fcd"), "probs": probs, "sub": {"fcd": of, "state": os_}, "fallback": False}

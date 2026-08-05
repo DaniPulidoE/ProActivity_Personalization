@@ -22,6 +22,7 @@ from ProVoice.models.xlstm_model import (
     FEATURE_NAMES,
     log_encoded_frames,
     logits_to_probs,
+    logits_to_label,
     levels_to_distribution,
     levels_to_cumulative,
     soft_corn_loss,
@@ -122,7 +123,7 @@ class SeqDataset(Dataset):
     ):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
-        self.groups: List[Tuple[np.ndarray, int]] = []
+        self.groups: List[Tuple[np.ndarray, np.ndarray]] = []
         skipped = []
         for gid, g in df.groupby('segment_id'):
             g = g.reset_index(drop=True)
@@ -132,12 +133,12 @@ class SeqDataset(Dataset):
             if np.isnan(level_vec).any() or level_vec.sum() <= 0:
                 skipped.append(gid)
                 continue
-            # Keep BOTH representations: the multi-hot is the training target
-            # (every loss now accepts a set), while the argmax int is what the
-            # legacy single-label metrics need.
+            # The multi-hot mark vector is the ONLY label representation. Both
+            # losses consume it directly and every metric is set-aware, so there
+            # is nothing left that needs a collapsed integer — and no argmax to
+            # silently pick the driver's lowest acceptable level.
             lvl = (level_vec > 0).astype(np.float32)
-            y = int(np.argmax(level_vec))
-            rows = [g.iloc[i].to_dict() for i in range(len(g))]
+            rows = g.to_dict("records")
             # Keep only the LAST window_seconds of the segment (frames are
             # chronological within a segment). None/0 = use the full segment.
             rows = truncate_frames_by_seconds(rows, window_seconds)
@@ -145,9 +146,9 @@ class SeqDataset(Dataset):
             # segment's DURATION and not on the rate the session happened to
             # achieve. None/0 = encode the raw frames (pre-resampling behaviour).
             X = encode_and_resample(rows, resample_hz, window_seconds)
-            self.groups.append((X, y, lvl))
+            self.groups.append((X, lvl))
             if log_fh is not None:
-                log_encoded_frames(log_fh, split, str(gid), X, label=y)
+                log_encoded_frames(log_fh, split, str(gid), X, levels=lvl)
         if skipped:
             print(f"[warn] skipped {len(skipped)} segment(s) with missing/empty Level_* labels: "
                 f"{skipped[:5]}{' ...' if len(skipped) > 5 else ''}")
@@ -158,23 +159,19 @@ class SeqDataset(Dataset):
 
 
 def make_collate(context_length: int):
+    """Collate ``(X, levels)`` items into ``(frames, lengths, levels)`` batches.
+
+    Items carry the multi-hot mark vector and nothing else — there is no
+    collapsed integer label anywhere in the pipeline, so a caller cannot
+    accidentally reintroduce one by unpacking the wrong element.
+    """
     def collate(batch):
         if len(batch) == 0:
             return (torch.empty(0, context_length, D_IN),
                     torch.empty(0, dtype=torch.long),
-                    torch.empty(0, dtype=torch.long),
                     torch.empty(0, len(LEVELS)))
-        xs, ys, ls, lvls = [], [], [], []
-        for item in batch:
-            # Items are (X, y, multi-hot levels). Callers that predate
-            # multi-label labels (xlstm_maml, sweep_train_frac) still hand over
-            # plain (X, y) pairs, so derive the one-hot from y for those.
-            if len(item) == 2:
-                X, y = item
-                lvl = np.zeros(len(LEVELS), dtype=np.float32)
-                lvl[int(y)] = 1.0
-            else:
-                X, y, lvl = item
+        xs, ls, lvls = [], [], []
+        for X, lvl in batch:
             T = X.shape[0]
             if T > context_length:
                 X = X[-context_length:]
@@ -185,29 +182,104 @@ def make_collate(context_length: int):
                 # so the pad frames after it have exactly zero influence.
                 X = np.concatenate([X, np.zeros((pad, X.shape[1]), dtype=X.dtype)], axis=0)
             xs.append(torch.from_numpy(X))
-            ys.append(int(y))
             ls.append(min(T, context_length))
             lvls.append(torch.from_numpy(np.asarray(lvl, dtype=np.float32)))
         return (torch.stack(xs, 0),
-                torch.tensor(ys, dtype=torch.long),
                 torch.tensor(ls, dtype=torch.long),
                 torch.stack(lvls, 0))
     return collate
 
 
+# --------------------------------------------------------------------------- #
+# Metrics.
+#
+# A window's label is the SET of LoAs the driver marked acceptable (~a third of
+# real windows mark more than one, and a third of THOSE are non-contiguous, e.g.
+# {L1, L5}). Every metric below therefore takes the multi-hot `levels` vector,
+# never a collapsed integer.
+#
+# There used to be an `int(np.argmax(level_vec))` pseudo-label threaded through
+# the datasets and into these metrics. np.argmax returns the FIRST maximal index,
+# so on a multi-hot vector it always resolved to the driver's LOWEST acceptable
+# level — a systematic downward bias in the reference used for model selection,
+# meta-validation early stopping, and the published learning curves. The
+# `resolve_targets` below replaces it.
+# --------------------------------------------------------------------------- #
+def resolve_targets(levels: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """Per-row effective ground truth: the marked level the prediction is judged against.
+
+    Every metric here compares two point values, but the label is a set. This
+    resolves the set to the single marked level CLOSEST to the prediction — the
+    level the driver would plausibly have named had they been forced to name
+    one — so a prediction inside the set is exactly right, and one outside it is
+    scored against the nearest acceptable alternative rather than against an
+    arbitrary member.
+
+    Properties that make this safe to build every metric on:
+
+    * **Exact reduction.** On a single-label row the only marked level is
+      returned regardless of the prediction, so every metric below collapses to
+      its ordinary single-label form. Existing single-label results are
+      numerically unchanged.
+    * **Deterministic ties.** A prediction equidistant from two marked levels
+      (e.g. marks {1, 3}, prediction 2) resolves to the LOWER one, via argmin's
+      first-match rule. Arbitrary, but fixed — never data-dependent.
+    * **Empty rows are inert.** A row with no marked level returns the
+      prediction itself, contributing zero error instead of an invented label.
+      Callers upstream already reject such rows; this is belt-and-braces.
+
+    CAVEAT, state it when reporting: the resolved target depends on the
+    prediction, so these are best-match (oracle-favourable) scores. That is the
+    right convention for a set-valued label scored against a point prediction,
+    but it means the chance-corrected metric (QWK) is an UPPER BOUND on
+    multi-label rows — its "true" marginal shifts with the model. Single-label
+    rows are unaffected.
+    """
+    y_pred = np.asarray(y_pred)
+    if len(y_pred) == 0:
+        return y_pred.astype(int)
+    levels = np.asarray(levels)
+    idx = np.arange(levels.shape[1])
+    out = y_pred.astype(int).copy()
+    for i, (row, p) in enumerate(zip(levels, y_pred)):
+        marked = idx[row.astype(bool)]
+        if marked.size:
+            out[i] = int(marked[np.abs(marked - int(p)).argmin()])
+    return out
+
+
+# --- single-label primitives -------------------------------------------------
+# Kept as the building blocks the set-aware metrics delegate to. Call these
+# DIRECTLY only on data you know is single-label; otherwise use the set_* forms.
 def accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if len(y_true) == 0: return 0.0
     return float((y_true == y_pred).mean())
 
 
 def macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
+    """Macro-F1 averaged over LoA levels WITH SUPPORT (matches sklearn's
+    ``f1_score(..., labels=present, average='macro', zero_division=0)``).
+
+    A level absent from both the labels and the predictions is skipped, not
+    scored 0. Scoring it 0 capped the achievable value at (levels present)/5 —
+    0.6 on a per-driver validation tail covering 3 of the 5 levels — which read
+    as a failure to personalize when the model was in fact perfect.
+
+    Consequence to keep in mind: the denominator now varies with the tail, so
+    values are not comparable across tails with different level coverage.
+    """
     f1s = []
     for c in range(n_classes):
         tp = int(((y_pred == c) & (y_true == c)).sum())
         fp = int(((y_pred == c) & (y_true != c)).sum())
         fn = int(((y_pred != c) & (y_true == c)).sum())
         denom = 2 * tp + fp + fn
-        f1s.append((2.0 * tp / denom) if denom > 0 else 0.0)
+        if denom > 0:
+            f1s.append(2.0 * tp / denom)
+    # No level had support (empty input, or labels outside [0, n_classes)):
+    # np.mean([]) is nan, which would propagate silently into the metrics CSV.
+    if not f1s:
+        return 0.0
     return float(np.mean(f1s))
 
 
@@ -215,31 +287,6 @@ def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Mean absolute error in LoA levels — ordinal metric: off-by-1 < off-by-4."""
     if len(y_true) == 0: return 0.0
     return float(np.abs(y_true.astype(float) - y_pred.astype(float)).mean())
-
-
-def set_accuracy(levels: np.ndarray, y_pred: np.ndarray) -> float:
-    """Fraction of predictions the driver marked as acceptable.
-
-    Identical to :func:`accuracy` when every row marks exactly one level.
-    """
-    if len(y_pred) == 0: return 0.0
-    return float(levels[np.arange(len(y_pred)), y_pred].astype(bool).mean())
-
-
-def set_mae(levels: np.ndarray, y_pred: np.ndarray) -> float:
-    """Distance to the NEAREST marked level; 0 when the prediction is accepted.
-
-    Generalises :func:`mae` to multi-label rows without punishing a model for
-    picking one acceptable level over another. Reduces exactly to ``mae`` when
-    every row marks a single level.
-    """
-    if len(y_pred) == 0: return 0.0
-    idx = np.arange(levels.shape[1])
-    dists = []
-    for row, p in zip(levels, y_pred):
-        marked = idx[row.astype(bool)]
-        dists.append(float(np.abs(marked - p).min()) if marked.size else 0.0)
-    return float(np.mean(dists))
 
 
 def qwk(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
@@ -255,6 +302,49 @@ def qwk(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
     if np.isfinite(k):
         return float(k)
     return 1.0 if np.array_equal(y_true, y_pred) else 0.0
+
+
+# --- set-aware metrics (THE ones to report and select on) --------------------
+def set_accuracy(levels: np.ndarray, y_pred: np.ndarray) -> float:
+    """Fraction of predictions the driver marked as acceptable.
+
+    Reduces exactly to :func:`accuracy` when every row marks one level.
+    """
+    if len(y_pred) == 0: return 0.0
+    return float((resolve_targets(levels, y_pred) == np.asarray(y_pred)).mean())
+
+
+def set_mae(levels: np.ndarray, y_pred: np.ndarray) -> float:
+    """Distance to the NEAREST marked level; 0 when the prediction is accepted.
+
+    Generalises :func:`mae` to multi-label rows without punishing a model for
+    picking one acceptable level over another. Reduces exactly to ``mae`` when
+    every row marks a single level. **This is the model-selection metric.**
+    """
+    if len(y_pred) == 0: return 0.0
+    return mae(resolve_targets(levels, y_pred), np.asarray(y_pred))
+
+
+def set_macro_f1(levels: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
+    """Macro-F1 against the nearest marked level. Reduces exactly to :func:`macro_f1`.
+
+    Averages only over LoA levels with support (see :func:`macro_f1`), so a
+    validation tail covering 3 of the 5 levels can still reach 1.0. Scores are
+    therefore NOT comparable across tails that cover different numbers of
+    levels — report the level coverage alongside, or prefer set-MAE, which has
+    no such dependence.
+    """
+    if len(y_pred) == 0: return 0.0
+    return macro_f1(resolve_targets(levels, y_pred), np.asarray(y_pred), n_classes)
+
+
+def set_qwk(levels: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float:
+    """QWK against the nearest marked level. Reduces exactly to :func:`qwk`.
+
+    Upper bound on multi-label rows — see the caveat in :func:`resolve_targets`.
+    """
+    if len(y_pred) == 0: return 0.0
+    return qwk(resolve_targets(levels, y_pred), np.asarray(y_pred), n_classes)
 
 
 def main():
@@ -412,7 +502,7 @@ def main():
         head_type=head_type,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    multi = int(sum(1 for _, _, lvl in train_ds.groups if float(np.sum(lvl)) > 1))
+    multi = int(sum(1 for _, lvl in train_ds.groups if float(np.sum(lvl)) > 1))
     if multi:
         print(f"[info] {multi}/{len(train_ds.groups)} training segment(s) mark several "
               f"acceptable LoAs; targets become a distribution over them.")
@@ -421,12 +511,12 @@ def main():
         # soft-CORN: each of the K-1 logits models P(y>k | y>k-1), trained on
         # its conditional subset weighted by P(y >= k). A single marked level
         # recovers the original CORN loss exactly (up to the normalizer).
-        loss_fn = lambda logits, yb, lvl: soft_corn_loss(logits, lvl)
+        loss_fn = lambda logits, lvl: soft_corn_loss(logits, lvl)
     else:
         _ce = nn.CrossEntropyLoss()
         # Soft (B, K) targets — supported since torch 1.10 and numerically
         # identical to the integer form when exactly one level is marked.
-        loss_fn = lambda logits, yb, lvl: _ce(logits, levels_to_distribution(lvl))
+        loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
 
     best = float("inf")  # select on MAE (lower is better); +inf ensures the first epoch always saves
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
@@ -446,41 +536,43 @@ def main():
 
     for ep in range(args.epochs):
         model.train()
-        for xb, yb, lb, vb in train_dl:
-            xb, yb, lb, vb = xb.to(device), yb.to(device), lb.to(device), vb.to(device)
+        for xb, lb, vb in train_dl:
+            xb, lb, vb = xb.to(device), lb.to(device), vb.to(device)
             logits = model(xb, lengths=lb)
-            loss = loss_fn(logits, yb, vb)
+            loss = loss_fn(logits, vb)
             opt.zero_grad(); loss.backward(); opt.step()
 
-        model.eval(); y_true = []; y_pred = []; y_lvl = []
+        model.eval(); y_pred = []; y_lvl = []
         with torch.no_grad():
-            for xb, yb, lb, vb in test_dl:
-                xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
+            for xb, lb, vb in test_dl:
+                xb, lb = xb.to(device), lb.to(device)
                 logits = model(xb, lengths=lb)
-                # logits_to_probs maps every head type to a 5-class PMF, so
-                # argmax decoding is identical for CE and CORN.
-                pred = logits_to_probs(logits, head_type).argmax(dim=-1)
-                y_true.append(yb.cpu().numpy()); y_pred.append(pred.cpu().numpy())
+                # Each head decoded by its canonical rule: argmax for softmax,
+                # Shi et al.'s rank rule sum_k 1[q_k > 0.5] for CORN.
+                pred = logits_to_label(logits, head_type)
+                y_pred.append(pred.cpu().numpy())
                 y_lvl.append(vb.numpy())
-        Yt = np.concatenate(y_true, 0); Yp = np.concatenate(y_pred, 0)
+        Yp = np.concatenate(y_pred, 0)
         Yl = np.concatenate(y_lvl, 0)
-        acc = accuracy(Yt, Yp); mf1 = macro_f1(Yt, Yp, 5)
-        kappa = qwk(Yt, Yp, 5)
-        # Set-aware: credit any level the driver marked acceptable. Both reduce
-        # to the plain single-label metrics when one level is marked per row.
-        err = set_mae(Yl, Yp); sacc = set_accuracy(Yl, Yp)
-        print(f"[epoch {ep:02d}] acc={acc:.3f} set-acc={sacc:.3f} macro-F1={mf1:.3f} "
-              f"MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
+        # All four metrics are set-aware: they credit any level the driver
+        # marked acceptable, and reduce EXACTLY to their single-label forms on
+        # rows that mark one level.
+        sacc = set_accuracy(Yl, Yp); mf1 = set_macro_f1(Yl, Yp, 5)
+        err = set_mae(Yl, Yp); kappa = set_qwk(Yl, Yp, 5)
+        print(f"[epoch {ep:02d}] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
+              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)})")
 
-        # Select on MAE: LoA is ordinal, so off-by-1 << off-by-4, and accuracy
-        # is blind to error distance (and to majority-class collapse under the
-        # class imbalance). MAE is the design-doc primary metric.
+        # Select on set-MAE: LoA is ordinal, so off-by-1 << off-by-4, and
+        # accuracy is blind to error distance (and to majority-class collapse
+        # under the class imbalance). MAE is the design-doc primary metric, and
+        # the set form is the one that does not silently score a multi-label
+        # window against the driver's lowest acceptable level.
         if err < best:
             best = err
             save_checkpoint(model, str(outp), arch=arch)
-            print(f"[OK] saved -> {outp} (MAE={err:.3f})")
+            print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
 
-    print(f"[BEST] MAE={best:.3f}")
+    print(f"[BEST] set-MAE={best:.3f}")
 
 
 if __name__ == "__main__":

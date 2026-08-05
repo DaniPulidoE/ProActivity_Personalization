@@ -676,10 +676,13 @@ POPUP_INPUT_DEFAULT = POPUP_INPUT_KEYBOARD
 # fixing one for the whole session with --functionname.
 #
 # The spellings are NOT free text: they have to match src/ProVoice/fcd_config.py
-# exactly, because resolve_function_key() maps anything it does not recognise to
-# the FIRST entry of its table ('Adjust seat positioning') without warning. A
-# paraphrase like 'Send a message' or 'Change music' would therefore be logged
-# against the wrong FCD vector rather than failing loudly.
+# exactly. A paraphrase like 'Send a message' or 'Change music' resolves to
+# fcd_config.UNKNOWN_FUNCTION_KEY and is scored with a NEUTRAL FCD vector (all
+# 3s) rather than that function's real one, so the segment carries no task
+# context. It warns once per distinct bad name ('[fcd][warn] ...') and the
+# 'Unknown function' string reaches the decisions.csv `profile` column, so this
+# is now detectable after a run instead of silent — but the segment is still
+# wasted. Check the console for [fcd][warn] before trusting a session.
 RANDOM_FUNCTION_POOL = (
     'Send a text message',
     'Start a phone call',

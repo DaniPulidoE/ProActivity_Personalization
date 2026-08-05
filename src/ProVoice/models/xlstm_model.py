@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import json
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -186,10 +187,44 @@ RESAMPLE_GAP_S = 1.0
 
 
 def secs_of_day(ts: Any) -> Optional[float]:
-    """Parse a frame timestamp ('HH:MM:SS.fff' or full ISO) to seconds-of-day."""
+    """Parse a frame timestamp ('HH:MM:SS[.fff]' or full ISO) to seconds-of-day.
+
+    HOT PATH. Called about 400x per decision at 4 Hz — every frame in the window
+    is parsed twice, once by ``truncate_frames_by_seconds`` and once by
+    ``_relative_times`` — and once per row over the whole training set.
+    ``strptime`` costs ~4.7 us/call and is the bulk of that, so the fixed
+    ``HH:MM:SS[.fff]`` shape the DataCollector actually writes (100 % of real
+    logged frames) is parsed by hand first at ~0.5 us, and everything else falls
+    through to the general parsers.
+
+    The arithmetic mirrors the fallback's ``h*3600 + m*60 + s + micro/1e6``
+    term for term, including the split of seconds into integer and fractional
+    parts, so the two paths agree BIT-FOR-BIT rather than merely closely — a
+    reordered float sum would differ in the last ulp and make the fast path a
+    silent source of drift between otherwise identical runs.
+
+    The ISO fallback is not optional. The drive UI writes full ISO datetimes for
+    label windows, and returning None for those fails SILENTLY in the worst
+    direction: ``_relative_times`` DROPS unparseable frames (so a window quietly
+    skips resampling and reaches the model on the wrong time grid) and
+    ``truncate_frames_by_seconds`` returns the sequence uncut (so ~40-100 s of
+    history reaches a model trained on 20 s windows). Neither raises.
+    """
     if not ts:
         return None
     s = str(ts).strip()
+    # Fast path, guarded on the exact shape: colons in place, all-digit fields,
+    # and either nothing or a '.' after the seconds. Anything else — a sign, a
+    # space-padded hour, an ISO date, a timezone suffix — drops through to the
+    # general parsers rather than being silently mis-read.
+    if (len(s) >= 8 and s[2] == ':' and s[5] == ':'
+            and (len(s) == 8 or s[8] == '.')
+            and s[0:2].isdigit() and s[3:5].isdigit() and s[6:8].isdigit()):
+        try:
+            return (int(s[0:2]) * 3600 + int(s[3:5]) * 60 + int(s[6:8])
+                    + (float(s[8:]) if len(s) > 8 else 0.0))
+        except ValueError:
+            pass
     t = None
     try:
         t = datetime.fromisoformat(s).time()
@@ -335,7 +370,7 @@ def log_encoded_frames(
     mode: str,
     tag: str,
     frames: np.ndarray,
-    label: Optional[int] = None,
+    levels: Optional[np.ndarray] = None,
 ) -> None:
     """Append one JSONL line per frame to an open file handle.
 
@@ -344,13 +379,20 @@ def log_encoded_frames(
         mode:   "train", "val", or "infer"
         tag:    segment_id (train/val) or timestamp string (infer)
         frames: float32 array shape (T, D_IN) — only real frames, no zero padding
-        label:  integer LoA class 0-4 (train/val only; omit for infer)
+        levels: multi-hot (K,) mark vector, logged as the LIST of LoA levels the
+                driver marked acceptable (train/val only; omit for infer). A
+                list, not a scalar: a window may mark several levels, and
+                collapsing that to one integer is exactly the bias this
+                pipeline no longer carries.
     """
+    marked: Optional[List[int]] = None
+    if levels is not None:
+        marked = [int(k) for k, v in enumerate(np.asarray(levels).ravel()) if v]
     for i in range(len(frames)):
         vec = frames[i]
         entry: Dict[str, Any] = {"mode": mode, "tag": tag, "frame_idx": i}
-        if label is not None:
-            entry["label"] = label
+        if marked is not None:
+            entry["levels"] = marked
         for j, name in enumerate(FEATURE_NAMES):
             entry[name] = round(float(vec[j]), 6)
         fh.write(json.dumps(entry) + "\n")
@@ -376,6 +418,23 @@ def _as01(x: Any) -> float:
         return 0.0
 
 
+@lru_cache(maxsize=256)
+def _fcd_vec_normalized(functionname: str) -> Tuple[float, ...]:
+    """The 12 FCD dims for ``functionname``, normalised [1,5] -> [0,1].
+
+    Cached because it is a pure function of the name and the name is CONSTANT
+    across a window at serving (``encode_and_resample`` is handed one name for
+    the whole sequence) — yet it used to be recomputed per frame: a dict copy
+    out of ``get_fcd_for_function`` plus twelve float ops, then discarded.
+
+    Returns a TUPLE, not a list: immutable, so handing the same object to every
+    caller cannot let one of them corrupt the cache. ``encode_frame`` only
+    splats it, so nothing downstream needs a mutable copy.
+    """
+    fcd = get_fcd_for_function(functionname)
+    return tuple((float(fcd[k]) - 1.0) / 4.0 for k in FCD_NAMES)
+
+
 def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     """Encode a single timestep into a ``float32`` vector of length ``D_IN``.
 
@@ -390,8 +449,7 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     stringifies the column), or a plain string (``"phone"``). All forms are
     normalised to a list before building the multi-hot vector.
     """
-    fcd = get_fcd_for_function(functionname or "")
-    fcd_vec = [(float(fcd[k]) - 1.0) / 4.0 for k in FCD_NAMES]   # [1,5] → [0,1]
+    fcd_vec = _fcd_vec_normalized(functionname or "")            # [1,5] → [0,1]
     num = [_as01(row.get(k)) for k in STATE_NUM]
     num_carla = [_as01(row.get(k)) for k in STATE_CARLA]
     catv = []
@@ -522,7 +580,13 @@ def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.T
     - 'corn': logits are K-1 conditionals P(y>k | y>k-1). The chain rule gives
       cumulative probs q_k = P(y>k) as a running product of sigmoids (monotone
       non-increasing by construction => rank-consistent), and differencing the
-      q_k yields a valid PMF: p_0 = 1-q_1, p_k = q_k - q_{k+1}, p_{K-1} = q_{K-1}.
+      q_k yields a valid PMF. With q 0-indexed (q_k = P(y>k), k = 0..K-2) and
+      the conventions q_{-1} = 1, q_{K-1} = 0, every class is one difference:
+      p_k = q_{k-1} - q_k, i.e. p_0 = 1-q_0 and p_{K-1} = q_{K-2}.
+
+    To go all the way to a single LoA, pass the result to :func:`probs_to_label`
+    (or use :func:`logits_to_label`) — argmax is NOT the right rule for a CORN
+    head.
     """
     if head_type == 'softmax':
         return torch.softmax(logits, dim=-1)
@@ -533,6 +597,60 @@ def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.T
         lower = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)  # [q_0, ..., q_{K-2}, 0]
         return upper - lower                                   # non-negative because q is monotone
     raise ValueError(f"Unknown head_type: {head_type!r}")
+
+
+# --------------------------------------------------------------------------- #
+# PMF -> single LoA. The SECOND half of the decoding contract (logits_to_probs
+# is the first), shared by the trainers, the sweep and the decision engine so
+# train and serve cannot pick different rules.
+# --------------------------------------------------------------------------- #
+CORN_RANK_THRESHOLD = 0.5
+
+
+def probs_to_label(probs: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
+    """Decode a (B, K) PMF to (B,) integer LoA using each head's canonical rule.
+
+    - **'softmax': argmax** (the mode). A softmax head is nominal — its outputs
+      carry no order — so the mode is the only rule its parameterization
+      justifies.
+    - **'corn': the rank rule of Shi, Cao & Raschka (2023)**,
+      ``y_hat = sum_k 1[q_k > 0.5]`` with ``q_k = P(y > k)``: walk up the
+      thresholds while the model still believes the label is above them. This
+      is CORN's *published* prediction rule and the one its rank-consistency
+      guarantee is stated for — `q` is monotone by construction, so the
+      indicator flips at most once and ``y_hat`` is exactly the index of that
+      flip. Bounded in [0, K-1] with no clamping: all thresholds below 0.5
+      gives 0, all above gives K-1.
+
+    Why this is not argmax. ``sum_k 1[q_k > 0.5]`` is the **median** of the
+    decoded PMF, whereas argmax is its **mode**. They are optimal for different
+    losses — the median minimizes expected absolute error, the mode minimizes
+    0/1 error — and on this head they disagree on ~9 % of predictions, by up to
+    3 levels. LoA is ordinal and the design selects models on set-MAE, so the
+    median is both the better-matched estimator and the one the CORN literature
+    reports; argmax was the previous behaviour and is kept available as
+    ``logits_to_probs(...).argmax(-1)`` for ablations.
+
+    Note for a CE-vs-CORN comparison: this changes head AND decoder together.
+    To isolate the head, decode both arms with argmax explicitly.
+
+    Works on a posterior-AVERAGED PMF too (the Laplace layer's
+    ``predictive_pmf``): ``q_k`` is a linear functional of the PMF, so the
+    ``q`` of an averaged PMF is the average of the samples' ``q``.
+    """
+    if head_type == 'softmax':
+        return probs.argmax(dim=-1)
+    if head_type == 'corn':
+        # q_k = P(y > k) = sum_{j > k} p_j — reverse cumulative sum, dropping
+        # the k = -1 entry (which is identically 1).
+        q = probs.flip(-1).cumsum(-1).flip(-1)[..., 1:]         # (B, K-1)
+        return (q > CORN_RANK_THRESHOLD).sum(dim=-1)
+    raise ValueError(f"Unknown head_type: {head_type!r}")
+
+
+def logits_to_label(logits: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
+    """``probs_to_label(logits_to_probs(logits, ht), ht)`` — the usual entry point."""
+    return probs_to_label(logits_to_probs(logits, head_type), head_type)
 
 
 # --------------------------------------------------------------------------- #

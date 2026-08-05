@@ -88,7 +88,7 @@ from ProVoice.fcd_config import FCD_NAMES
 from ProVoice.models.xlstm_model import (
     save_checkpoint,
     load_checkpoint,
-    logits_to_probs,
+    logits_to_label,
     encode_and_resample,
     STATE_NUM,
     STATE_CARLA,
@@ -97,14 +97,15 @@ from ProVoice.models.xlstm_model import (
     soft_corn_loss,
 )
 from ProVoice.models.xlstm_model import _as01
+from ProVoice.models.laplace_head import corn_curvature_blocks
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
     read_jsonl,
     normalize_row,
     make_collate,
-    mae,
-    qwk,
+    set_mae,
+    set_qwk,
 )
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -114,10 +115,10 @@ LEVELS = [f"Level_{i}" for i in range(1, 6)]
 # tasks) and the one-hot / length-encoded categoricals are not continuous.
 _JITTER_SLICE = slice(len(FCD_NAMES), len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA))
 
-# (frames (T, D_IN) float32, argmax LoA class 0-4, multi-hot marked levels).
-# The int is what the ordinal METRICS need; the multi-hot is the training
-# target, so a driver who marks several acceptable LoAs is not collapsed.
-Segment = Tuple[np.ndarray, int, np.ndarray]
+# (frames (T, D_IN) float32, multi-hot marked levels). The multi-hot is the
+# whole label: it is the training target AND the metric target, so a driver who
+# marks several acceptable LoAs is never collapsed to one of them.
+Segment = Tuple[np.ndarray, np.ndarray]
 
 
 def build_driver_segments(
@@ -125,12 +126,12 @@ def build_driver_segments(
     window_seconds: float | None,
     resample_hz: float | None = None,
 ) -> Dict[str, List[Segment]]:
-    """Encode one (X, y, levels) triple per segment, grouped per driver, chronologically.
+    """Encode one (X, levels) pair per segment, grouped per driver, chronologically.
 
     Chronology = first appearance in the JSONL (groupby(sort=False)), NOT the
     lexicographic order of segment_id strings — episode supports must be
     temporal prefixes/blocks. Segments with missing/all-zero Level_* labels
-    are skipped and reported, never argmax'd into a bogus class-0 label.
+    are skipped and reported, never collapsed into a bogus class-0 label.
     """
     if not all(k in df.columns for k in LEVELS):
         raise ValueError(f"Input data has no {LEVELS} columns; labels are required.")
@@ -145,16 +146,16 @@ def build_driver_segments(
                 skipped.append(gid)
                 continue
             # Both losses take the marked SET, so a multi-label segment trains
-            # on what the driver gave instead of being rejected. The argmax int
-            # rides along only for the ordinal metrics.
+            # on what the driver gave instead of being rejected — and the
+            # meta-validation metrics take the same set, so early stopping is
+            # not steered by a collapsed stand-in for it.
             levels = (lv > 0).astype(np.float32)
-            y = int(np.argmax(lv))
-            rows = [g.iloc[i].to_dict() for i in range(len(g))]
+            rows = g.to_dict("records")
             rows = truncate_frames_by_seconds(rows, window_seconds)
             # Same fixed grid as train_XLSTM.SeqDataset — the meta-learner must
             # see the segments exactly as the population model did.
             X = encode_and_resample(rows, resample_hz, window_seconds)
-            segs.append((X, y, levels))
+            segs.append((X, levels))
         if segs:
             drivers[str(pid)] = segs
     if skipped:
@@ -240,18 +241,99 @@ def adapt_head(Z: torch.Tensor, target: torch.Tensor,
     return w, b
 
 
+def _solve_head_newton(Z: torch.Tensor, target: torch.Tensor,
+                       w0: torch.Tensor, b0: torch.Tensor,
+                       loss_fn, l2sp: float, max_iter: int, tol: float,
+                       ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Damped Newton on the CORN proximal problem — the fast path.
+
+    The inner objective is ~260 parameters over at most 10 support points and
+    is STRICTLY convex (each CORN unit is a logistic regression, plus the prox
+    term's 2λI), so Newton converges quadratically and the exact Hessian is
+    already available block-diagonally from ``corn_curvature_blocks``. LBFGS
+    with a 200-iteration cap and strong-Wolfe line search was solving this to
+    ~1e-5 in 17.9 ms — the dominant cost of an iMAML episode once the dense
+    autograd Hessian was removed.
+
+    Gradient and objective come from ``loss_fn`` via autograd rather than a
+    second hand-derived formula: the Hessian is the expensive part and is
+    already shared and verified, while a duplicated gradient could silently
+    drift from ``soft_corn_loss`` if that ever changed.
+
+    Backtracking (Armijo) keeps it honest: the Newton direction is a descent
+    direction because H is PD, so the line search terminates, and every step
+    decreases the objective. Without damping, a full Newton step can overshoot
+    on a logistic loss when the anchor starts far from the optimum.
+
+    A unit no label reaches gets a zero curvature block, so its Hessian is the
+    pure 2λI prior and the first Newton step lands it exactly on the anchor —
+    which is the correct minimiser for a unit with no data.
+    """
+    anchor_w, anchor_b = w0.detach(), b0.detach()
+    w, b = anchor_w.clone(), anchor_b.clone()
+    n_out, d = w.shape
+    n = Z.shape[0]
+    eye = torch.eye(d + 1, dtype=torch.float64, device=Z.device)
+
+    def _obj(w_: torch.Tensor, b_: torch.Tensor) -> torch.Tensor:
+        return (loss_fn(F.linear(Z, w_, b_), target)
+                + l2sp * (((w_ - anchor_w) ** 2).sum() + ((b_ - anchor_b) ** 2).sum()))
+
+    def _val_and_grad(w_, b_):
+        wg = w_.detach().requires_grad_(True)
+        bg = b_.detach().requires_grad_(True)
+        val = _obj(wg, bg)
+        gw, gb = torch.autograd.grad(val, (wg, bg))
+        return float(val.detach()), gw, gb
+
+    for _ in range(max_iter):
+        val, gw, gb = _val_and_grad(w, b)
+        if float((gw.pow(2).sum() + gb.pow(2).sum()).sqrt()) <= tol:
+            break
+        H = corn_curvature_blocks(Z, target, w, b) / n + 2.0 * l2sp * eye
+        g_blk = torch.cat([gw, gb.unsqueeze(1)], dim=1).to(torch.float64)
+        L = torch.linalg.cholesky(H)                       # PD: 2*l2sp > 0
+        step = torch.cholesky_solve(g_blk.unsqueeze(-1), L).squeeze(-1)
+        dw = -step[:, :d].to(w.dtype)
+        db = -step[:, d].to(b.dtype)
+        slope = float((gw * dw).sum() + (gb * db).sum())   # < 0, H is PD
+        t, ok = 1.0, False
+        with torch.no_grad():
+            for _ in range(40):
+                if float(_obj(w + t * dw, b + t * db)) <= val + 1e-4 * t * slope:
+                    ok = True
+                    break
+                t *= 0.5
+        if not ok:            # already at the optimum to float precision
+            break
+        w = w + t * dw
+        b = b + t * db
+
+    _, gw, gb = _val_and_grad(w, b)
+    residual = float((gw.pow(2).sum() + gb.pow(2).sum()).sqrt())
+    return w.detach(), b.detach(), residual
+
+
 def solve_head_proximal(Z: torch.Tensor, target: torch.Tensor,
                         w0: torch.Tensor, b0: torch.Tensor,
                         loss_fn, l2sp: float, max_iter: int, tol: float,
+                        head_type: str = "corn",
                         ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """Solve the proximal head problem argmin_θ loss(θ) + λ·||θ − θ_meta||²
-    to (near-)optimality with full-batch LBFGS. The objective is strictly
-    convex (GLM losses + the 2λI of the prox term), so the argmin is unique.
+    to (near-)optimality. The objective is strictly convex (GLM losses + the
+    2λI of the prox term), so the argmin is unique.
+
+    CORN heads use damped Newton with the exact block-diagonal Hessian
+    (:func:`_solve_head_newton`). Softmax heads fall back to LBFGS: their units
+    couple through the normaliser, so the block-diagonal Hessian does not apply.
 
     Returns (w*, b*, residual) where residual = ||∇(inner objective)|| at the
     returned point. The implicit iMAML gradient is exact only at the argmin —
     callers should surface residual > tol instead of silently trusting it.
     """
+    if head_type == "corn":
+        return _solve_head_newton(Z, target, w0, b0, loss_fn, l2sp, max_iter, tol)
+
     anchor_w, anchor_b = w0.detach(), b0.detach()
     w = anchor_w.clone().requires_grad_(True)
     b = anchor_b.clone().requires_grad_(True)
@@ -280,7 +362,8 @@ def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
                     Zq: torch.Tensor, vq: torch.Tensor,
                     w0: torch.Tensor, b0: torch.Tensor,
                     loss_fn, l2sp: float, scale: float,
-                    max_iter: int, tol: float) -> Tuple[float, float]:
+                    max_iter: int, tol: float,
+                    head_type: str = "corn") -> Tuple[float, float]:
     """One iMAML episode: implicit meta-gradients from the stationarity of
     the proximal inner problem (Rajeswaran et al. 2019), computed exactly at
     this head size (dense solve, no CG).
@@ -299,7 +382,7 @@ def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
     """
     Zs_det = Zs.detach()
     ws, bs, residual = solve_head_proximal(Zs_det, vs, w0, b0, loss_fn,
-                                           l2sp, max_iter, tol)
+                                           l2sp, max_iter, tol, head_type=head_type)
 
     # Query pathway: backbone grads through Zq; g_q lands on the wl/bl leaves.
     wl = ws.clone().requires_grad_(True)
@@ -309,19 +392,52 @@ def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
     gq = torch.cat([wl.grad.reshape(-1), bl.grad.reshape(-1)])
 
     # v = (∇²G at θ*)⁻¹ · g_q. The Hessian includes the prox term's +2λI, so
-    # it is PD and the dense solve is exact.
+    # it is PD and the solve is exact.
     n_out, d = ws.shape
     anchor_w, anchor_b = w0.detach(), b0.detach()
-    theta_star = torch.cat([ws.reshape(-1), bs.reshape(-1)])
 
-    def flat_objective(t: torch.Tensor) -> torch.Tensor:
-        wf, bf = t[:n_out * d].view(n_out, d), t[n_out * d:]
-        return (loss_fn(F.linear(Zs_det, wf, bf), vs)
-                + l2sp * (((wf - anchor_w) ** 2).sum() + ((bf - anchor_b) ** 2).sum()))
+    if head_type == "corn":
+        # Closed-form block-diagonal Hessian instead of
+        # torch.autograd.functional.hessian, which costs ONE double-backward per
+        # parameter — 260 of them per episode at the deployed head size, ~180x
+        # the cost of this path for a bit-identical result (verified to 1e-16 in
+        # float64 against autograd, with the autograd Hessian's off-block
+        # entries exactly zero).
+        #
+        # NOTE the normaliser. corn_curvature_blocks is un-normalised, while
+        # this inner objective is the BATCH-MEAN loss + λ||·||², so the data
+        # term carries 1/B and the prox term contributes exactly 2λI. Reusing
+        # LaplacePosterior's τ = 2Nλ here instead would rescale v by B — and B
+        # is the episode's support size, drawn per episode, so it would inject
+        # episode-dependent noise into the meta-gradient without raising.
+        blocks = corn_curvature_blocks(Zs_det, vs, ws, bs)          # (K-1, E+1, E+1)
+        eye = torch.eye(d + 1, dtype=blocks.dtype, device=blocks.device)
+        H = blocks / Zs_det.shape[0] + 2.0 * l2sp * eye
+        # Solve per unit. The flat layout here is [all weights; all biases], so
+        # unit j's parameters are NOT contiguous in it — assembling a flat
+        # matrix and slicing it is where an index bug would hide. Going
+        # straight to (K-1, E+1) blocks sidesteps that entirely, and it is the
+        # shape the VJP below wants anyway.
+        gq_blk = torch.cat([gq[:n_out * d].view(n_out, d),
+                            gq[n_out * d:].unsqueeze(1)], dim=1).to(blocks.dtype)
+        L = torch.linalg.cholesky(H)                                # PD: 2λ > 0
+        v_blk = torch.cholesky_solve(gq_blk.unsqueeze(-1), L).squeeze(-1)
+        vw = v_blk[:, :d].to(ws.dtype)
+        vb = v_blk[:, d].to(bs.dtype)
+    else:
+        # Softmax heads couple their units through the normaliser, so the
+        # Hessian is not block-diagonal and the closed form does not apply.
+        # Fall back to the dense autograd Hessian.
+        theta_star = torch.cat([ws.reshape(-1), bs.reshape(-1)])
 
-    H = torch.autograd.functional.hessian(flat_objective, theta_star)
-    v = torch.linalg.solve(H, gq)
-    vw, vb = v[:n_out * d].view(n_out, d), v[n_out * d:]
+        def flat_objective(t: torch.Tensor) -> torch.Tensor:
+            wf, bf = t[:n_out * d].view(n_out, d), t[n_out * d:]
+            return (loss_fn(F.linear(Zs_det, wf, bf), vs)
+                    + l2sp * (((wf - anchor_w) ** 2).sum() + ((bf - anchor_b) ** 2).sum()))
+
+        H = torch.autograd.functional.hessian(flat_objective, theta_star)
+        v = torch.linalg.solve(H, gq)
+        vw, vb = v[:n_out * d].view(n_out, d), v[n_out * d:]
 
     # One VJP delivers the remaining meta-gradients: −(∂/∂ψ)[∇_θG · v] puts
     # the anchor pathway into the LIVE w0/b0 (= 2λ·v·scale) and the support
@@ -375,18 +491,18 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
                         ) -> Tuple[float, float]:
     """Meta-validation on ONE held-out driver with the DEPLOYED adaptation:
     fine_tune_XLSTM-style AdamW on the head over the driver's first K segments
-    (true session prefix), then MAE/QWK on everything after — the same
-    temporal protocol as the sweep script."""
-    xs, _ys, ls, vs = collate(segs[:K])
+    (true session prefix), then set-MAE/set-QWK on everything after — the same
+    temporal protocol and the same set-aware metrics as the sweep script."""
+    xs, ls, vs = collate(segs[:K])
     Zs = embed(model, xs, ls, device)
     w, b = adapt_head_deployed(Zs, vs.to(device), model.head.weight, model.head.bias,
                                loss_fn, steps, lr, l2sp)
-    xq, yq, lq, _vq = collate(segs[K:])
+    xq, lq, vq = collate(segs[K:])
     Zq = embed(model, xq, lq, device)
     with torch.no_grad():
-        pred = logits_to_probs(F.linear(Zq, w, b), head_type).argmax(dim=-1)
-    Yt, Yp = yq.numpy(), pred.cpu().numpy()
-    return mae(Yt, Yp), qwk(Yt, Yp, 5)
+        pred = logits_to_label(F.linear(Zq, w, b), head_type)
+    Yl, Yp = vq.numpy(), pred.cpu().numpy()
+    return set_mae(Yl, Yp), set_qwk(Yl, Yp, 5)
 
 
 def main():
@@ -438,7 +554,11 @@ def main():
                          "keep --patience comfortably larger than the epochs remaining after "
                          "the switch, since val-MAE may transiently worsen at the transition.")
     ap.add_argument("--imaml-max-iter", type=int, default=200,
-                    help="LBFGS iteration cap for the iMAML inner solve.")
+                    help="Iteration cap for the iMAML inner solve (damped Newton on a "
+                         "CORN head, LBFGS on a softmax one). Newton converges "
+                         "quadratically on this strictly convex ~260-param problem and "
+                         "typically needs <20, so the default is a safety cap, not a "
+                         "budget; the per-epoch residual report is the thing to watch.")
     ap.add_argument("--imaml-tol", type=float, default=1e-4,
                     help="Gradient-norm tolerance for the iMAML inner solve. The implicit "
                          "meta-gradient is exact only at the argmin, so episodes ending above "
@@ -474,7 +594,7 @@ def main():
                     help="AdamW lr for meta-validation adaptation. Keep equal to "
                          "fine_tune_XLSTM's --lr (2e-3) for the same reason.")
     ap.add_argument("--patience", type=int, default=10,
-                    help="Early-stop after this many meta-epochs without val-MAE improvement.")
+                    help="Early-stop after this many meta-epochs without val set-MAE improvement.")
     # --- task augmentation ---
     ap.add_argument("--crop-frac",  type=float, default=0.0,
                     help="Max fraction of leading frames randomly dropped per segment (window crop).")
@@ -485,6 +605,16 @@ def main():
         raise ValueError(f"Need 1 <= k-min <= k-max, got {args.k_min}, {args.k_max}")
     if args.fo_warmup_epochs < 0:
         raise ValueError(f"--fo-warmup-epochs must be >= 0, got {args.fo_warmup_epochs}")
+    if args.order == "imaml" and args.l2sp <= 0.0:
+        # Without a binding prox term the inner problem is not strictly convex,
+        # so its argmin is not unique and the implicit gradient is undefined.
+        # Numerically the Hessian is singular too (condition number ~1e17), so
+        # this used to surface as a silently wrong solve rather than an error.
+        raise ValueError(
+            "--order imaml requires --l2sp > 0: the implicit meta-gradient is "
+            "defined by the proximal term, and without it the inner argmin is "
+            f"neither unique nor numerically solvable (got --l2sp {args.l2sp})."
+        )
     if args.fo_warmup_epochs > 0 and args.order == "first":
         print("[warn] --fo-warmup-epochs has no effect with --order first (already first-order).")
     if args.fo_warmup_epochs >= args.meta_epochs and args.order != "first":
@@ -611,17 +741,17 @@ def main():
                     drivers[pid], rng, args.k_min, args.k_max,
                     args.query_max, args.episode_start)
                 if args.crop_frac > 0.0 or args.jitter_std > 0.0: # jitter augmentation (if specified in arguments)
-                    support = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y, v)
-                               for X, y, v in support]
-                    query = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), y, v)
-                             for X, y, v in query]
+                    support = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), v)
+                               for X, v in support]
+                    query = [(augment_segment(X, rng, args.crop_frac, args.jitter_std), v)
+                             for X, v in query]
 
                 # Embed support/query. Support keeps its graph whenever the
                 # support pathway into the backbone is used (second/imaml);
                 # first order drops it. Query always keeps its graph.
-                xs, _ys, ls, vs = collate(support)
+                xs, ls, vs = collate(support)
                 Zs = embed(model, xs, ls, device, grad=second or imaml)
-                xq, _yq, lq, vq = collate(query)
+                xq, lq, vq = collate(query)
                 Zq = embed(model, xq, lq, device, grad=True)
 
                 if imaml:
@@ -632,7 +762,8 @@ def main():
                         Zs, vs.to(device), Zq, vq.to(device),
                         model.head.weight, model.head.bias,
                         loss_fn, args.l2sp, 1.0 / nb,
-                        args.imaml_max_iter, args.imaml_tol)
+                        args.imaml_max_iter, args.imaml_tol,
+                        head_type=head_type)
                     batch_loss += lq_val * nb # for logging
                     ep_res.append(res)
                 else:
@@ -682,7 +813,7 @@ def main():
             model.train()
             val_mae, val_qwk = float(np.mean(maes)), float(np.mean(qwks))
             print(f"[epoch {ep:02d}] query_loss={train_loss:.4f} "
-                  f"val_MAE={val_mae:.3f} val_QWK={val_qwk:.3f} "
+                  f"val_set-MAE={val_mae:.3f} val_set-QWK={val_qwk:.3f} "
                   f"(drivers={len(val_pids)}, K={val_ks}){res_note}")
             if val_mae < best_val:
                 best_val = val_mae
@@ -699,7 +830,7 @@ def main():
             save_checkpoint(model, str(outp), arch=arch)
 
     if val_pids:
-        print(f"[BEST] val_MAE={best_val:.3f} -> {outp}")
+        print(f"[BEST] val_set-MAE={best_val:.3f} -> {outp}")
     print("[next] compare inits with the SAME per-driver protocol, e.g.:\n"
           f"  python -m scripts.sweep_train_frac --in-data data/labeled_pXXX.jsonl "
           f"--in-model {outp} --out results/sweep_pXXX_anil.png")

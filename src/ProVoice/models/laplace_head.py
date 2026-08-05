@@ -42,6 +42,8 @@ fitting here applies the identical UQ mechanism to both arms by construction.
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from typing import Any, Dict, Optional
 
 import torch
@@ -52,6 +54,86 @@ from ProVoice.models.xlstm_model import logits_to_probs, levels_to_subset_weight
 # Checkpoint key under which the serialized posterior rides alongside "arch"
 # and "state_dict" in the .pt file (absent on checkpoints fit without UQ).
 LAPLACE_KEY = "laplace"
+
+# Seed for the posterior draws when the caller supplies no generator.
+#
+# The default has to be a FIXED seed rather than the global RNG. Every published
+# quantity here is a Monte-Carlo estimate over ~30 head samples — posterior
+# width vs. K, BALD scores, conformal scores, the quantile-decoded LoA — so
+# drawing from the ambient global RNG would make "the predictive PMF of this
+# driver at this K" depend on whatever else consumed random numbers earlier in
+# the process. Two runs of the same analysis would disagree, and at serving the
+# same driver state could decode to a different LoA on a re-request.
+#
+# A fresh generator seeded with this value is built PER CALL, so the mapping
+# (posterior, Z) -> PMF is a pure function: repeated calls agree, and call
+# ORDER is irrelevant. Pass an explicit `generator` to override — e.g. to study
+# the Monte-Carlo spread itself, which a fixed seed deliberately hides.
+DEFAULT_SAMPLE_SEED = 0
+
+
+@torch.no_grad()
+def corn_curvature_blocks(
+    Z: torch.Tensor,
+    levels: torch.Tensor,
+    W: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """Per-unit GLM curvature of the soft-CORN loss, SUMMED over samples.
+
+    Returns ``(K-1, E+1, E+1)``; block j is
+
+        sum_i  w_ij * sigma_ij * (1 - sigma_ij) * z~_i z~_i^T
+
+    with ``z~ = [z; 1]`` and ``w_ij = P_i(y >= j)`` (``levels_to_subset_weights``).
+
+    Exact, not an approximation. For BCE with a linear logit the second
+    derivative is ``sigma*(1-sigma)`` times the per-sample weight, independent
+    of the target value (the canonical-link GLM property), and CORN units share
+    no parameters — so the Hessian really is block-diagonal with these blocks.
+    Verified against ``torch.autograd.functional.hessian`` to ~1e-16 in float64,
+    with the off-block entries of the autograd Hessian exactly zero.
+
+    **UN-NORMALISED and PRIOR-FREE on purpose.** The two consumers minimise
+    differently-normalised objectives — :meth:`LaplacePosterior.fit` the
+    un-normalised NLL with prior ``2*N*lam``, ``xlstm_maml.imaml_meta_step`` the
+    BATCH-MEAN loss with prior ``2*lam`` — and folding either convention in here
+    is exactly the mistake that is invisible downstream. Reusing the Laplace
+    normaliser inside iMAML rescales the implicit meta-gradient by the support
+    size, which is drawn per episode, so it would not even be a constant
+    learning-rate error; and nothing raises. Each caller adds its own normaliser
+    and prior in the open.
+
+    **CORN only.** A softmax head couples its units through the normaliser, so
+    its Hessian has non-zero off-block entries (measured ~0.19 where CORN gives
+    exactly 0) and this decomposition does not hold.
+
+    Computed in float64 whatever the input dtype: these are small matrices about
+    to be inverted, and the cost is nothing next to the conditioning it buys.
+    """
+    Z = Z.detach().to(torch.float64)
+    levels = levels.detach().to(torch.float64)
+    W = W.detach().to(torch.float64)
+    b = b.detach().to(torch.float64)
+    if Z.shape[0] != levels.shape[0]:
+        raise ValueError(f"Z has {Z.shape[0]} rows but levels has {levels.shape[0]}")
+    if W.shape[0] != levels.shape[1] - 1:
+        raise ValueError(
+            f"Expected a CORN head with {levels.shape[1] - 1} units, got {W.shape[0]}. "
+            "Softmax heads are not block-diagonal; this decomposition does not apply."
+        )
+    n, e = Z.shape
+    Zt = torch.cat([Z, torch.ones(n, 1, dtype=torch.float64, device=Z.device)], dim=1)
+    theta = torch.cat([W, b.unsqueeze(1)], dim=1)              # (K-1, E+1)
+    Wt = levels_to_subset_weights(levels)                      # (N, K-1)
+    sig = torch.sigmoid(Zt @ theta.T)                          # (N, K-1)
+    wgt = Wt * sig * (1.0 - sig)                               # (N, K-1)
+    out = torch.empty(W.shape[0], e + 1, e + 1, dtype=torch.float64, device=Z.device)
+    for j in range(W.shape[0]):
+        # A unit no label reaches has wgt[:, j] == 0, giving a zero block — the
+        # pure-prior Hessian once the caller adds its prior term.
+        out[j] = (Zt * wgt[:, j].unsqueeze(1)).T @ Zt
+    return out
 
 
 class LaplacePosterior:
@@ -70,6 +152,8 @@ class LaplacePosterior:
         n_cond_examples: sum of the soft subset weights — a diagnostic of how
                          much data each threshold actually saw (equals hard
                          CORN's M when every segment marks one level)
+        sample_seed:     seed for posterior draws when no generator is passed
+                         (see DEFAULT_SAMPLE_SEED)
     """
 
     def __init__(
@@ -81,6 +165,7 @@ class LaplacePosterior:
         l2sp: float,
         n_examples: int,
         n_cond_examples: float,
+        sample_seed: int = DEFAULT_SAMPLE_SEED,
     ):
         self.mean = mean
         self.chol_prec = chol_prec
@@ -89,6 +174,20 @@ class LaplacePosterior:
         self.l2sp = float(l2sp)
         self.n_examples = int(n_examples)
         self.n_cond_examples = float(n_cond_examples)
+        self.sample_seed = int(sample_seed)
+
+    def _generator(self, generator: Optional[torch.Generator]) -> torch.Generator:
+        """Caller's generator, else a FRESH one seeded with ``sample_seed``.
+
+        Fresh per call, not stored: a persistent generator would advance with
+        each draw, so the same query would answer differently depending on how
+        many times it had been asked before.
+        """
+        if generator is not None:
+            return generator
+        g = torch.Generator()
+        g.manual_seed(self.sample_seed)
+        return g
 
     # ------------------------------------------------------------------ fit
     @classmethod
@@ -159,18 +258,13 @@ class LaplacePosterior:
         # is recovered by multiplying by N — that N is the prior scale.
         tau = 2.0 * N * float(l2sp)
 
+        # Un-normalised curvature (shared with xlstm_maml's iMAML step), plus
+        # THIS objective's prior. The normaliser lives here, not in the helper:
+        # soft_corn_loss averages over the batch, so rescaling by N recovers
+        # `NLL + N*lam*||.||^2`, whose prior precision is tau = 2*N*lam.
         P = Z.shape[1] + 1
         eye = torch.eye(P, dtype=torch.float64)
-        Zt = torch.cat([Z, torch.ones(N, 1, dtype=torch.float64)], dim=1)   # (N, E+1)
-        H = torch.empty(K1, P, P, dtype=torch.float64)
-        for j in range(K1):
-            Hj = tau * eye # prior precision
-            wj = Wt[:, j]
-            if bool((wj > 0).any()): # update prior with likelihood
-                sig = torch.sigmoid(Zt @ mean[j])                  # (N,)
-                w = wj * sig * (1.0 - sig)                         # weighted GLM curvature
-                Hj = Hj + (Zt * w.unsqueeze(1)).T @ Zt
-            H[j] = Hj
+        H = corn_curvature_blocks(Z, levels, W, b) + tau * eye
         chol_prec = torch.linalg.cholesky(H)                       # PD: tau > 0
 
         return cls(
@@ -190,9 +284,15 @@ class LaplacePosterior:
         """Draw head samples ~ N(mean, H^{-1}); returns (n_samples, K-1, E+1).
 
         With H = L L^T, x = mean + L^{-T} eps has covariance H^{-1}.
+
+        The single point where randomness enters this class — ``pmf_samples``,
+        ``predictive_pmf`` and ``predictive_loa_std`` all route through here, so
+        seeding this covers every published quantity. Omitting ``generator``
+        gives reproducible draws (see DEFAULT_SAMPLE_SEED).
         """
         K1, P = self.mean.shape
-        eps = torch.randn(n_samples, K1, P, 1, dtype=torch.float64, generator=generator)
+        eps = torch.randn(n_samples, K1, P, 1, dtype=torch.float64,
+                          generator=self._generator(generator))
         delta = torch.linalg.solve_triangular(
             self.chol_prec.transpose(-1, -2), eps, upper=True
         )
@@ -255,6 +355,10 @@ class LaplacePosterior:
             "l2sp": self.l2sp,
             "n_examples": self.n_examples,
             "n_cond_examples": self.n_cond_examples,
+            # Serialized so a reloaded posterior reproduces the numbers that were
+            # reported from it. Posteriors written before this key existed load
+            # fine — from_state_dict falls back to the constructor default.
+            "sample_seed": self.sample_seed,
         }
 
     @classmethod
@@ -269,10 +373,32 @@ def attach_laplace_to_checkpoint(path: str, posterior: LaplacePosterior) -> None
     Read-modify-write on the whole file so ``xlstm_model.save_checkpoint`` /
     ``load_checkpoint`` stay untouched and older checkpoints (no posterior)
     remain valid.
+
+    ATOMIC: the modified checkpoint is written to a temporary file in the same
+    directory and then ``os.replace``d over the original, so an interruption
+    (crash, Ctrl-C, full disk) leaves the previous checkpoint intact instead of
+    truncated. Writing in place would put the fine-tuned weights — the whole
+    output of the run — at risk to save a posterior that can always be refitted.
+    ``os.replace`` is atomic on POSIX and on Windows; the temp file must share
+    the destination's directory for that to hold, hence ``dir=``.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     ckpt[LAPLACE_KEY] = posterior.state_dict()
-    torch.save(ckpt, path)
+
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".laplace-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            torch.save(ckpt, fh)
+            fh.flush()
+            os.fsync(fh.fileno())      # survive a power loss, not just a crash
+        os.replace(tmp, path)
+    except BaseException:              # BaseException: clean up on Ctrl-C too
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_laplace_from_checkpoint(path: str) -> Optional[LaplacePosterior]:

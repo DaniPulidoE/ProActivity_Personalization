@@ -10,7 +10,7 @@ from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
 from ProVoice.models.xlstm_model import (
     save_checkpoint,
     load_checkpoint,
-    logits_to_probs,
+    logits_to_label,
     levels_to_distribution,
     soft_corn_loss,
 )
@@ -23,12 +23,10 @@ from ProVoice.models.train_XLSTM import (
     normalize_row,
     SeqDataset,
     make_collate,
-    accuracy,
-    macro_f1,
-    mae,
-    qwk,
     set_accuracy,
+    set_macro_f1,
     set_mae,
+    set_qwk,
 )
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -37,16 +35,15 @@ LEVELS = [f"Level_{i}" for i in range(1, 6)]
 def embed_all(model, dl, device):
     # function that precomputes the embeddings for all sequences in a dataloader, using the frozen in_proj and backbone of the model. Returns pooled embeddings and labels.
     """Run the frozen in_proj+backbone once; return pooled embeddings and labels."""
-    zs, ys, vs = [], [], []
-    for xb, yb, lb, vb in dl:
+    zs, vs = [], []
+    for xb, lb, vb in dl:
         h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
         # Batches are RIGHT-padded: read the hidden state at the last REAL
         # frame (index length-1), same readout as model.forward.
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
         zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
-        ys.append(yb)
-        vs.append(vb)   # multi-hot Level_* — the training target for both heads
-    return torch.cat(zs), torch.cat(ys), torch.cat(vs)
+        vs.append(vb)   # multi-hot Level_* — the training target AND the metric target
+    return torch.cat(zs), torch.cat(vs)
 
 
 def main():
@@ -188,14 +185,14 @@ def main():
         loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
 
     # model saving setup
-    best = -1.0  # ensures the first epoch always saves, so a checkpoint always exists
+    best = float("inf")  # select on set-MAE (lower is better); +inf always saves epoch 0
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # precompute embeddings for all sequences in train and test datasets (more efficient - back-bone is frozen)
-    Ztr, ytr, Vtr = embed_all(model, train_dl, device)   # (n_train, 64), (n_train,), (n_train, 5)
-    Zte, yte, Vte = embed_all(model, test_dl, device)
-    Ztr, ytr, Vtr = Ztr.to(device), ytr.to(device), Vtr.to(device)
-    Zte, yte, Vte = Zte.to(device), yte.to(device), Vte.to(device)
+    Ztr, Vtr = embed_all(model, train_dl, device)   # (n_train, 64), (n_train, 5)
+    Zte, Vte = embed_all(model, test_dl, device)
+    Ztr, Vtr = Ztr.to(device), Vtr.to(device)
+    Zte, Vte = Zte.to(device), Vte.to(device)
 
     multi = int((Vtr.sum(dim=-1) > 1).sum())
     if multi:
@@ -217,25 +214,27 @@ def main():
 
         # evaluation: one matrix multiply, no batching needed
         with torch.no_grad():
-            Yp = logits_to_probs(model.head(Zte), head_type).argmax(dim=-1).cpu().numpy()
-        Yt = yte.cpu().numpy()
+            Yp = logits_to_label(model.head(Zte), head_type).cpu().numpy()
         Vl = Vte.cpu().numpy()
-        acc = accuracy(Yt, Yp)
-        mf1 = macro_f1(Yt, Yp, 5)
-        err = set_mae(Vl, Yp)
+        # Set-aware throughout: a multi-label window is scored against the
+        # marked level nearest the prediction, not against its lowest.
         sacc = set_accuracy(Vl, Yp)
-        kappa = qwk(Yt, Yp, 5)
-        print(f"[epoch {ep:02d}] acc={acc:.3f} set-acc={sacc:.3f} macro-F1={mf1:.3f} "
-              f"MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yt)})")
+        mf1 = set_macro_f1(Vl, Yp, 5)
+        err = set_mae(Vl, Yp)
+        kappa = set_qwk(Vl, Yp, 5)
+        print(f"[epoch {ep:02d}] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
+              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)})")
 
-        # save model if best so far (or always, for now)
-        if acc > best:
-            best = acc
-            # DECIDE IN HOW TO MANAGE THIS LOGIC AFTERWARDS
+        # Select on set-MAE, matching train_XLSTM.py. Selecting on accuracy
+        # (the previous behaviour) is blind to ordinal distance and disagreed
+        # with the population trainer, so the two stages optimized different
+        # things — and it is the fine-tuned head that the study measures.
+        if err < best:
+            best = err
             save_checkpoint(model, str(outp), arch=arch)
-        print(f"[OK] saved-> {outp}")
-        
-    print(f"[BEST] acc={best:.3f}")
+            print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
+
+    print(f"[BEST] set-MAE={best:.3f}")
 
     if args.laplace:
         # The Laplace expansion is only valid at the head being shipped: the

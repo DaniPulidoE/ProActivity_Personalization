@@ -841,7 +841,6 @@ def main():
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully from trained_models/fcd_levels.pkl")
@@ -854,7 +853,6 @@ def main():
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully for collection")
@@ -878,7 +876,6 @@ def main():
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
                     default_function=functionname,
-                    conservative=True,
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
@@ -895,7 +892,6 @@ def main():
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             print("[main] Combined-FCD part loaded successfully.")
         except Exception as e:
@@ -917,7 +913,6 @@ def main():
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
                     default_function=functionname,
-                    conservative=True,
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
@@ -931,7 +926,6 @@ def main():
                 fcd_strategy=fcd_engine,
                 state_strategy=state_engine,
                 w_fcd=w_fcd,
-                conservative=True,
             )
             print("[main] CombinedFusionStrategy initialized successfully.")
         except Exception as e:
