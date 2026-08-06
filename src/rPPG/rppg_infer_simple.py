@@ -1,5 +1,4 @@
 import threading
-import types
 import queue
 from pathlib import Path
 import site
@@ -95,11 +94,6 @@ class OnlineRPPG(RemoteVitalSigns):
             }}
 
         super().__init__(config)
-
-
-        self.signal_processor.init_filters()   # re-init with the patched method
-
-        self._fs_lock = threading.Lock()
 
         # Ring buffer replacing the parent's O(num_frames) shift-and-append
         # window (RemoteVitalSigns.inference_thread rolls the WHOLE
