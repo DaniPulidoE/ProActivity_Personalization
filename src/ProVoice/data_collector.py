@@ -1011,7 +1011,10 @@ class DataCollector:
         # still gets their own std, so it degrades gracefully.
         PERCLOS_MIN_SCALE = 0.1
         if len(perclos_series) > 1:
-            std_perclos = max(float(np.std(perclos_series)), PERCLOS_MIN_SCALE)
+            #std_perclos = max(float(np.std(perclos_series)), PERCLOS_MIN_SCALE)
+            std_perclos = float(np.std(perclos_series))
+            if std_perclos == 0:
+                std_perclos = PERCLOS_MIN_SCALE
         else:  # no full-window samples collected -> fall back to the same scale
             std_perclos = PERCLOS_MIN_SCALE
         self.calibrate['perclos'] = {'mean': mean_perclos, 'std': std_perclos}
