@@ -1057,16 +1057,24 @@ def main():
     # the list grew, changing a fixed condition mid-study without a single line
     # of output saying so.
     #
-    # THE DENSITIES ARE ORDERED, which changes what the five collection
-    # scenarios are: not five interchangeable draws but a dose series from 15 to
-    # 40 vehicles. That suits a population model that cannot see traffic --
-    # congestion is a main determinant of the labels and the model has to be
-    # robust to it unseen -- and the counterbalancing in start_experiment.py's
-    # TRAFFIC_SEED_PLAN survives unchanged, because relabelling seeds does not
-    # disturb it: each density is still driven four times, twice as a first run
-    # and twice as a second, and every pair of densities occurs exactly once.
+    # THE DENSITIES ARE ORDERED, which changes what the collection scenarios
+    # are: not interchangeable draws but a dose series from 15 to 40 vehicles.
+    # That suits a population model that cannot see traffic -- congestion is a
+    # main determinant of the labels and the model has to be robust to it unseen
+    # -- and the counterbalancing in start_experiment.py's TRAFFIC_SEED_PLAN is
+    # undisturbed by relabelling seeds: over its twelve participants each
+    # density is driven six times, three as a first run and three as a second,
+    # and every ORDERED pair of densities occurs exactly once.
     #
-    # CHECK BEFORE USING THIS FOR REAL: that all five sizes hold the same
+    # 33 (25 VEHICLES) IS RETIRED. The study went from five collection scenarios
+    # to four, and 33 is the one dropped -- the middle rung, so the 15-40 range
+    # is unchanged. Its row stays here on purpose: start_experiment.py's
+    # COLLECTION_SEEDS no longer contains it, so it cannot be assigned by the
+    # plan, but --traffic-seed 33 remains a legal off-plan pilot and should
+    # spawn the density it always did rather than fall through to the
+    # "unlisted seed" branch below and quietly spawn the whole list.
+    #
+    # CHECK BEFORE USING THIS FOR REAL: that all four sizes hold the same
     # simulated-time rate, which the [SYNC] line reports every 30 s. "It spawns
     # fine" is not the same measurement as "it runs at real time". If 40 cars
     # runs at 0.5x and 15 at 0.85x, the amount of driving inside each 20 s label
@@ -1077,9 +1085,9 @@ def main():
         42: 11,   # study: calibration and adaptation. Do not change.
         11: 40,
         22: 30,
-        33: 25,
         44: 20,
         55: 15,
+        33: 25,   # RETIRED from the plan; off-plan --traffic-seed 33 only.
     }
 
     # THE ASSIGNMENT: the 30 cars split evenly three ways -- 10 baseline, 10

@@ -230,20 +230,32 @@ STUDY_TRAFFIC_SEED = 42
 # the imbalance is only ever visible to someone who reconstructs what should
 # have happened. Deriving it removes the step where that can go wrong.
 #
-# THE DESIGN. Five scenarios over ten participants x two runs. C(5,2) = 10, so
-# every participant gets a DIFFERENT PAIR and every pair of scenarios occurs
-# exactly once. Each scenario is then used four times: twice as a first run and
-# twice as a second. Verified at startup by _validate_traffic_plan().
+# THE DESIGN. Four scenarios over twelve participants x two runs. P(4,2) = 12 --
+# four choices for run 1 times three remaining for run 2 -- so every participant
+# gets a DIFFERENT ORDERED PAIR and every ordered pair occurs exactly once. Each
+# scenario is then used six times: three as a first run and three as a second.
+# Verified at startup by _validate_traffic_plan().
 #
-#  - Pairs all distinct (lambda = 1) means the scenario effect is estimable and
-#    not tangled with any one participant.
-#  - The 2/2 split across run positions is the counterbalance that matters:
+#  - Ordered pairs all distinct means every UNORDERED pair occurs exactly twice,
+#    once in each order. So the scenario effect is estimable, not tangled with
+#    any one participant, AND separable from the order it was met in -- which
+#    the previous ten-participant design (each unordered pair once, in one
+#    arbitrary order) could not do.
+#  - The 3/3 split across run positions is the counterbalance that matters:
 #    run 2 differs from run 1 for everyone -- they have learned the rig, learned
 #    the route, and are fifteen minutes more tired. A scenario that always
 #    landed in run 1 would have that baked into it inseparably.
-#  - Holding out any single scenario removes exactly four runs spread over four
+#  - Holding out any single scenario removes exactly six runs spread over six
 #    different participants, which is an honest generalisation test for the
 #    population model rather than a test on one person.
+#  - THE ROWS ARE IN BLOCKS OF FOUR (001-004, 005-008, 009-012) and each block
+#    is already balanced on its own: within it every scenario appears once as
+#    run 1 and once as run 2. Recruitment that stops at four or eight
+#    participants therefore still yields a complete counterbalance rather than a
+#    broken one -- which is the realistic failure mode, since the design is only
+#    balanced at exactly 12 and participants drop out. Run the rows IN ORDER for
+#    that to hold. (The three blocks are the "rotate by 1 / by 2 / by 3" shifts
+#    of the scenario list, which is what makes them cover the 12 arcs exactly.)
 #
 # WHY 42 IS ABSENT. It is the calibration/adaptation scenario (STUDY_TRAFFIC_SEED
 # above). Keeping it out of collection is what makes the study a test on traffic
@@ -252,31 +264,47 @@ STUDY_TRAFFIC_SEED = 42
 # THE RUN NUMBER IS NOT LOGGED SEPARATELY, and does not need to be: no
 # participant sees the same scenario twice (enforced below), so run number is
 # recoverable from the participantid and traffic_seed that every raw_data.jsonl
-# frame already carries.
+# frame already carries. Note this is a property of the pairs, not of the
+# design: it survives dropping to four scenarios only because no row repeats a
+# scenario, which _validate_traffic_plan makes fatal.
 #
 # CHANGING THIS: edit before the first participant, then leave it alone. If
 # someone drops out, re-run THEIR row with the replacement rather than adding a
-# new one -- a fresh pair breaks lambda = 1. For an 11th participant onwards,
-# add reversed pairs (P11 = ("1"'s pair reversed)) so the balance keeps growing
-# evenly. A pilot or a re-run that should not follow the plan uses an explicit
+# new one -- a fresh pair would duplicate one ordered pair and leave another
+# unused. For a 13th participant onwards, restart the cycle (P13 = P001's pair,
+# P14 = P002's, ...) so each block of four keeps the balance growing evenly. A
+# pilot or a re-run that should not follow the plan uses an explicit
 # --traffic-seed, which is honoured and announced.
+#
 # The seed VALUES are arbitrary labels -- nothing is derived from the number and
-# any five distinct integers would do. They only have to be distinct, stable
-# once collection starts, and different from STUDY_TRAFFIC_SEED.
-COLLECTION_SEEDS = (11, 22, 33, 44, 55)
+# any four distinct integers would do. They only have to be distinct, stable
+# once collection starts, and different from STUDY_TRAFFIC_SEED. What the seed
+# selects is a whole scenario, density included: fixed_npc_traffic.py's
+# SCENARIO_FLEET_SIZE maps 11/22/44/55 to 40/30/20/15 vehicles, so these four
+# are a dose series and their ORDER in COLLECTION_SEEDS is the dose order.
+# 33 (25 vehicles) was the fifth and is RETIRED -- the middle rung, dropped
+# rather than an endpoint so the 15-40 range is unchanged. It is no longer a
+# legal planned scenario (an entry naming it is fatal below), though
+# --traffic-seed 33 still runs it off-plan for a pilot.
+COLLECTION_SEEDS = (11, 22, 44, 55)
 
 TRAFFIC_SEED_PLAN = {
     # participantid: (run 1 scenario, run 2 scenario)
-    "001": (22, 11),
-    "002": (33, 11),
-    "003": (11, 44),
-    "004": (11, 55),
-    "005": (33, 22),
-    "006": (44, 22),
-    "007": (22, 55),
-    "008": (44, 33),
-    "009": (55, 33),
-    "010": (55, 44),
+    # Block 1 -- each scenario once as run 1, once as run 2
+    "001": (11, 22),
+    "002": (22, 44),
+    "003": (44, 55),
+    "004": (55, 11),
+    # Block 2
+    "005": (11, 44),
+    "006": (22, 55),
+    "007": (44, 11),
+    "008": (55, 22),
+    # Block 3
+    "009": (11, 55),
+    "010": (22, 11),
+    "011": (44, 22),
+    "012": (55, 44),
 }
 
 RUNS_PER_PARTICIPANT = 2
@@ -320,7 +348,7 @@ def _validate_traffic_plan():
     run number unrecoverable), a scenario outside COLLECTION_SEEDS, the study
     seed leaking into collection. The count balance is reported rather than
     enforced, because a plan is legitimately unbalanced while it is being
-    extended past ten participants.
+    extended past twelve participants, or while a block is half-recruited.
     """
     problems = []
     for pid, pair in TRAFFIC_SEED_PLAN.items():
@@ -348,18 +376,96 @@ def _validate_traffic_plan():
         raise SystemExit("Bad TRAFFIC_SEED_PLAN in start_experiment.py:\n  "
                          + "\n  ".join(problems))
 
+    # Reported, not fatal -- and printed only when something is off, so a
+    # correct plan is silent. This is the half of the design that a bad edit
+    # breaks WITHOUT breaking anything a single session can notice: the plan
+    # still resolves a scenario for every participant and run, it just no
+    # longer counterbalances. Saying so at startup is the only moment anyone
+    # would find out before the corpus is complete.
+    for line in traffic_plan_imbalances():
+        print("[PLAN][warn] " + line)
+
 
 def traffic_plan_summary():
-    """One line per scenario: how often it is used, and in which run position."""
+    """One line per scenario: how often it is used, and in which run position.
+
+    Plus one line for the ordered-pair coverage, which is what the twelve-row
+    design actually claims: P(4,2) = 12 pairs, each used exactly once.
+    """
     total, first = {}, {}
     for pair in TRAFFIC_SEED_PLAN.values():
         for i, seed in enumerate(pair):
             total[seed] = total.get(seed, 0) + 1
             if i == 0:
                 first[seed] = first.get(seed, 0) + 1
-    return ["scenario %d: %d run(s), %d as run 1, %d as run 2"
-            % (s, total[s], first.get(s, 0), total[s] - first.get(s, 0))
-            for s in sorted(total)]
+    lines = ["scenario %d: %d run(s), %d as run 1, %d as run 2"
+             % (s, total[s], first.get(s, 0), total[s] - first.get(s, 0))
+             for s in sorted(total)]
+    n_seeds = len(COLLECTION_SEEDS)
+    lines.append("ordered pairs: %d distinct of %d rows, %d possible"
+                 % (len(set(TRAFFIC_SEED_PLAN.values())),
+                    len(TRAFFIC_SEED_PLAN),
+                    n_seeds * (n_seeds - 1)))
+    return lines
+
+
+def traffic_plan_imbalances():
+    """Ways the plan departs from the counterbalance, worst first. [] if none.
+
+    Everything here is a COUNT, i.e. a property of the plan as a whole rather
+    than of any one row -- which is exactly why it needs stating out loud. A row
+    that is wrong on its own is caught above and is fatal; a plan whose rows are
+    each individually fine but which uses one scenario five times and another
+    seven is indistinguishable from a correct one at every point where anyone
+    looks, until the analysis.
+
+    A part-recruited plan trips these legitimately (a half-finished block is
+    unbalanced by construction), so they are warnings and the message says which
+    complete size would clear them.
+    """
+    out = []
+    pairs = list(TRAFFIC_SEED_PLAN.values())
+    block = len(COLLECTION_SEEDS)
+    full = block * (block - 1)
+
+    dupes = sorted({p for p in pairs if pairs.count(p) > 1})
+    if dupes:
+        out.append("ordered pair(s) used more than once: %s. Each one used "
+                   "twice means another is unused, so that scenario order is "
+                   "never observed."
+                   % ", ".join("(%d, %d)" % p for p in dupes))
+
+    if len(pairs) % block:
+        out.append("%d participants planned; the design is balanced in blocks "
+                   "of %d (%d, %d, %d, ...), so this one stops mid-block."
+                   % (len(pairs), block, block, 2 * block, 3 * block))
+
+    total, first = {}, {}
+    for pair in pairs:
+        for i, seed in enumerate(pair):
+            total[seed] = total.get(seed, 0) + 1
+            if i == 0:
+                first[seed] = first.get(seed, 0) + 1
+    missing = [s for s in COLLECTION_SEEDS if s not in total]
+    if missing:
+        out.append("scenario(s) %s appear in no run at all."
+                   % ", ".join(str(s) for s in missing))
+    if total and len(set(total.values())) > 1:
+        out.append("scenarios are not driven equally often: "
+                   + ", ".join("%d x%d" % (s, total[s]) for s in sorted(total)))
+    lopsided = [s for s in sorted(total)
+                if abs(2 * first.get(s, 0) - total[s]) > 1]
+    if lopsided:
+        out.append("scenario(s) %s sit mostly in one run position, so their "
+                   "effect is confounded with practice and fatigue: %s"
+                   % (", ".join(str(s) for s in lopsided),
+                      ", ".join("%d = %d run 1 / %d run 2"
+                                % (s, first.get(s, 0), total[s] - first.get(s, 0))
+                                for s in lopsided)))
+    if out and len(pairs) != full:
+        out.append("(the complete design is %d participants: every ordered "
+                   "pair of the %d scenarios exactly once.)" % (full, block))
+    return out
 
 
 def resolve_traffic_seed(args, parser):
