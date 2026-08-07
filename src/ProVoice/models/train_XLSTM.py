@@ -16,6 +16,8 @@ from ProVoice.models.xlstm_model import (
     STATE_CAT,
     STATE_NUM,
     STATE_CARLA,
+    SENTINEL_VALUES,
+    FEATURE_ALIASES,
     XLSTMSequenceClassifier,
     save_checkpoint,
     DEFAULT_CONTEXT_LENGTH,
@@ -72,25 +74,51 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out['drowsiness_alert']= pick('drowsiness_alert', 'drowsy', 'fatigue')
     out['gaze_distracted'] = pick('gaze_distracted', 'gaze', 'distraction')
     out['heart_rate']      = pick('heart_rate', 'hr', 'heartrate', 'bpm')
-    # CARLA vehicle/world features — use sentinel defaults matching encode_frame expectations
+    # CARLA vehicle/world features — use sentinel defaults matching encode_frame expectations.
+    # NOTE: this function WHITELISTS keys; anything not listed here never reaches
+    # the trainer, and silently arrives at encode_frame as its default. Every
+    # name in STATE_NUM / STATE_CARLA must therefore appear below (asserted at
+    # the end of this function).
     out['speed_ratio_max']   = pick('speed_ratio_max',   default=None)
-    out['speed_ratio_limit'] = pick('speed_ratio_limit', default=-1)
     out['brake']             = pick('brake',             default=None)
     out['steer']             = pick('steer',             default=None)
-    out['precipitation']     = pick('precipitation',     default=None)
-    out['is_night']          = pick('is_night',          default=None)
+    out['throttle']          = pick('throttle',          default=None)
     out['is_junction']       = pick('is_junction',       default=None)
+    # null = "no vehicle ahead within the 100 m detection range", a real state of
+    # the world, NOT a missing measurement -- it maps to the reserved marker, not
+    # to 0.0 (which would mean a lead vehicle at zero metres). Same treatment
+    # encode_frame applies at serving time; SENTINEL_VALUES is the shared source.
+    out['lead_distance_m']   = pick('lead_distance_m',
+                                    default=SENTINEL_VALUES['lead_distance_m'])
     out['perclos']       = pick('perclos',       default=0.0)
     out['gaze_score']    = pick('gaze_score',    default=0.0)
     out['hr_delta']      = pick('hr_delta',      default=0.0)
     out['rr_delta']      = pick('rr_delta',      default=0.0)
     out['blink_rate']    = pick('blink_rate',    default=0.0)
     out['yawn_rate']     = pick('yawn_rate',     default=0.0)
+    # The DataCollector logs EAR under 'eye_ar'; the model feature is named 'ear'.
+    # Without the alias this column is silently all-zeros. The alias list is
+    # xlstm_model.FEATURE_ALIASES, NOT a literal here: encode_frame applies the
+    # same map at serving time, and the two drifting apart is exactly the
+    # train/serve skew this used to cause.
+    out['ear']           = pick('ear', *FEATURE_ALIASES['ear'], default=0.0)
+    out['mar']           = pick('mar',            default=0.0)
 
     for k in LEVELS:
         if k in row and row[k] not in (None, ""):
             out[k] = int(float(row[k]))
     return out
+
+
+# A model feature missing from normalize_row's whitelist does not raise -- it
+# arrives at encode_frame as a constant default (0.0, or the sentinel), so the
+# column is dead weight and training still "succeeds". Checked once at import,
+# against the schema itself, so adding a feature to STATE_NUM / STATE_CARLA
+# without wiring it up here fails loudly instead of quietly zeroing a channel.
+_NORMALIZE_ROW_KEYS = set(normalize_row({}))
+assert set(STATE_NUM) | set(STATE_CARLA) <= _NORMALIZE_ROW_KEYS, (
+    "normalize_row does not emit these model features: "
+    f"{sorted((set(STATE_NUM) | set(STATE_CARLA)) - _NORMALIZE_ROW_KEYS)}")
 
 
 def load_label_map(path: str | None) -> Dict[str, List[int]]: # NOT USED !!!
@@ -444,7 +472,10 @@ def main():
         if k not in df.columns: df[k] = 0.0
         df[k] = df[k].apply(_as01)
     for k in STATE_CARLA:
-        default = -1 if k == 'speed_ratio_limit' else 0.0
+        # SENTINEL_VALUES is the single source of truth for which columns have a
+        # reserved "missing" marker; encode_frame applies the same mapping at
+        # serving time. Hard-coding the name here would let the two drift.
+        default = SENTINEL_VALUES.get(k, 0.0)
         if k not in df.columns: df[k] = default
         df[k] = df[k].fillna(default)
     

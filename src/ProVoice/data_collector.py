@@ -293,7 +293,7 @@ class DataCollector:
         # bridge is noticed within a couple of frames rather than stalling the
         # thread for the default socket timeout.
         self._state_http_timeout = max(2.0, 3.0 * self._state_poll_interval)
-        self._cached_speed: int = 0
+        self._cached_speed: float = 0.0
         self._cached_steer: int = 0
         self._cached_brake: int = 0
         self._cached_precipitation: int = 0
@@ -1396,11 +1396,29 @@ class DataCollector:
             data['facebox_consec_misses'] = int(self._face_box_consec_misses)
 
         # Emotion — EmotiEffLib on the RGB tight face crop.
+        #
+        # Both keys are PRE-DECLARED as None so that (a) they exist on every
+        # line and keep a FIXED position in the JSON object, and (b) "the
+        # classifier produced no reading" is represented as null rather than
+        # forged into a real class. Three separate conditions land here and are
+        # deliberately indistinguishable downstream, because none of them tells
+        # us anything about the driver's affect: no face in frame, a landmark
+        # box that clipped to zero area at the frame edge, and detect_emotion
+        # returning None (recognizer failed to load, or inference raised).
+        #
+        # This used to backfill 'neutral' near the end of collect_data, which
+        # was actively harmful: a fabricated 'neutral' is byte-identical to a
+        # confident real one, so a session where EmotiEffLib never loaded read
+        # as a perfectly calm driver for its entire duration, and the only
+        # trace was emotion_prob VANISHING from the object (a missing key, not
+        # a null -- which breaks positional readers instead of null checks).
+        data['emotion'] = None
+        data['emotion_prob'] = None
         if emotion_crop_bgr is not None:
             with self._phase('visual.emotion'):
                 emo = self.detect_emotion(cv2.cvtColor(emotion_crop_bgr, cv2.COLOR_BGR2RGB))
             if emo:
-                data.update(emo)  # emotion, emotion_prob
+                data.update(emo)  # emotion, emotion_prob — overwrite, position kept
 
         # EAR/MAR from the landmarks (sentinels when no face, as before).
         if face_present:
@@ -1544,7 +1562,7 @@ class DataCollector:
             
             try:
                 vel = self.carla_vehicle.get_velocity()
-                speed = int((vel.x**2 + vel.y**2 + vel.z**2)**0.5 * 3.6)
+                speed = round((vel.x**2 + vel.y**2 + vel.z**2)**0.5 * 3.6, 2)
 
                 control = self.carla_vehicle.get_control()
                 brake = control.brake
@@ -1695,7 +1713,7 @@ class DataCollector:
         else:
             # No CARLA actor or bridge — minimal env-var fallback.
             pv = os.getenv('PV_SPEED')
-            speed = int(pv) if pv not in (None, '') else None
+            speed = round(float(pv), 2) if pv not in (None, '') else None
             brake = None
             steer = None
             speed_lim = None
@@ -1728,7 +1746,7 @@ class DataCollector:
         # 100 m" for the distance, and additionally "ego below walking pace" for
         # the headway -- neither is a missing value to be imputed, and neither
         # should be filled with 0 (a 0 s headway is a collision).
-        data['lead_distance_m']     = lead_distance_m
+        data['lead_distance_m']     = lead_distance_m/100 if lead_distance_m is not None else -1
         data['headway_s']           = headway_s
         # Static for the session, repeated per frame so a raw_data.jsonl line is
         # self-describing: which traffic scenario produced it is not recoverable
@@ -1781,9 +1799,6 @@ class DataCollector:
         for k, v in ctx.items():
             if v not in (None, ""):
                 data[k] = v
-
-        if 'emotion' not in data or not data['emotion']:
-            data['emotion'] = 'neutral'
 
         with self._lock:
             self.latest_data = dict(data)
@@ -2445,8 +2460,8 @@ class DataCollector:
                 # unread response leaves the socket mid-message and the next
                 # request would raise ResponseNotReady.
                 body = resp.read()
-                print(f"[DataCollector] HTTP GET {self.vehicle_state_url} "
-                      f"-> {resp.status} {resp.reason} ({len(body)} bytes)")
+                """print(f"[DataCollector] HTTP GET {self.vehicle_state_url} "
+                      f"-> {resp.status} {resp.reason} ({len(body)} bytes)")"""
                 if resp.status != 200:
                     raise ValueError(f"bridge returned HTTP {resp.status} {resp.reason}")
                 age_hdr = resp.getheader("X-State-Age")
@@ -2530,7 +2545,7 @@ class DataCollector:
                     raise ValueError(f"stale vehicle state ({age:.1f}s)")
                 _stale_since = 0.0
 
-                self._cached_speed               = int(state.get("speed_kmh", self._cached_speed))
+                self._cached_speed               = float(state.get("speed_kmh", self._cached_speed))
                 self._cached_brake               = float(state.get("brake", self._cached_brake))
                 self._cached_steer               = float(state.get("steer", self._cached_steer))
                 self._cached_speed_limit         = float(state.get("speed_limit_kmh", self._cached_speed_limit))

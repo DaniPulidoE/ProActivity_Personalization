@@ -37,8 +37,13 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('gaze-distracted').innerText = data.gaze_distracted ? 'YES' : 'NO';
         highlightAlerts(document.getElementById('gaze-distracted'));
 
-        document.getElementById('emotion-label').innerText = data.emotion;
-        document.getElementById('emotion-prob').innerText = data.emotion_prob;
+        // emotion/emotion_prob are null when the classifier produced no
+        // reading (no face, empty crop, recognizer down) -- show a dash
+        // rather than the string "null", and never a fabricated class.
+        document.getElementById('emotion-label').innerText =
+            (data.emotion == null ? '—' : data.emotion);
+        document.getElementById('emotion-prob').innerText =
+            (data.emotion_prob == null ? '—' : data.emotion_prob);
 
         document.getElementById('phone-status').innerText = data.lab.includes('phone') ? 'Detected' : 'No';
         highlightAlerts(document.getElementById('phone-status'));

@@ -198,7 +198,11 @@ class StateLevelsLoAStrategy(BaseStrategy):
             return 0.0
 
     def _extract_features(self, state: Dict[str, Any]) -> Optional[np.ndarray]:
-        cats = [str(state.get(k, "")) for k in _STATE_CAT]
+        # `or ""` not `.get(k, "")`: emotion is now None when the classifier
+        # produced no reading, and str(None) would feed the literal "None" to
+        # the categorical encoder as though it were a class it had been
+        # trained on. Absent and empty must encode identically here.
+        cats = [str(state.get(k) or "") for k in _STATE_CAT]
         has_any = any(cats) or any(k in state for k in _STATE_NUM)
         if not has_any: return None
         fn = state.get("functionname") or self.default_key

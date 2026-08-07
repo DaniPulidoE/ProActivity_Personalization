@@ -93,6 +93,7 @@ from ProVoice.models.xlstm_model import (
     STATE_NUM,
     STATE_CARLA,
     STATE_CAT,
+    SENTINEL_VALUES,
     levels_to_distribution,
     soft_corn_loss,
 )
@@ -668,7 +669,9 @@ def main():
         if k not in df.columns: df[k] = 0.0
         df[k] = df[k].apply(_as01)
     for k in STATE_CARLA:
-        default = -1 if k == "speed_ratio_limit" else 0.0
+        # See train_XLSTM: SENTINEL_VALUES is the one place a missing-marker is
+        # declared, so train / meta-train / serve cannot disagree.
+        default = SENTINEL_VALUES.get(k, 0.0)
         if k not in df.columns: df[k] = default
         df[k] = df[k].fillna(default)
 

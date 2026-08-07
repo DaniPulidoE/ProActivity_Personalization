@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,33 +47,34 @@ except ImportError:  # pragma: no cover - exercised only when xlstm is absent
 # --------------------------------------------------------------------------- #
 # Canonical feature schema (ONE fixed order, used everywhere).
 # --------------------------------------------------------------------------- #
-STATE_NUM = ['perclos', 'gaze_score', 'hr_delta', 'rr_delta', 'blink_rate', 'yawn_rate']
-STATE_CARLA = ['speed_ratio_max', 'speed_ratio_limit', 'brake', 'steer', 'precipitation', 'is_night', 'is_junction']
-STATE_CAT_LEN = ['environment', 'secondary_task']
+STATE_NUM = ['perclos', 'gaze_score', 'hr_delta', 'rr_delta', 'blink_rate', 'yawn_rate', 'ear', 'mar']
+# no speed ratio limit because all map has the same speed limit
+# no precipitation or night - no weather in CARLA0.10.0
+STATE_CARLA = ['speed_ratio_max', 'brake', 'steer', 'throttle', 'is_junction', 'lead_distance_m']
+STATE_CAT_LEN = []
 STATE_CAT_ONE_HOT = ['emotion', 'lab']
-STATE_CAT = STATE_CAT_LEN + STATE_CAT_ONE_HOT
+STATE_CAT =  STATE_CAT_ONE_HOT
 
 
 # one-hot encoding for emotion and lab categories
 EMOTION_VOCAB = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
-LAB_VOCAB = ['face', 'phone', 'drink', 'smoke', 'distracted', 'safe'] # leave only phone and drink if we use the detection model !
+LAB_VOCAB = ['face', 'drink'] # leave only phone and drink if we use the detection model !
 
 # FCD values, then each NUM (1 value), then each CAT (2 values).
 #D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
 # with one-hot encoding for emotion and lab categories
-D_IN = len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA) + len(STATE_CAT_LEN) + len(EMOTION_VOCAB) + len(LAB_VOCAB) 
+D_IN = len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA) + len(EMOTION_VOCAB) + len(LAB_VOCAB)
 
 DEFAULT_CONTEXT_LENGTH = 400
 
-# Canonical feature names — same order as the 40-dim vector produced by encode_frame().
+# Canonical feature names — same order as the D_IN-dim vector produced by encode_frame().
 # Used to label log entries so they can be read without the source code.
 FEATURE_NAMES: List[str] = (
     list(FCD_NAMES)                                       # 12  FCD dims (normalised [1,5]→[0,1])
-    + list(STATE_NUM)                                     #  6  driver state numerics
-    + list(STATE_CARLA)                                   #  7  CARLA vehicle/world
-    + ["environment_len", "secondary_task_len"]           #  2  string-length context encoding
+    + list(STATE_NUM)                                     #  8  driver state numerics
+    + list(STATE_CARLA)                                   #  6  CARLA vehicle/world
     + [f"emotion_{e}" for e in EMOTION_VOCAB]             #  7  one-hot emotion
-    + [f"lab_{l}"     for l in LAB_VOCAB]                 #  6  multi-hot distraction
+    + [f"lab_{l}"     for l in LAB_VOCAB]                 #  2  multi-hot distraction
 )
 assert len(FEATURE_NAMES) == D_IN, f"FEATURE_NAMES length {len(FEATURE_NAMES)} != D_IN {D_IN}"
 
@@ -83,7 +85,12 @@ assert len(FEATURE_NAMES) == D_IN, f"FEATURE_NAMES length {len(FEATURE_NAMES)} !
 # The collection loop is paced by `sampling_interval` but only ever falls BELOW
 # its nominal rate (CPU contention, camera stalls), so the achieved rate varies
 # per session: 19.6 Hz and 9.3 Hz have both been measured on the same machine on
-# the same day. `truncate_frames_by_seconds` already pins the WALL-CLOCK span of
+# the same day. Moving perception onto worker threads has since made the rate
+# much more stable -- 18.6 and 17.9 Hz over two 15-min sessions on 2026-08-07,
+# median inter-frame gap 51-53 ms, one gap >0.5 s in 32,892 frames -- but that
+# is a property of one machine under one load, not a guarantee, and the whole
+# point of this contract is that nothing downstream has to trust it.
+# `truncate_frames_by_seconds` already pins the WALL-CLOCK span of
 # the input, but the number of recurrent steps spanning that span still floats
 # with the rate — 20 s is ~396 frames at 19.6 Hz and ~186 at 9.3 Hz. An xLSTM
 # learns its time constants per STEP, not per second, so that is a 2x rescaling
@@ -152,7 +159,7 @@ DEFAULT_RESAMPLE_HZ = 10.0
 # the CARLA vehicle/world channels.
 _LINEAR_FEATURES = frozenset(
     ['perclos', 'gaze_score']
-    + ['speed_ratio_max', 'speed_ratio_limit', 'brake', 'steer', 'precipitation']
+    + ['speed_ratio_max', 'brake', 'steer', 'lead_distance_m']
 )
 assert _LINEAR_FEATURES <= set(FEATURE_NAMES), (
     f"unknown feature name in _LINEAR_FEATURES: {_LINEAR_FEATURES - set(FEATURE_NAMES)}")
@@ -162,12 +169,38 @@ assert _LINEAR_FEATURES <= set(FEATURE_NAMES), (
 # point whose two bracketing samples include the marker is HELD instead: a
 # blend of a real value and a sentinel reads as a real value and is not one.
 #
-#   * speed_ratio_limit — `speed / speed_limit`, or -1 when the limit is unknown
-#     or zero (data_collector._carla_process). Both operands are non-negative,
-#     so a genuine ratio can never be -1 and the marker is unambiguous. Without
-#     this guard a -1 -> 0.9 transition spread over ~5 grid steps would
-#     manufacture a deceleration-then-acceleration that never happened.
-SENTINEL_VALUES: Dict[str, float] = {'speed_ratio_limit': -1.0}
+#   * lead_distance_m — metres to the nearest vehicle ahead in the ego lane, or
+#     -1 for "no lead vehicle within the 100 m detection range" (see
+#     data_collector._carla_process, which logs that case as null; the null->-1
+#     mapping is applied here, in encode_frame, so the raw log keeps saying
+#     "nothing there" rather than asserting a distance). A distance is
+#     non-negative, so -1 is unambiguous. The marker is NOT interchangeable
+#     with 0: 0 m is bumper contact, i.e. the most urgent state the feature can
+#     express, and is exactly what `_as01(None)` would otherwise produce.
+#     Measured on data/raw_data.jsonl: 73.5 % of frames carry the marker and
+#     real readings cluster at both ends (p25 6.6 m, p75 55.8 m), so
+#     marker<->real transitions are frequent and large — without this guard each
+#     one would be smeared over ~5 grid steps into a closing/receding lead
+#     vehicle that never existed.
+# Feature names the DataCollector logs under a DIFFERENT key. Read through
+# ``_row_get`` so the rename happens in ONE place, on every path into the model.
+#
+# The bug this exists to prevent: 'ear' is logged as 'eye_ar'. The trainer's
+# normalize_row aliased it, encode_frame did not, and the serving path hands
+# encode_frame the collector's raw dicts -- so the model TRAINED on real EAR
+# (~0.2) and was SERVED a constant 0.0 for that dim, silently, because a missing
+# key is indistinguishable from a genuine zero once _as01 has run. Aliasing here
+# rather than in each caller is the point: normalize_row WHITELISTS keys, so any
+# future feature whose log key differs from its feature name fails the same way.
+#
+# Prefer the canonical name when both are present; fall through only on
+# missing/empty, so a row that already carries 'ear' is untouched.
+FEATURE_ALIASES: Dict[str, Tuple[str, ...]] = {'ear': ('eye_ar',)}
+
+SENTINEL_VALUES: Dict[str, float] = {'lead_distance_m': -1.0}
+assert set(FEATURE_ALIASES) <= set(FEATURE_NAMES), (
+    "FEATURE_ALIASES keys must be real feature names: "
+    f"{set(FEATURE_ALIASES) - set(FEATURE_NAMES)}")
 assert set(SENTINEL_VALUES) <= _LINEAR_FEATURES, (
     "a sentinel column must also be linear, else the guard is dead code: "
     f"{set(SENTINEL_VALUES) - _LINEAR_FEATURES}")
@@ -418,6 +451,45 @@ def _as01(x: Any) -> float:
         return 0.0
 
 
+def _row_get(row: Dict[str, Any], name: str) -> Any:
+    """``row[name]``, falling back to the log-key aliases in FEATURE_ALIASES.
+
+    Returns None for missing/empty so ``_as01`` and ``_as_sentinel`` apply their
+    own defaults exactly as before -- this only widens WHERE the value is looked
+    up, it does not change how a genuinely absent value is encoded.
+    """
+    v = row.get(name)
+    if v is not None and v != "":
+        return v
+    for alt in FEATURE_ALIASES.get(name, ()):
+        v = row.get(alt)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _as_sentinel(x: Any, sentinel: float) -> float:
+    """Like :func:`_as01`, but ABSENT/None/NaN maps to ``sentinel`` — not 0.0.
+
+    For the columns in :data:`SENTINEL_VALUES` the missing state is a real,
+    meaningful state of the world ("no lead vehicle in range"), and 0.0 is a
+    legitimate — in fact extreme — value of the same feature. Routing those
+    through ``_as01`` would silently encode "the road ahead is clear" as "a
+    vehicle is touching the bumper", which is the worst possible confusion for
+    a feature the model may lean on to justify a high LoA.
+
+    Note the empty string is treated as missing too: pandas writes NaN out as
+    "" through several of the CSV/JSONL paths that feed the trainers.
+    """
+    if x is None:
+        return float(sentinel)
+    if isinstance(x, float) and math.isnan(x):
+        return float(sentinel)
+    if str(x).strip().lower() in ('', 'nan', 'none', 'null'):
+        return float(sentinel)
+    return _as01(x)
+
+
 @lru_cache(maxsize=256)
 def _fcd_vec_normalized(functionname: str) -> Tuple[float, ...]:
     """The 12 FCD dims for ``functionname``, normalised [1,5] -> [0,1].
@@ -438,11 +510,13 @@ def _fcd_vec_normalized(functionname: str) -> Tuple[float, ...]:
 def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     """Encode a single timestep into a ``float32`` vector of length ``D_IN``.
 
-    Layout: 12 FCD values (normalised [1,5]→[0,1]), 6 driver-state NUM values,
-    7 CARLA vehicle/world values (speed_ratio_max, speed_ratio_limit, brake,
-    steer, precipitation, is_night, is_junction), 2 string-length CAT values
-    (environment, secondary_task), 7 emotion one-hot values, 6 lab multi-hot
-    values. Total: D_IN = 40.
+    Layout: 12 FCD values (normalised [1,5]→[0,1]), 8 driver-state NUM values,
+    6 CARLA vehicle/world values (speed_ratio_max, brake, steer, throttle,
+    is_junction, lead_distance_m), 7 emotion one-hot values, 2 lab multi-hot
+    values. Total: D_IN = 35. ``FEATURE_NAMES`` is the authoritative order.
+
+    Columns listed in ``SENTINEL_VALUES`` take their reserved marker when the
+    field is absent or null instead of ``_as01``'s 0.0 — see ``_as_sentinel``.
 
     ``lab`` can be a Python list (from live DataCollector or JSONL), a
     string-encoded list (``"['face', 'phone']"`` — produced when pandas
@@ -450,13 +524,31 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     normalised to a list before building the multi-hot vector.
     """
     fcd_vec = _fcd_vec_normalized(functionname or "")            # [1,5] → [0,1]
-    num = [_as01(row.get(k)) for k in STATE_NUM]
-    num_carla = [_as01(row.get(k)) for k in STATE_CARLA]
+    num = [_as01(_row_get(row, k)) for k in STATE_NUM]
+    num_carla = [_as_sentinel(_row_get(row, k), SENTINEL_VALUES[k]) if k in SENTINEL_VALUES
+                 else _as01(_row_get(row, k))
+                 for k in STATE_CARLA]
     catv = []
     for k in STATE_CAT:
         v = row.get(k, "")
         if k == 'emotion':
-            vec = [1.0 if v.strip().lower() == e else 0.0 for e in EMOTION_VOCAB]
+            # An ALL-ZERO one-hot is the encoding of "no emotion reading". It is
+            # not a class and must not be confused with one: the DataCollector
+            # logs emotion=null whenever the classifier produced nothing (no
+            # face, empty crop, recognizer down), and asserting a class there --
+            # 'neutral', as this pipeline used to -- tells the model the driver
+            # was calm during exactly the frames where their face was not
+            # visible. Zeros say "no evidence either way", which is true.
+            #
+            # This costs no input dimension: the 7-dim block simply sums to 0
+            # instead of 1, so D_IN is unchanged and existing checkpoints load.
+            # An unrecognised label falls through to the same all-zero vector
+            # rather than being silently rounded to a neighbouring class.
+            # None also reaches here from pandas via the string 'None'/'nan',
+            # which is why the check is on the normalised string, not `is None`.
+            es = "" if v is None else str(v).strip().lower()
+            vec = ([0.0] * len(EMOTION_VOCAB) if es in ('', 'none', 'null', 'nan')
+                   else [1.0 if es == e else 0.0 for e in EMOTION_VOCAB])
         elif k == 'lab':
             if isinstance(v, list):
                 lab_list = v
