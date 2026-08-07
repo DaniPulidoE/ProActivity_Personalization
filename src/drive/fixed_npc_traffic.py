@@ -1082,7 +1082,7 @@ def main():
     # the manipulation, and one that also moves ProVoice's achieved frame rate,
     # which xlstm_model.py already identifies as a leakage channel.
     SCENARIO_FLEET_SIZE = {
-        42: 11,   # study: calibration and adaptation. Do not change.
+        42: 25,   # study: calibration and adaptation. Do not change.
         11: 40,
         22: 30,
         44: 20,

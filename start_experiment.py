@@ -42,10 +42,10 @@ EXPERIMENT SETUP:
 EXPERIMENT SETUP (remote):
 0. Launch CARLA:
     CARLA MACHINE: ./CarlaUnreal --RenderOffScreen 
-1. Teaching the LoA control:
-    CARLA MACHINE:    uv run python start_experiment.py --experiment-popup
-2. Driver adaptation phase:
+1. Driver adaptation phase:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-adaptation
+2. Teaching the LoA control:
+    CARLA MACHINE:    uv run python start_experiment.py --experiment-popup
 3. Calibration:
     CARLA MACHINE:    uv run python start_experiment.py --experiment-calibration-carla-remote --participantid <participantid>
     PROVOICE MACHINE: uv run python start_experiment.py --experiment-calibration-provoice-remote
