@@ -108,9 +108,20 @@ def _parse_loa_set(raw: str) -> List[int]:
         if not part:
             continue
         try:
-            out.add(max(0, min(4, int(float(part)))))
+            value = int(float(part))
         except ValueError:
+            # Not a number at all. Dropping this silently used to be
+            # indistinguishable from a deliberately blank label.
+            print(f"[labels][warn] un-parseable LoA {part!r} in {raw!r} -- mark IGNORED")
             continue
+        if not 0 <= value <= 4:
+            # Still clamped (behaviour unchanged), but said out loud: an
+            # out-of-range level means the drive UI wrote something the scale
+            # does not define, and absorbing it into a valid level turns a UI
+            # bug into plausible-looking ground truth.
+            print(f"[labels][warn] LoA {value} outside 0..4 in {raw!r} -- "
+                  f"CLAMPED to {max(0, min(4, value))}")
+        out.add(max(0, min(4, value)))
     return sorted(out)
 
 
@@ -201,16 +212,45 @@ def _match_windows(windows: List[Dict[str, Any]], t: float) -> List[Dict[str, An
     return out
 
 
-def iter_raw_frames(path: Path):
+# How many individual bad lines get their own message before the rest are only
+# counted. One truncated tail line is the expected case; a flood means something
+# else is wrong and the per-line detail stops helping.
+_MAX_BAD_LINE_REPORTS = 5
+
+
+def iter_raw_frames(path: Path, stats: Optional[Dict[str, int]] = None):
+    """Yield parsed frames, COUNTING and REPORTING lines that fail to parse.
+
+    This used to swallow decode errors with a bare ``except: continue``. That is
+    a silent-data-loss path, not a robustness measure: ``raw_data.jsonl`` is
+    written in append mode and the collector is killed at session end, so a
+    half-written final line is an ordinary outcome. Worse, ``n_total`` counts
+    only lines that parsed, so nothing in the summary could ever reveal the loss
+    -- frames would simply be missing from a training segment.
+
+    ``stats['bad_lines']`` is set once the generator is exhausted.
+    """
+    bad = 0
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                yield json.loads(line)
-            except Exception:
+                obj = json.loads(line)
+            except Exception as e:
+                bad += 1
+                if bad <= _MAX_BAD_LINE_REPORTS:
+                    ell = "..." if len(line) > 80 else ""
+                    print(f"[raw][warn] {path.name} line {lineno}: unparseable JSON "
+                          f"({e}) -- frame DROPPED: {line[:80]}{ell}")
+                elif bad == _MAX_BAD_LINE_REPORTS + 1:
+                    print("[raw][warn] ... further unparseable lines are counted "
+                          "but not printed individually")
                 continue
+            yield obj
+    if stats is not None:
+        stats["bad_lines"] = bad
 
 
 def _fcd_vector(frame: Dict[str, Any], functionname: str = "") -> List[float]:
@@ -257,19 +297,34 @@ def main() -> None:
     out_jsonl = Path(args.out_jsonl); out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     out_fcd = Path(args.out_fcd); out_fcd.parent.mkdir(parents=True, exist_ok=True)
 
-    seg_frames: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    # Only a COUNT per segment, never the frames themselves. The per-segment FCD
+    # vector is a pure function of the segment's functionname (FCD is static per
+    # function), so the old per-frame average was the mean of N identical
+    # vectors -- and retaining every in-window frame to compute it was the
+    # builder's only unbounded memory cost, growing linearly with the study.
+    seg_n_frames: Dict[str, int] = defaultdict(int)
     seg_meta: Dict[str, Dict[str, Any]] = {}
-    n_total = n_labeled = n_no_session = n_no_window = 0
+    n_total = n_labeled = n_no_window = 0
+    # Three distinct failures that used to share one counter, so a timestamp that
+    # stopped parsing would be reported as a session-matching problem.
+    n_no_sid = n_unknown_session = n_bad_timestamp = 0
+    raw_stats: Dict[str, int] = {"bad_lines": 0}
     n_frames_used = n_multi = 0
     loa_hist: Dict[int, int] = defaultdict(int)
 
     with out_jsonl.open("w", encoding="utf-8") as fo:
-        for frame in iter_raw_frames(raw_path):
+        for frame in iter_raw_frames(raw_path, raw_stats):
             n_total += 1
             sid = (frame.get("session_id") or "").strip()
             t = _secs_of_day(frame.get("timestamp"))
-            if not sid or sid not in windows or t is None:
-                n_no_session += 1
+            if not sid:
+                n_no_sid += 1
+                continue
+            if sid not in windows:
+                n_unknown_session += 1
+                continue
+            if t is None:
+                n_bad_timestamp += 1
                 continue
             matches = _match_windows(windows[sid], t)
             if not matches:
@@ -300,31 +355,46 @@ def main() -> None:
                 n_labeled += 1
                 for _loa in w["loa"]:   # a multi-mark counts toward every level it names
                     loa_hist[_loa] += 1
-                seg_frames[w["segment_id"]].append(frame)
-                seg_meta[w["segment_id"]] = {
-                    "loa": w["loa"],
-                    "functionname": w["functionname"] or str(frame.get("functionname", "")),
-                }
+                seg_n_frames[w["segment_id"]] += 1
+                if w["segment_id"] not in seg_meta:
+                    seg_meta[w["segment_id"]] = {
+                        "loa": w["loa"],
+                        "functionname": w["functionname"] or str(frame.get("functionname", "")),
+                        # Only consulted when NO functionname is known (labels
+                        # written before the column existed); _fcd_vector then
+                        # falls back to the frame's own logged FCD. Kept from the
+                        # FIRST frame of the segment so that path survives
+                        # without retaining the other ~380.
+                        "fcd_fallback": frame.get("FCD") or frame.get("fcd"),
+                    }
 
     # Per-segment aggregated FCD table for the FCD trainer.
     n_seg = 0
     with out_fcd.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(LEVELS + FEATS + ["function_group", "segment_id", "n_frames"])
-        for seg_id, frames in seg_frames.items():
-            vecs = [_fcd_vector(fr, seg_meta[seg_id]["functionname"]) for fr in frames]
-            agg = []
-            for j in range(len(FCD_NAMES)):
-                col = [v[j] for v in vecs if v[j] == v[j]]  # drop NaN
-                agg.append(int(round(sum(col) / len(col))) if col else 3)
-            agg = [max(1, min(5, v)) for v in agg]
-            levels = _loa_to_levels(seg_meta[seg_id]["loa"])
-            w.writerow([levels[k] for k in LEVELS] + agg + [seg_meta[seg_id]["functionname"], seg_id, len(frames)])
+        for seg_id, meta in seg_meta.items():
+            # One vector per SEGMENT, not per frame: identical by construction,
+            # so this is exactly what the average produced. A NaN dimension (one
+            # the FCD config could not supply) still falls back to the neutral 3,
+            # and the 1..5 clamp is retained.
+            probe = {"FCD": meta.get("fcd_fallback"), "functionname": meta["functionname"]}
+            vec = _fcd_vector(probe, meta["functionname"])
+            agg = [max(1, min(5, int(round(v)))) if v == v else 3 for v in vec]
+            levels = _loa_to_levels(meta["loa"])
+            w.writerow([levels[k] for k in LEVELS] + agg
+                       + [meta["functionname"], seg_id, seg_n_frames[seg_id]])
             n_seg += 1
 
     print(f"[frames] {n_total} read | {n_frames_used} inside a window | "
-          f"{n_no_session} no-session-match | {n_no_window} outside-any-window "
+          f"{n_no_window} outside-any-window "
           f"(the scene is frozen while a popup is open, and no window covers that time)")
+    print(f"[frames][skipped] unparseable-json-line={raw_stats['bad_lines']} | "
+          f"blank-session-id={n_no_sid} | session-not-in-labels={n_unknown_session} | "
+          f"unparseable-timestamp={n_bad_timestamp}")
+    if raw_stats["bad_lines"] or n_no_sid or n_bad_timestamp:
+        print("[frames][warn] the counters above should be ZERO on a healthy run "
+              "-- a non-zero value means frames were DROPPED, not merely unlabelled")
     print(f"[rows] {n_labeled} labelled rows written "
           f"({n_multi} frames carried more than one label)")
     print(f"[segments] {n_seg} -> {out_fcd}")

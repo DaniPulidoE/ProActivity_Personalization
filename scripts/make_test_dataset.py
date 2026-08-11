@@ -45,11 +45,11 @@ EMOTIONS = ["neutral", "happy", "sad", "surprise", "fear"]
 SESSIONS = [
     ("TESTDATA_SESSION_A", "TEST_P01", datetime(2099, 1, 1, 10, 0, 0), [
         ("Adjust seat positioning", "city", "none", 0),
-        ("Send a text message", "city", "phone", 1),
+        ("Respond to a text message", "city", "phone", 1),
         ("Overtake vehicle ahead", "highway", "none", 2),
         ("Change song", "city", "none", 3),
         ("Navigation control", "highway", "none", 4),
-        ("Start a phone call", "city", "phone", 1),
+        ("Respond to a phone call", "city", "phone", 1),
         ("Provide weather update", "highway", "none", 2),
         ("Adjust in-car temperature", "city", "none", 3),
         ("Change driving mode", "highway", "none", 4),
@@ -59,11 +59,11 @@ SESSIONS = [
     ]),
     ("TESTDATA_SESSION_B", "TEST_P02", datetime(2099, 1, 2, 14, 30, 0), [
         ("Adjust seat positioning", "highway", "none", 4),
-        ("Send a text message", "city", "phone", 3),
+        ("Respond to a text message", "city", "phone", 3),
         ("Overtake vehicle ahead", "highway", "none", 2),
         ("Change song", "city", "none", 1),
         ("Navigation control", "city", "none", 0),
-        ("Start a phone call", "highway", "phone", 4),
+        ("Respond to a phone call", "highway", "phone", 4),
         ("Provide weather update", "city", "none", 3),
         ("Adjust in-car temperature", "highway", "none", 2),
         ("Change driving mode", "city", "none", 1),

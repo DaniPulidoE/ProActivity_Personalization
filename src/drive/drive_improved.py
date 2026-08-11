@@ -684,8 +684,8 @@ POPUP_INPUT_DEFAULT = POPUP_INPUT_KEYBOARD
 # is now detectable after a run instead of silent — but the segment is still
 # wasted. Check the console for [fcd][warn] before trusting a session.
 RANDOM_FUNCTION_POOL = (
-    'Send a text message',
-    'Start a phone call',
+    'Respond to a text message',
+    'Respond to a phone call',
     'Provide weather update',
     'Provide traffic news',
     'Change song',

@@ -14,8 +14,16 @@ def _canon(s: str) -> str:
 FUNCTIONS = [
     ("adjustseatpositioning",      "Adjust seat positioning"),
     ("adjustincartemperature",     "Adjust in-car temperature"),
-    ("sendatextmessage",           "Send a text message"),
-    ("startaphonecall",            "Start a phone call"),
+    # The KEYS here are deliberately not the canonicalized display names: they
+    # are what BASE_FCD_CONFIG is indexed by, so the FCD vector is unchanged by a
+    # rewording, and labels carrying the older spelling ('Send a text message',
+    # 'Start a phone call') still resolve — _canon of those is exactly the key,
+    # already an identity entry in _ALIASES below. Segments recorded under either
+    # spelling therefore POOL as one task; the raw string is preserved in
+    # user_loa_labels.csv, so whether the wording shifts the LoA distribution
+    # stays checkable post-hoc.
+    ("sendatextmessage",           "Respond to a text message"),
+    ("startaphonecall",            "Respond to a phone call"),
     ("navigationcontrol",          "Navigation control"),
     ("changedrivingmode",          "Change driving mode"),
     ("selectparkingspace",         "Select parking space"),
@@ -31,8 +39,8 @@ FUNCTIONS = [
 _BASE_NUMS = {
     1:  [2,3,3,4,1,2,4,2,2,2,2,2],   # Adjust seat positioning
     2:  [2,3,3,2,2,2,4,4,2,2,2,2],   # Adjust in-car temperature
-    3:  [2,3,2,4,4,3,4,4,3,4,2,3],   # Send a text message
-    4:  [2,3,2,2,4,2,4,3,4,3,2,2],   # Start a phone call
+    3:  [2,3,2,4,4,3,4,4,3,4,2,3],   # Respond to a text message
+    4:  [2,3,2,2,4,2,4,3,4,3,2,2],   # Respond to a phone call
     5:  [2,3,4,2,2,3,4,3,3,2,2,3],   # Navigation control
     6:  [2,5,4,4,2,4,3,3,4,3,4,3],   # Change driving mode
     7:  [3,3,2,5,2,4,3,2,3,3,2,4],   # Select parking space
