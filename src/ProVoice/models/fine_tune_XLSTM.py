@@ -3,7 +3,6 @@ import argparse, pathlib
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
@@ -11,15 +10,20 @@ from ProVoice.models.xlstm_model import (
     save_checkpoint,
     load_checkpoint,
     logits_to_label,
-    levels_to_distribution,
-    soft_corn_loss,
 )
 from ProVoice.models.xlstm_model import _as01
+from ProVoice.models.head_adapt import (
+    adapt_head,
+    DEFAULT_ADAPT_LR,
+    DEFAULT_ADAPT_STEPS,
+    DEFAULT_TAU,
+)
 from ProVoice.models.laplace_head import LaplacePosterior, attach_laplace_to_checkpoint
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
     read_jsonl,
+    iter_jsonl,
     normalize_row,
     SeqDataset,
     make_collate,
@@ -56,14 +60,30 @@ def main():
                          "xLSTM (one line per frame). Off by default — pass a path to enable "
                          "for debugging.")
     #ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch",  type=int, default=16)
+    # Adaptation is full-batch with a FIXED, K-independent step budget and no
+    # best-epoch selection — see ProVoice.models.head_adapt for why all three
+    # matter. --epochs/--batch are gone with the mini-batch loop they described.
+    ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS,
+                    help="Full-batch gradient steps. Fixed a priori (tune it once on the "
+                         "development drivers, not per run): selecting the best epoch on "
+                         "the validation tail would select and report on the same "
+                         "segments, spend part of the driver's labels on selection, and "
+                         "bias the low-K end of the learning curve more than the high-K "
+                         "end.")
+    ap.add_argument("--embed-batch", dest="embed_batch", type=int, default=32,
+                    help="How many segments go through the frozen backbone at once. "
+                         "Throughput/VRAM only — it does not affect the adapted head.")
     ap.add_argument("--seed",   type=int, default=42)
-    ap.add_argument("--lr",     type=float, default=2e-3)
-    ap.add_argument("--l2sp",   type=float, default=0.01,
-                    help="Strength λ of the L2-SP penalty λ·||θ_head − θ_pop||² anchoring the "
-                         "fine-tuned head to the population head. 0 disables; larger values "
-                         "keep the personalized model closer to the base model.")
+    ap.add_argument("--lr",     type=float, default=DEFAULT_ADAPT_LR)
+    ap.add_argument("--tau",    type=float, default=DEFAULT_TAU,
+                    help="PRIOR PRECISION of the L2-SP anchor N(θ_pop, 1/τ). The penalty "
+                         "strength λ is derived as τ/(2K) for the K support segments, "
+                         "because the objective is a batch MEAN and so a fixed λ realises "
+                         "τ = 2Kλ — an anchor that strengthens as data accumulates and "
+                         "vanishes exactly where the design wants graceful degradation "
+                         "(K→0 ⇒ τ→0). Larger τ keeps the personalized model closer to the "
+                         "population model; τ→∞ recovers it exactly. Must match the τ "
+                         "scripts/sweep_train_frac.py drew its learning curve with.")
     ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
                     help="Fraction of segments reserved as the chronologically-LAST validation "
                          "tail. Keep this fixed across runs so learning curves share one "
@@ -82,15 +102,15 @@ def main():
         raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train-frac must be in (0, 1], got {args.train_frac}")
-    if args.laplace and args.l2sp <= 0.0:
-        raise ValueError("--laplace requires --l2sp > 0 (the L2-SP anchor defines the prior).")
+    if args.laplace and args.tau <= 0.0:
+        raise ValueError("--laplace requires --tau > 0 (the L2-SP anchor defines the prior).")
     
     # seed and cuda
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # build df
-    rows = [normalize_row(r) for r in read_jsonl(pathlib.Path(args.in_jsonl))]
+    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
     if not rows:
         raise ValueError("JSONL is empty or contains no valid rows.")
     df = pd.DataFrame(rows)
@@ -165,27 +185,23 @@ def main():
     if len(train_ds) == 0 or len(test_ds) == 0:
         raise ValueError(f"Insufficient segments: train={len(train_ds)}, val={len(test_ds)}. Ensure Level_* labels exist.")
 
-    # collate function for DataLoader to handle variable-length sequences
+    # collate function for DataLoader to handle variable-length sequences.
+    # These loaders now feed the frozen backbone ONCE (embed_all) and nothing
+    # else — adaptation is full-batch on the cached embeddings — so --embed-batch
+    # is a throughput/memory knob with no effect on the result: every sequence is
+    # padded to context_length regardless of who it shares a batch with, and the
+    # readout is taken at its own true length. shuffle=False keeps the cached
+    # rows in dataset order, so Ztr[:k] means "the first k segments" for anyone
+    # slicing a support prefix out of them (which is exactly what the sweep does).
     collate = make_collate(context_length)
-    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  collate_fn=collate)
-    test_dl  = DataLoader(test_ds,  batch_size=max(8, args.batch), shuffle=False, collate_fn=collate)
+    train_dl = DataLoader(train_ds, batch_size=args.embed_batch, shuffle=False, collate_fn=collate)
+    test_dl  = DataLoader(test_ds,  batch_size=args.embed_batch, shuffle=False, collate_fn=collate)
     
     # set up model
     model.to(device)
     model.requires_grad_(False) # freeze all parameters
     model.head.requires_grad_(True) # only fine-tune head
-    # anchor weights (population model)
-    theta_pop = {n: p.detach().clone() for n, p in model.head.named_parameters()}
-    # no weight decay (penalty on distance to population model weights)
-    opt = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0.0)
-    if head_type == "corn":
-        loss_fn = lambda logits, lvl: soft_corn_loss(logits, lvl)
-    else:
-        _ce = nn.CrossEntropyLoss()
-        loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
 
-    # model saving setup
-    best = float("inf")  # select on set-MAE (lower is better); +inf always saves epoch 0
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
 
     # precompute embeddings for all sequences in train and test datasets (more efficient - back-bone is frozen)
@@ -198,53 +214,51 @@ def main():
     if multi:
         print(f"[info] {multi}/{len(Vtr)} fine-tuning segment(s) mark several acceptable LoAs.")
 
-    n = Ztr.shape[0] # number of training samples
-    for ep in range(args.epochs):
-        # train
-        perm = torch.randperm(n, device=device) # replaces DataLoader shuffling
-        for i in range(0, n, args.batch):
-            idx = perm[i:i + args.batch]
-            logits = model.head(Ztr[idx])
-            l2sp = sum(((p - theta_pop[n2]) ** 2).sum()
-                    for n2, p in model.head.named_parameters())
-            loss = loss_fn(logits, Vtr[idx]) + args.l2sp * l2sp
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+    # The population head is the anchor AND the initialization; adapt_head copies
+    # it, so model.head still holds theta_pop until we install the result.
+    head, info = adapt_head(model.head, Ztr, Vtr, tau=args.tau, head_type=head_type,
+                            steps=args.steps, lr=args.lr)
+    print(f"[adapt] K={info['n']} tau={info['tau']:.4g} -> lambda={info['l2sp']:.4g} | "
+          f"{info['steps']} full-batch steps @ lr={info['lr']:g} | "
+          f"final loss={info['final_loss']:.4f} |grad|={info['grad_norm']:.2e}")
+    if info["grad_norm"] > 1e-3:
+        # Not cosmetic: the Laplace layer expands about the MAP, so a head that
+        # has not reached a stationary point invalidates the posterior's
+        # exactness argument rather than merely being slightly undertrained.
+        print(f"[adapt][warn] |grad| = {info['grad_norm']:.2e} — the head has NOT converged "
+              f"to the MAP. Raise --steps or --lr; --laplace results are unreliable "
+              f"until this is small.")
+    model.head = head
 
-        # evaluation: one matrix multiply, no batching needed
-        with torch.no_grad():
-            Yp = logits_to_label(model.head(Zte), head_type).cpu().numpy()
-        Vl = Vte.cpu().numpy()
-        # Set-aware throughout: a multi-label window is scored against the
-        # marked level nearest the prediction, not against its lowest.
-        sacc = set_accuracy(Vl, Yp)
-        mf1 = set_macro_f1(Vl, Yp, 5)
-        err = set_mae(Vl, Yp)
-        kappa = set_qwk(Vl, Yp, 5)
-        print(f"[epoch {ep:02d}] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
-              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)})")
+    # ONE evaluation of the shipped head, on the temporal tail. The tail is for
+    # REPORTING only now: it no longer picks an epoch, so it is not selected on
+    # and reported from at the same time.
+    with torch.no_grad():
+        Yp = logits_to_label(model.head(Zte), head_type).cpu().numpy()
+    Vl = Vte.cpu().numpy()
+    # Set-aware throughout: a multi-label window is scored against the marked
+    # level nearest the prediction, not against its lowest.
+    sacc = set_accuracy(Vl, Yp)
+    mf1 = set_macro_f1(Vl, Yp, 5)
+    err = set_mae(Vl, Yp)
+    kappa = set_qwk(Vl, Yp, 5)
+    print(f"[val] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
+          f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)})")
 
-        # Select on set-MAE, matching train_XLSTM.py. Selecting on accuracy
-        # (the previous behaviour) is blind to ordinal distance and disagreed
-        # with the population trainer, so the two stages optimized different
-        # things — and it is the fine-tuned head that the study measures.
-        if err < best:
-            best = err
-            save_checkpoint(model, str(outp), arch=arch)
-            print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
-
-    print(f"[BEST] set-MAE={best:.3f}")
+    save_checkpoint(model, str(outp), arch=arch)
+    print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
 
     if args.laplace:
-        # The Laplace expansion is only valid at the head being shipped: the
-        # in-memory model holds the LAST epoch, but the checkpoint holds the
-        # best one — reload it and fit on the same adaptation embeddings.
-        best_model, _ = load_checkpoint(str(outp))
+        # Fit on the head we just shipped — no reload, because there is no
+        # longer a "best" checkpoint that differs from the in-memory model.
+        # l2sp comes from adapt_head, so the anchor the head was trained under
+        # and the prior the posterior assumes are the same number by
+        # construction (LaplacePosterior.fit re-derives tau = 2*N*l2sp from it).
         posterior = LaplacePosterior.fit(
-            best_model.head, Ztr.cpu(), Vtr.cpu(),
-            l2sp=args.l2sp, n_classes=best_model.n_classes,
+            model.head.cpu(), Ztr.cpu(), Vtr.cpu(),
+            l2sp=info["l2sp"], n_classes=model.n_classes,
         )
+        model.head.to(device)
         attach_laplace_to_checkpoint(str(outp), posterior)
         print(f"[laplace] posterior over adapted soft-CORN head attached to {outp} "
               f"(n={posterior.n_examples}, soft_n_cond={posterior.n_cond_examples:.1f}, "

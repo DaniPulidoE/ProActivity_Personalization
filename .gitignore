@@ -4,7 +4,7 @@
 # (maco018/in-car-distraction-yolo26) and are downloaded at runtime.
 # ---------------------------------------------------------------------------
 # Model weights (pulled from Hugging Face / auto-downloaded by Ultralytics)
-*.pt
+#*.pt
 # Training datasets (downloaded from Kaggle, rebuilt by scripts/build_statefarm_dataset.py)
 /datasets/
 # Ultralytics training run outputs (curves, checkpoints, logs)
@@ -266,3 +266,4 @@ tfm_venv_UE5_P12/
 # my stuff
 prueba.*
 data/
+message.md

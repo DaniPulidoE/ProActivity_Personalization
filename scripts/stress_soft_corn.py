@@ -88,7 +88,6 @@ print("E. DEGENERATE / EDGE-CASE LABELS")
 print("=" * 70)
 z = torch.randn(1, K - 1, requires_grad=True)
 cases = {
-    "all-zero levels (should be filtered upstream)": torch.zeros(1, K),
     "all levels marked (max ambiguity)":            torch.ones(1, K),
     "gapped {0,4}":                                  lv_of(0, 4),
     "boundary y=0":                                  lv_of(0),
@@ -100,6 +99,26 @@ for name, v in cases.items():
     g = torch.autograd.grad(loss, z, retain_graph=True)[0]
     print(f"  {name:<46} loss={loss.item():>10.6f}  finite={bool(torch.isfinite(loss))}  "
           f"g finite={bool(torch.isfinite(g).all())}")
+
+# Rows carrying no usable label are now REJECTED rather than absorbed. They used
+# to be inert in the loss (p = q = 0) but levels_to_subset_weights still gave
+# them a hard 1.0 at threshold 0, so an unmarked row contributed a full
+# observation of data curvature to the Laplace posterior while contributing
+# nothing to the fit. Negative entries were worse: clamp(min=1e-8) on a
+# non-positive row sum produced probabilities of +-1e8 and silently voided the
+# |dL/dz| <= 1 bound that section C verifies.
+print()
+rejected = {
+    "all-zero levels (no LoA marked)": torch.zeros(1, K),
+    "zero row inside a valid batch":   torch.cat([lv_of(0), torch.zeros(1, K)]),
+    "negative entry":                  torch.tensor([[1.0, -1.0, 0.0, 0.0, 0.0]]),
+}
+for name, v in rejected.items():
+    try:
+        soft_corn_loss(torch.zeros(v.shape[0], K - 1), v)
+        print(f"  {name:<46} NOT REJECTED  <-- regression")
+    except ValueError:
+        print(f"  {name:<46} rejected (ValueError)  OK")
 
 print()
 print("=" * 70)
@@ -118,10 +137,12 @@ try:
     print(f"  float16 = {f16.item():.6f}   rel.err = {abs(f16.item()-ref.item())/abs(ref.item()):.3e}")
 except Exception as e:
     print(f"  float16 raised: {e}")
-# the clamp(min=1e-8) in float16
-half_sum = torch.zeros(1, K, dtype=torch.float16).sum(-1, keepdim=True).clamp(min=1e-8)
-print(f"  NOTE clamp(min=1e-8) in fp16 -> {half_sum.item()} "
-      f"(fp16 min subnormal ~6e-8; degenerate rows only)")
+# The old clamp(min=1e-8) underflowed to 0 in fp16 (min subnormal ~6e-8), so a
+# degenerate row became 0/0 = NaN there while merely being inert in fp32 — the
+# guard was dtype-dependent. levels_to_distribution now rejects such rows in
+# every dtype, and soft_corn_loss still promotes targets to >= fp32 so the PMF
+# and its CDF are not quantized before being used as regression weights.
+print(f"  NOTE degenerate rows now raise in every dtype (was: fp32 inert, fp16 NaN)")
 
 print()
 print("=" * 70)

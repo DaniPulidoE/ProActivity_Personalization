@@ -10,13 +10,19 @@
 # every sweep point trains a Linear(64->5) on the cached embeddings (full-batch,
 # deterministic — no seed variance).
 #
+# The adaptation itself lives in ProVoice.models.head_adapt, which fine_tune_XLSTM
+# also calls, so the curve measures exactly the procedure that gets served. Two
+# properties of that module are what make points on this curve comparable to each
+# other: the step budget does not depend on k, and the anchor is specified as a
+# prior PRECISION tau (lambda = tau/2k) so its strength does not either. See the
+# head_adapt docstring — both used to drift with k, in opposite directions.
+#
 # Usage:
 #   python -m scripts.sweep_train_frac \
 #       --in-data data/labeled_data.jsonl \
 #       --in-model trained_models/state_xlstm.pt \
 #       --out results/train_frac_sweep.png
 import argparse
-import copy
 import csv
 import pathlib
 
@@ -35,12 +41,17 @@ from ProVoice.models.xlstm_model import (
     encode_and_resample,
     load_checkpoint,
     logits_to_label,
-    levels_to_distribution,
-    soft_corn_loss,
+)
+from ProVoice.models.head_adapt import (
+    adapt_head,
+    DEFAULT_ADAPT_LR,
+    DEFAULT_ADAPT_STEPS,
+    DEFAULT_TAU,
 )
 from ProVoice.models.train_XLSTM import (
     set_seed,
     read_jsonl,
+    iter_jsonl,
     normalize_row,
     make_collate,
     set_accuracy,
@@ -102,31 +113,6 @@ def embed_segments(model, Xs, vs, context_length: int, device: str, chunk: int =
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
         zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
     return torch.cat(zs, dim=0)
-
-
-def fine_tune_head(pop_head: nn.Linear, Z: torch.Tensor, V: torch.Tensor,
-                   lr: float, l2sp: float, epochs: int, head_type: str) -> nn.Linear:
-    """Fine-tune a fresh copy of the population head on cached embeddings.
-
-    Full-batch AdamW with the L2-SP anchor lambda*||theta - theta_pop||^2, so a
-    given (k, lr, l2sp, epochs) always yields the same head — no seed variance.
-    The loss matches the checkpoint's head type (CE for softmax, soft-CORN for
-    corn); ``V`` is the multi-hot marked-level target both losses consume.
-    """
-    head = copy.deepcopy(pop_head)
-    theta_pop = {n: p.detach().clone() for n, p in pop_head.named_parameters()}
-    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.0)
-    if head_type == "corn":
-        loss_fn = lambda logits, lvl: soft_corn_loss(logits, lvl)
-    else:
-        _ce = nn.CrossEntropyLoss()
-        loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
-    for _ in range(epochs):
-        logits = head(Z)
-        pen = sum(((p - theta_pop[n]) ** 2).sum() for n, p in head.named_parameters())
-        loss = loss_fn(logits, V) + l2sp * pen
-        opt.zero_grad(); loss.backward(); opt.step()
-    return head
 
 
 @torch.no_grad()
@@ -250,11 +236,19 @@ def main():
     ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
                     help="Chronologically-last fraction of segments held out as the fixed "
                          "validation tail (same convention as fine_tune_XLSTM.py).")
-    ap.add_argument("--lr",     type=float, default=5e-4)
-    ap.add_argument("--l2sp",   type=float, default=0.01,
-                    help="Strength of the L2-SP anchor to the population head.")
-    ap.add_argument("--epochs", type=int, default=300,
-                    help="Full-batch gradient steps per sweep point.")
+    ap.add_argument("--lr",     type=float, default=DEFAULT_ADAPT_LR)
+    ap.add_argument("--tau",    type=float, default=DEFAULT_TAU,
+                    help="PRIOR PRECISION of the L2-SP anchor, held constant across the "
+                         "whole sweep. The per-point lambda is derived as tau/(2k), which "
+                         "is what makes points COMPARABLE along k: the objective is a "
+                         "batch mean, so a fixed lambda would realise tau=2*k*lambda and "
+                         "the anchor would grow stronger as data accumulates — and vanish "
+                         "at the small-k end where the design most wants it. Must match "
+                         "the tau used by fine_tune_XLSTM.py, or the curve describes a "
+                         "different estimator than the one that gets served.")
+    ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS,
+                    help="Full-batch gradient steps per sweep point. Fixed and "
+                         "k-INDEPENDENT on purpose (was --epochs).")
     ap.add_argument("--max-points", dest="max_points", type=int, default=60,
                     help="Cap on the number of sweep points (thinned evenly if exceeded).")
     ap.add_argument("--seed", type=int, default=42)
@@ -263,7 +257,7 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    rows = [normalize_row(r) for r in read_jsonl(pathlib.Path(args.in_jsonl))]
+    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
     if not rows:
         raise ValueError("JSONL is empty or contains no valid rows.")
     df = pd.DataFrame(rows)
@@ -305,15 +299,26 @@ def main():
           f"macro-F1={base['f1']:.3f} set-MAE={base['mae']:.3f} QWK={base['qwk']:.3f}")
 
     ks = pick_sweep_points(len(Vpool), args.max_points)
-    results = []
+    results, infos = [], []
+    worst_grad = 0.0
     for k in ks:
-        head = fine_tune_head(model.head, Zpool[:k], Vpool[:k],
-                              lr=args.lr, l2sp=args.l2sp, epochs=args.epochs,
-                              head_type=head_type)
+        # Same call the deployed fine-tuner makes: full-batch, fixed steps, no
+        # epoch selection, lambda derived from tau. The curve and the served
+        # head are the same estimator by construction, not by convention.
+        head, info = adapt_head(model.head, Zpool[:k], Vpool[:k],
+                                tau=args.tau, head_type=head_type,
+                                steps=args.steps, lr=args.lr)
         m = evaluate(head, Zval, Vval, head_type)
-        results.append(m)
+        results.append(m); infos.append(info)
+        worst_grad = max(worst_grad, info["grad_norm"])
         print(f"[k={k:3d}] ({k * SEGMENT_SECONDS / 60.0:5.1f} min) set-acc={m['acc']:.3f} "
-              f"macro-F1={m['f1']:.3f} set-MAE={m['mae']:.3f} QWK={m['qwk']:.3f}")
+              f"macro-F1={m['f1']:.3f} set-MAE={m['mae']:.3f} QWK={m['qwk']:.3f} "
+              f"(lam={info['l2sp']:.2e}, |grad|={info['grad_norm']:.2e})")
+    # One number to check before trusting the curve: every point must have
+    # reached its MAP, or differences along k are partly differences in how far
+    # each point got rather than in what the data supports.
+    print(f"[converge] worst |grad| over the sweep = {worst_grad:.2e} "
+          f"({'OK' if worst_grad < 1e-3 else 'HIGH — raise --steps or --lr'})")
 
     out_png = pathlib.Path(args.out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -327,12 +332,17 @@ def main():
                     "val_set_accuracy", "val_set_macro_f1", "val_set_mae", "val_set_qwk",
                     "baseline_set_accuracy", "baseline_set_macro_f1",
                     "baseline_set_mae", "baseline_set_qwk",
-                    "head_type", "n_val", "n_multi_label", "lr", "l2sp", "epochs"])
-        for k, m in zip(ks, results):
+                    "head_type", "n_val", "n_multi_label", "lr", "tau",
+                    # l2sp VARIES along the sweep (= tau/2k) and is the number the
+                    # Laplace layer needs, so it is recorded per row rather than
+                    # once in a footer. grad_norm certifies the point converged.
+                    "l2sp", "steps", "grad_norm"])
+        for k, m, info in zip(ks, results, infos):
             w.writerow([k, round(k * SEGMENT_SECONDS / 60.0, 2),
                         m["acc"], m["f1"], m["mae"], m["qwk"],
                         base["acc"], base["f1"], base["mae"], base["qwk"],
-                        head_type, n_val, n_multi, args.lr, args.l2sp, args.epochs])
+                        head_type, n_val, n_multi, args.lr, args.tau,
+                        info["l2sp"], args.steps, info["grad_norm"]])
 
     plot_curve(ks, [m["mae"] for m in results], [m["acc"] for m in results],
                base["mae"], base["acc"], n_val, out_png)

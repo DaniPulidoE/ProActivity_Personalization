@@ -149,7 +149,19 @@ _YAWN_ANSCOMBE_ZERO = 2.0 * math.sqrt(3.0 / 8.0)
 _MAD_TO_SIGMA = 1.4826
 # Floor in dispersion for bpm and rr:
 
-#_ROBUST_SCALE_FLOOR = {'bpm': 5.0, 'rr': 2.0}
+_ROBUST_SCALE_FLOOR = {'bpm': 5.0, 'rr': 2.0}
+
+# Bound on the z-scores _standardized_delta emits (hr_delta, rr_delta), in both
+# directions. READ BY data_preprocessing/heart_rate_preprocessing.py via AST, so
+# this assignment is the single definition for the live and offline paths alike
+# — keep it a plain literal.
+#
+# Why bound it at all: the calibration std is measured over a 180 s window and
+# systematically underestimates a driver's range across a full drive (cohort
+# median 2.81 vs 5.28 bpm), and it does so by a different factor per driver
+# (1.0x to 4.0x). That inflates hr_delta unevenly — measured up to ±12 — on the
+# one STATE_NUM column that is not already inside [0,1].
+_HR_DELTA_CLIP = 5.0
 
 # ── HR harmonic rejection ─────────────────────────────────────────────────────
 # Band, as a multiple of the running reference, in which a reading is treated as
@@ -157,6 +169,12 @@ _MAD_TO_SIGMA = 1.4826
 # resolution is 30/600 Hz = 3 bpm, so a true 2f peak always lands well inside.
 _HR_HARMONIC_LO = 1.7
 _HR_HARMONIC_HI = 2.3
+# Physiologically defensible range for a seated adult. Outside it the estimator
+# is not measuring a pulse, whatever it reported — its own search band is
+# 36-198 bpm, so it can and does return rates nobody has. READ BY
+# data_preprocessing/heart_rate_preprocessing.py via AST, so the live gate and
+# the offline gate are one definition; keep it a plain literal.
+_HR_RANGE = (40.0, 180.0)
 # Accepted readings needed before the band is trusted enough to reject anything.
 _HR_REF_MIN = 3
 # Consecutive rejections after which the REFERENCE is presumed wrong rather than
@@ -415,6 +433,7 @@ class DataCollector:
         self._hr_accepted: deque = deque(maxlen=5)  # recent ACCEPTED readings -> reference
         self._hr_reject_run: int = 0                # consecutive rejections
         self._hr_harmonic_rejects: int = 0          # session total, logged
+        self._hr_out_of_range: int = 0              # readings outside _HR_RANGE
         # UNFILTERED reading as the toolbox produced it, kept whether or not the
         # harmonic filter accepted it, and logged as heart_rate_raw. The live
         # filter is a guard on the actuator, NOT the source of truth: dropping a
@@ -806,11 +825,22 @@ class DataCollector:
         a sustained harmonic and a sustained real change look identical in
         duration, and only the *transition* distinguishes them.
         """
-        if len(self._hr_accepted) < _HR_REF_MIN:
-            return False                       # reference not established yet
-        ref = float(np.median(self._hr_accepted))
+        if len(self._hr_accepted) >= _HR_REF_MIN:
+            ref = float(np.median(self._hr_accepted))
+        else:
+            # Not enough accepted readings yet — fall back to this driver's
+            # stored calibration baseline. Without it the filter is DISARMED for
+            # its first three readings and cannot judge them at all: in one 007
+            # session the very first reading was 134 bpm against a session of
+            # ~70, accepted because nothing was there to compare it to, and it
+            # then briefly became the reference other readings were judged
+            # against. The baseline is the right seed because it is measured on
+            # this driver, and — once heart_rate_preprocessing.py has written the
+            # _preprocessed file — it is octave-corrected, which anchors the fold
+            # below to the correct octave from reading one.
+            ref = float((self.calibrate.get('bpm') or {}).get('mean', 0.0) or 0.0)                 if hasattr(self, 'calibrate') else 0.0
         if ref <= 0.0:
-            return False
+            return False                       # no reference available at all
         return _HR_HARMONIC_LO * ref <= hr <= _HR_HARMONIC_HI * ref
 
     def calibrate_step(self) -> None:
@@ -939,8 +969,13 @@ class DataCollector:
                     # _standardized_delta divides hr_delta by it.
                     mean = float(np.median(values))
                     mad = float(np.median([abs(x - mean) for x in values]))
-                    #std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
-                    std = _MAD_TO_SIGMA * mad
+                    # Floored: below this the MAD is measuring estimator noise
+                    # over a 180 s window rather than the driver's range, and
+                    # _standardized_delta DIVIDES hr_delta by it. Same floor
+                    # heart_rate_preprocessing.py applies when it rewrites a
+                    # stored baseline, so a driver calibrated live and a driver
+                    # whose file was preprocessed land on the same scale.
+                    std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
                 else:
                     mean = sum(values) / len(values)
                     # Dispersion about the location estimate above. Not read at
@@ -1270,13 +1305,20 @@ class DataCollector:
 
 
     def _standardized_delta(self, value: float, cal_key: str, history) -> float:
-        """(value - baseline) / std as a z-score.
+        """(value - baseline) / std as a z-score, clipped to ±_HR_DELTA_CLIP.
 
         Baseline and std come from the live calibration for ``cal_key`` when it
         produced samples; otherwise they fall back to the rolling ``history``
         stats. Every degenerate case (no calibration, short history, zero std)
         collapses to a unit std, so the result is the raw deviation — never a
         divide-by-zero or an exploded value.
+
+        THE CLIP MUST MATCH data_preprocessing/heart_rate_preprocessing.py.
+        That script rewrites this same column offline for training, and it reads
+        ``_HR_DELTA_CLIP`` out of this file by AST rather than restating it, so
+        there is one number. Changing it here changes both; hard-coding a second
+        copy there would recreate the train/serve skew that hid in ``ear`` for
+        weeks (see "Feature-name aliases" in CLAUDE.md).
         """
         cal = self.calibrate.get(cal_key, {}) if hasattr(self, 'calibrate') else {}
         cal_mean = cal.get('mean', 0.0)
@@ -1290,7 +1332,14 @@ class DataCollector:
             std = 1.0
         if std == 0.0:
             std = 1.0
-        return round((value - baseline) / std, 1)
+        z = (value - baseline) / std
+        # Applies to rr_delta as well as hr_delta: both are STATE_NUM inputs, and
+        # every other numeric dim reaches the model inside [0,1] (`_as01` coerces
+        # but does not scale), so an unbounded z-score is the one column that can
+        # dominate in_proj at initialization. Measured on the population data,
+        # hr_delta reached ±12 before this bound; ±5 leaves p95 near 3.4 and
+        # engages on ~2% of frames.
+        return round(max(-_HR_DELTA_CLIP, min(_HR_DELTA_CLIP, z)), 1)
 
     def _visual_process(self, data: Dict[str, Any]) -> bool:
         """Populate ``data`` with visual driver-state features.
@@ -1391,6 +1440,7 @@ class DataCollector:
             # BVP fundamental is weak (crop, lighting or motion) — worth checking
             # before trusting the session's HR at all.
             data['rppg_harmonic_rejects'] = int(self._hr_harmonic_rejects)
+            data['rppg_out_of_range'] = int(self._hr_out_of_range)
             # Detector misses are the upstream cause of most rPPG dropouts.
             data['facebox_misses'] = int(self._face_box_misses)
             data['facebox_consec_misses'] = int(self._face_box_consec_misses)
@@ -2143,7 +2193,14 @@ class DataCollector:
                     clean = (not contaminated) or (not self._rppg_gap_suppress)
                     if clean and hr is not None and not (hr != hr):   # excludes NaN
                         hr_val = round(float(hr), 1)
-                        rejected = (self._hr_is_harmonic(hr_val)
+                        # Physiological range gate. The estimator searches
+                        # 36-198 bpm, so it CAN return a rate no seated adult
+                        # has; outside _HR_RANGE it is not measuring a pulse,
+                        # whatever it reported. Matches the same bound in
+                        # data_preprocessing/heart_rate_preprocessing.py.
+                        in_range = _HR_RANGE[0] <= hr_val <= _HR_RANGE[1]
+                        harmonic = in_range and self._hr_is_harmonic(hr_val)
+                        rejected = (harmonic
                                     and self._hr_reject_run < _HR_REJECT_RUN_MAX)
                         # Record the raw reading FIRST, unconditionally, so the
                         # live filter can never destroy data the offline pipeline
@@ -2151,23 +2208,43 @@ class DataCollector:
                         with self._rppg_lock:
                             self._last_hr_raw = hr_val
                             self._last_hr_raw_t = now
-                            self._last_hr_rejected = rejected
-                        # Drop probable 2f locks, but never more than
-                        # _HR_REJECT_RUN_MAX in a row — past that the reference
-                        # is likelier to be wrong than the readings.
-                        if rejected:
+                            self._last_hr_rejected = rejected or not in_range
+                        if not in_range:
+                            self._hr_out_of_range += 1
+                            if self._hr_out_of_range <= 5 or self._hr_out_of_range % 25 == 0:
+                                print(f"[DataCollector][rppg] discarded {hr_val} bpm — "
+                                      f"outside {_HR_RANGE[0]:.0f}-{_HR_RANGE[1]:.0f} "
+                                      f"(#{self._hr_out_of_range})")
+                        # FOLD a probable 2f lock rather than discard it. Halving
+                        # is not a guess here: _hr_is_harmonic only fires when
+                        # 1.7*ref <= hr <= 2.3*ref, so hr/2 necessarily lands in
+                        # [0.85*ref, 1.15*ref] — strictly closer to the reference
+                        # than the raw value, by construction. Dropping left
+                        # heart_rate holding a stale number for the ~6 s that
+                        # reading covered; folding recovers the measurement, which
+                        # is what the offline pass does (see `repair` there).
+                        # Still capped at _HR_REJECT_RUN_MAX in a row — past that
+                        # the reference is likelier to be wrong than the readings,
+                        # and the escape re-seeds from the raw value.
+                        elif rejected:
                             self._hr_reject_run += 1
                             self._hr_harmonic_rejects += 1
+                            folded = round(hr_val / 2.0, 1)
                             if (self._hr_harmonic_rejects <= 5
                                     or self._hr_harmonic_rejects % 25 == 0):
-                                print(f"[DataCollector][rppg] dropped {hr_val} bpm as a "
-                                      f"probable 2f harmonic of "
+                                print(f"[DataCollector][rppg] folded {hr_val} -> "
+                                      f"{folded} bpm as a probable 2f harmonic of "
                                       f"~{float(np.median(self._hr_accepted)):.0f} bpm "
-                                      f"(reject #{self._hr_harmonic_rejects})")
+                                      f"(fold #{self._hr_harmonic_rejects})")
+                            self._hr_accepted.append(folded)
+                            with self._rppg_lock:
+                                self._last_hr = folded
+                                self._last_hr_t = now
+                                self.bpm_history.append(folded)
                         else:
                             if self._hr_reject_run >= _HR_REJECT_RUN_MAX:
                                 print(f"[DataCollector][rppg] {self._hr_reject_run} "
-                                      f"consecutive rejections — re-seeding the HR "
+                                      f"consecutive folds — re-seeding the HR "
                                       f"reference from {hr_val} bpm")
                                 self._hr_accepted.clear()
                             self._hr_reject_run = 0

@@ -1,5 +1,5 @@
 # Usage: python -m ProVoice.train_XLSTM --in data/with_segments.jsonl --label-map data/labels.csv --out trained_models/state_xlstm.pt
-import argparse, json, pathlib, random
+import argparse, csv, json, pathlib, random
 from typing import List, Dict, Any, Tuple
 
 import numpy as np
@@ -42,8 +42,21 @@ def set_seed(s: int):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
 
 
-def read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
-    rows = []
+def iter_jsonl(path: pathlib.Path):
+    """Stream parsed JSONL objects one at a time. PREFER THIS over read_jsonl.
+
+    ``data/labeled_data.jsonl`` is 931 MB / 508,282 rows of 73 keys, and the raw
+    parsed dicts cost **4.0 GB** — measured, not estimated. Materializing them in
+    a list before normalizing means the raw list, the normalized list and the
+    DataFrame are all alive at once: 4.57 GB peak, of which 4.03 GB is the raw
+    list that is discarded moments later.
+
+    Consuming this generator instead lets each raw dict be freed as soon as
+    ``normalize_row`` has copied the ~25 fields it keeps, which drops the peak to
+    roughly 0.6 GB. That is the difference between one trainer fitting in RAM
+    alongside anything else and a machine that swaps — and the study runs 180 of
+    these back to back.
+    """
     with path.open('r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -52,8 +65,13 @@ def read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
                 obj = json.loads(line)
             except Exception:
                 continue
-            rows.append(obj)
-    return rows
+            yield obj
+
+
+def read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
+    """Eager list form. Kept for callers that genuinely need random access;
+    for a full-size file prefer :func:`iter_jsonl` — see its docstring for why."""
+    return list(iter_jsonl(path))
 
 
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,11 +403,81 @@ def main():
                          "object per frame (~thousands of large lines on a full dataset). "
                          "Pass a path to enable for debugging.")
     ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--val-pids", dest="val_pids", default="",
+                    help="Comma-separated participantids to use as the validation set, e.g. "
+                         "'001,005'. Overrides the default seeded 80/20 participant split, "
+                         "which cannot express a FIXED fold — needed by "
+                         "ProVoice.training_scripts.sweep_population_hparams, where the same "
+                         "6 folds must be reused across every config and seed or the "
+                         "comparison is confounded by which drivers each config was "
+                         "validated on. Ignored when --no-val is set.")
+    ap.add_argument("--no-val", dest="no_val", action="store_true",
+                    help="Train on EVERY participant in the input with no validation set, no "
+                         "per-epoch evaluation and no best-epoch selection; the final-epoch "
+                         "weights are saved. This is the LODO population-training mode: the "
+                         "held-out driver is absent from the input file entirely and is scored "
+                         "afterwards by the caller, so no signal from it can reach the "
+                         "checkpoint. Requires a pre-chosen --epochs (E*); --patience is "
+                         "ignored because there is nothing to be patient about.")
+    ap.add_argument("--metrics-csv", dest="metrics_csv", default="",
+                    help="Write one row per epoch (epoch, set_acc, macro_f1, set_mae, qwk, lr, "
+                         "val_n) to this CSV. The sweep reads these curves rather than parsing "
+                         "stdout, and needs the full curve — not just the [BEST] line — to "
+                         "extract E* from a smoothed minimum.")
+    ap.add_argument("--epochs", type=int, default=100,
+                    help="MAX epochs. Training stops earlier once --patience epochs pass "
+                         "with no set-MAE improvement, so this is a ceiling, not a "
+                         "duration. Raised from 30 together with the addition of real "
+                         "regularization (--dropout): before that, best-epoch selection "
+                         "was the ONLY thing standing between 63k parameters and ~1.1k "
+                         "training segments, and more epochs would only have widened the "
+                         "gap it had to paper over.")
+    ap.add_argument("--patience", type=int, default=20,
+                    help="Stop after this many consecutive epochs with no improvement "
+                         "(see --min-delta). 0 disables. Purely a compute saving: the "
+                         "BEST epoch is checkpointed as it happens, so stopping early "
+                         "never changes which weights ship — it only decides how long "
+                         "to keep looking for a better one.")
+    ap.add_argument("--min-delta", dest="min_delta", type=float, default=0.0,
+                    help="Minimum set-MAE decrease that counts as an improvement — it "
+                         "gates BOTH the checkpoint save and the patience counter. "
+                         "0 (default) keeps the previous behaviour: any decrease saves. "
+                         "Consider ~0.02: with a validation set of ~3 participants "
+                         "(~360 segments) the standard error on set-MAE is about "
+                         "0.9/sqrt(360) ~ 0.05, so improvements below that are noise, "
+                         "and taking the min over many epochs biases the reported value "
+                         "downward. Raising this makes early stopping more aggressive as "
+                         "well as the saves rarer, which is why it is opt-in.")
     ap.add_argument("--batch",  type=int, default=16)
     ap.add_argument("--seed",   type=int, default=42)
     ap.add_argument("--lr",     type=float, default=2e-3)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4,
+                    help="AdamW decoupled weight decay, applied to weight matrices and "
+                         "(residual-parameterized) norm gains only — never to biases or "
+                         "learnable_skip. See the param-group split below for why. NOTE "
+                         "this is near-inert at the default: decoupled decay shrinks by "
+                         "(1 - lr*wd) per step = 1 - 2e-7, i.e. ~0.04 % over 2,000 steps. "
+                         "--dropout is what actually regularizes this model.")
+    ap.add_argument("--dropout", type=float, default=0.15,
+                    help="Dropout inside the xLSTM block stack. This is the model's only "
+                         "active regularizer (see --weight_decay). Stored in the "
+                         "checkpoint arch and rebuilt on load; disabled by model.eval() "
+                         "for validation, fine-tuning embeddings and serving.")
+    ap.add_argument("--grad-clip", dest="grad_clip", type=float, default=1.0,
+                    help="Max global grad-norm; 0 disables. soft-CORN's own gradient is "
+                         "bounded by 1 per unit, so the LOSS cannot explode — this "
+                         "guards the 200-step recurrent unroll behind it, which can. "
+                         "Cheap insurance that also keeps the L2-SP vs. ANIL comparison "
+                         "from turning on one unlucky batch.")
+    ap.add_argument("--warmup-epochs", dest="warmup_epochs", type=float, default=3.0,
+                    help="Linear LR warmup from 0 to --lr over this many epochs, then "
+                         "CONSTANT (no decay). 0 disables. lr=2e-3 at batch 16 is high "
+                         "for a 2-block recurrent stack, and the warmup is the cheap half "
+                         "of the fix. Cosine decay is deliberately NOT applied: "
+                         "docs/meta_optimization_options.md rejected it for the outer "
+                         "meta-loop on the grounds that best-checkpoint selection plus "
+                         "early stopping already neutralize it, and the same argument "
+                         "holds here.")
     ap.add_argument("--context-length", dest="context_length", type=int, default=None,
                     help="Max sequence length. Defaults to window_seconds * resample_hz "
                          "(the exact grid length, so the frame cap never binds), or "
@@ -446,7 +534,7 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    rows = [normalize_row(r) for r in read_jsonl(pathlib.Path(args.in_jsonl))]
+    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
     if not rows:
         raise ValueError("JSONL is empty or contains no valid rows.")
     df = pd.DataFrame(rows)
@@ -490,7 +578,32 @@ def main():
     if df[SPLIT_VARIABLE].eq("").all():
         raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
     pids = df[SPLIT_VARIABLE].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
-    if len(pids) >= 2:
+    if args.no_val:
+        # LODO population training: every provided driver trains, nothing is held
+        # back, no epoch is selected. The held-out driver is not in this file at
+        # all, and is scored by the caller AFTER training — so there is no path
+        # by which a validation signal could pick the checkpoint.
+        print(f"[split] --no-val: training on ALL {len(pids)} participant(s), "
+              f"no validation set, no epoch selection")
+        tr_df = df.reset_index(drop=True)
+        te_df = df.iloc[0:0]
+    elif args.val_pids:
+        want = [p.strip() for p in args.val_pids.split(",") if p.strip()]
+        have = set(str(p) for p in pids)
+        missing = [p for p in want if p not in have]
+        if missing:
+            raise ValueError(
+                f"--val-pids names participant(s) not present in the data: {missing}. "
+                f"Available: {sorted(have)}")
+        te_pids = set(want)
+        tr_pids = have - te_pids
+        if not tr_pids:
+            raise ValueError("--val-pids holds out every participant; nothing left to train on.")
+        print(f"[split] EXPLICIT val participants={sorted(te_pids)}  "
+              f"train participants={sorted(tr_pids)}")
+        tr_df = df[df[SPLIT_VARIABLE].astype(str).isin(tr_pids)].reset_index(drop=True)
+        te_df = df[df[SPLIT_VARIABLE].astype(str).isin(te_pids)].reset_index(drop=True)
+    elif len(pids) >= 2:
         ntr = max(1, int(0.8 * len(pids)))
         tr_pids, te_pids = set(pids[:ntr]), set(pids[ntr:])
         print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
@@ -511,16 +624,22 @@ def main():
     try:
       train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh,
                             window_seconds=args.window_seconds, resample_hz=resample_hz)
-      test_ds  = SeqDataset(te_df, context_length=args.context_length, split="val",   log_fh=log_fh,
-                            window_seconds=args.window_seconds, resample_hz=resample_hz)
+      # Under --no-val there is no validation frame to build a dataset from, and
+      # SeqDataset rightly refuses an empty one (its segment_id assert). Skip the
+      # construction rather than weakening that guard, which exists to catch a
+      # genuinely empty split in the normal path.
+      test_ds  = ([] if args.no_val else
+                  SeqDataset(te_df, context_length=args.context_length, split="val", log_fh=log_fh,
+                             window_seconds=args.window_seconds, resample_hz=resample_hz))
     finally:
       if log_fh:
           log_fh.close()
-    if len(train_ds) == 0 or len(test_ds) == 0:
+    if len(train_ds) == 0 or (len(test_ds) == 0 and not args.no_val):
         raise ValueError(f"Insufficient segments: train={len(train_ds)}, val={len(test_ds)}. Ensure Level_* labels exist.")
     collate = make_collate(args.context_length)
     train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  collate_fn=collate)
-    test_dl  = DataLoader(test_ds,  batch_size=max(8, args.batch), shuffle=False, collate_fn=collate)
+    test_dl  = (DataLoader(test_ds, batch_size=max(8, args.batch), shuffle=False, collate_fn=collate)
+                if len(test_ds) else None)
 
     model = XLSTMSequenceClassifier(
         d_in=D_IN,
@@ -531,8 +650,56 @@ def main():
         context_length=args.context_length,
         #pool='last',
         head_type=head_type,
+        dropout=args.dropout,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # --- weight-decay param groups -----------------------------------------
+    # Decaying EVERY parameter is wrong for this backbone, and not for the usual
+    # reasons:
+    #
+    #   * fgate.bias initializes to a per-head linspace(3, 6) — deliberately
+    #     large so the forget gates start near-open, i.e. so the cell starts with
+    #     a LONG memory. Decaying it toward 0 shortens the memory horizon, which
+    #     is precisely the thing a recurrent model over a 20 s window exists to
+    #     learn. Same for igate.bias.
+    #   * learnable_skip initializes to 1.0; decaying it toward 0 attenuates the
+    #     residual path.
+    #   * The LayerNorm gains are the EXCEPTION to the usual "never decay norms"
+    #     advice. nx-ai's LayerNorm uses residual_weight=True, so the effective
+    #     gain is (1 + weight) and the weight initializes to 0.0 — decay pulls it
+    #     toward gain 1, i.e. toward the identity. That is a sensible shrinkage,
+    #     so norm gains stay in the decay group.
+    #
+    # At the default weight_decay this changes almost nothing (see the flag's
+    # help — decoupled decay is ~0.04 % over a full run). It matters the moment
+    # anyone raises it to a value that actually regularizes, which is exactly
+    # when the wrong grouping would quietly cost the model its memory horizon.
+    decay, no_decay = [], []
+    for _pname, _p in model.named_parameters():
+        if not _p.requires_grad:
+            continue
+        (no_decay if _pname.endswith(".bias") or "learnable_skip" in _pname
+         else decay).append(_p)
+    opt = torch.optim.AdamW(
+        [{"params": decay,    "weight_decay": args.weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr,
+    )
+    print(f"[optim] AdamW lr={args.lr:g} dropout={args.dropout:g} | weight_decay="
+          f"{args.weight_decay:g} on {sum(p.numel() for p in decay)} params, "
+          f"0.0 on {sum(p.numel() for p in no_decay)} (biases + learnable_skip)")
+
+    # --- linear warmup, then constant --------------------------------------
+    # Scheduler steps per BATCH, not per epoch, so the ramp is unaffected by how
+    # many segments a dataset happens to hold.
+    steps_per_epoch = max(1, len(train_dl))
+    warmup_steps = int(round(max(0.0, args.warmup_epochs) * steps_per_epoch))
+    sched = None
+    if warmup_steps > 0:
+        sched = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda s: min(1.0, (s + 1) / warmup_steps))
+        print(f"[optim] linear warmup over {warmup_steps} steps "
+              f"({args.warmup_epochs:g} epochs x {steps_per_epoch} steps), then constant")
     multi = int(sum(1 for _, lvl in train_ds.groups if float(np.sum(lvl)) > 1))
     if multi:
         print(f"[info] {multi}/{len(train_ds.groups)} training segment(s) mark several "
@@ -556,6 +723,7 @@ def main():
         num_blocks=args.num_blocks, num_heads=args.num_heads,
         context_length=args.context_length,
         head_type=head_type,
+        dropout=args.dropout,
         # Data contracts, not model kwargs: the time window segments were cut to
         # and the grid they were resampled onto. load_checkpoint() keeps them in
         # arch but does not pass them to the constructor; fine-tuning and
@@ -565,13 +733,36 @@ def main():
         resample_hz=resample_hz,
     )
 
+    metrics_fh = None
+    metrics_writer = None
+    if args.metrics_csv:
+        mp = pathlib.Path(args.metrics_csv); mp.parent.mkdir(parents=True, exist_ok=True)
+        metrics_fh = mp.open("w", newline="", encoding="utf-8")
+        metrics_writer = csv.writer(metrics_fh)
+        metrics_writer.writerow(["epoch", "set_acc", "macro_f1", "set_mae", "qwk", "lr", "val_n"])
+
+    bad_epochs = 0   # consecutive epochs without an improvement (see --patience)
     for ep in range(args.epochs):
         model.train()
         for xb, lb, vb in train_dl:
             xb, lb, vb = xb.to(device), lb.to(device), vb.to(device)
             logits = model(xb, lengths=lb)
             loss = loss_fn(logits, vb)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            if args.grad_clip and args.grad_clip > 0:
+                # BEFORE opt.step(), AFTER backward() — clipping the accumulated
+                # .grad is the whole mechanism; anywhere else it is a no-op.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+            if sched is not None:
+                sched.step()   # per BATCH: the warmup is defined in steps
+
+        if test_dl is None:
+            # --no-val: no evaluation, no selection. The checkpoint is written
+            # once after the loop, from the final epoch.
+            print(f"[epoch {ep:02d}] (no validation set; lr={opt.param_groups[0]['lr']:.2e})")
+            continue
 
         model.eval(); y_pred = []; y_lvl = []
         with torch.no_grad():
@@ -590,20 +781,52 @@ def main():
         # rows that mark one level.
         sacc = set_accuracy(Yl, Yp); mf1 = set_macro_f1(Yl, Yp, 5)
         err = set_mae(Yl, Yp); kappa = set_qwk(Yl, Yp, 5)
+        cur_lr = opt.param_groups[0]["lr"]
         print(f"[epoch {ep:02d}] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
-              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)})")
+              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)}, lr={cur_lr:.2e})")
+        if metrics_writer is not None:
+            metrics_writer.writerow([ep, sacc, mf1, err, kappa, cur_lr, len(Yp)])
+            metrics_fh.flush()   # the sweep reads these while the run is in flight
 
         # Select on set-MAE: LoA is ordinal, so off-by-1 << off-by-4, and
         # accuracy is blind to error distance (and to majority-class collapse
         # under the class imbalance). MAE is the design-doc primary metric, and
         # the set form is the one that does not silently score a multi-label
         # window against the driver's lowest acceptable level.
-        if err < best:
+        #
+        # ONE definition of "improved", used for both the save and the patience
+        # counter, so the two cannot disagree about whether an epoch helped.
+        if err < best - args.min_delta:
             best = err
+            bad_epochs = 0
             save_checkpoint(model, str(outp), arch=arch)
             print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
+        else:
+            bad_epochs += 1
+            if args.patience and bad_epochs >= args.patience:
+                print(f"[early-stop] no set-MAE improvement > {args.min_delta:g} for "
+                      f"{bad_epochs} epochs; stopping at epoch {ep} of {args.epochs}. "
+                      f"The best epoch is already on disk.")
+                break
 
-    print(f"[BEST] set-MAE={best:.3f}")
+    if metrics_fh is not None:
+        metrics_fh.close()
+
+    if test_dl is None:
+        # --no-val: nothing was selected, so the FINAL epoch is the model. Saved
+        # once, here, rather than inside the loop.
+        save_checkpoint(model, str(outp), arch=arch)
+        print(f"[OK] saved -> {outp} (final epoch {args.epochs - 1}, no validation, "
+              f"no epoch selection)")
+        return
+
+    # This is the MINIMUM over epochs of a quantity estimated on ~360 segments,
+    # so it is optimistically biased by roughly 1-2 standard errors (~0.05 each)
+    # — the winner's curse of selecting on the same set you report. Quote it as
+    # the selection criterion it is, not as the population model's expected
+    # performance on an unseen driver; the LODO folds are what estimates that.
+    print(f"[BEST] set-MAE={best:.3f} (selection minimum — optimistically biased, "
+          f"see note in train_XLSTM.py)")
 
 
 if __name__ == "__main__":

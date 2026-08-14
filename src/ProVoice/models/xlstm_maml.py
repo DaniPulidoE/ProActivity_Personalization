@@ -99,10 +99,18 @@ from ProVoice.models.xlstm_model import (
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.models.laplace_head import corn_curvature_blocks
+from ProVoice.models.head_adapt import (
+    adapt_head_tensors,
+    l2sp_from_tau,
+    DEFAULT_ADAPT_LR,
+    DEFAULT_ADAPT_STEPS,
+    DEFAULT_TAU,
+)
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
     read_jsonl,
+    iter_jsonl,
     normalize_row,
     make_collate,
     set_mae,
@@ -204,13 +212,24 @@ def embed(model, xb: torch.Tensor, lb: torch.Tensor, device: str,
         return h[torch.arange(h.size(0), device=h.device), idx]
 
 
-def adapt_head(Z: torch.Tensor, target: torch.Tensor,
-               w0: torch.Tensor, b0: torch.Tensor,
-               loss_fn, inner_steps: int, inner_lr: float, l2sp: float,
-               second_order: bool = False,
-               ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Proximal SGD on the head only: loss + λ·||θ − θ_meta||² — the deployed
-    L2-SP adaptation with the meta head as anchor.
+def inner_adapt(Z: torch.Tensor, target: torch.Tensor,
+                w0: torch.Tensor, b0: torch.Tensor,
+                loss_fn, inner_steps: int, inner_lr: float, tau: float,
+                second_order: bool = False,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """META-TRAINING's inner loop: differentiable proximal SGD on the head only,
+    loss + λ·||θ − θ_meta||², with the meta head as anchor.
+
+    NOT ``head_adapt.adapt_head`` — and it cannot be. The outer loop
+    differentiates THROUGH this trajectory (``create_graph=second_order``), so
+    every step has to stay in the autograd graph; ``adapt_head`` runs
+    ``torch.optim.AdamW`` for 2000 steps, which both severs the graph and would
+    be intractable to backprop through. This is the one place where the
+    meta-training and deployed adaptation procedures genuinely differ, and it is
+    why ``--order imaml`` is the variant the design prefers: implicit
+    differentiation needs only the inner problem's SOLUTION, never its path, so
+    it can solve the identical objective that gets deployed. See the module
+    docstring of ``head_adapt``.
 
     second_order=False (FOMAML): anchor detached, every step detached; the
     returned tensors are leaves whose .grad after a query-loss backward is the
@@ -222,6 +241,12 @@ def adapt_head(Z: torch.Tensor, target: torch.Tensor,
     meta head itself, so gradient also flows through the anchor pathway — and
     w.r.t. Z (the support pathway into the backbone).
     """
+    # tau -> lambda HERE, from this episode's own support size. Episodes
+    # deliberately vary K, and the objective is a batch MEAN, so a fixed lambda
+    # would realise tau = 2*K*lambda and the anchor strength would change from
+    # episode to episode purely as a side effect of the K sampling — variance
+    # injected into the meta-gradient that has nothing to do with the task.
+    l2sp = l2sp_from_tau(tau, Z.shape[0])
     if second_order:
         anchor_w, anchor_b = w0, b0
         w, b = w0, b0
@@ -362,12 +387,23 @@ def solve_head_proximal(Z: torch.Tensor, target: torch.Tensor,
 def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
                     Zq: torch.Tensor, vq: torch.Tensor,
                     w0: torch.Tensor, b0: torch.Tensor,
-                    loss_fn, l2sp: float, scale: float,
+                    loss_fn, tau: float, scale: float,
                     max_iter: int, tol: float,
                     head_type: str = "corn") -> Tuple[float, float]:
     """One iMAML episode: implicit meta-gradients from the stationarity of
     the proximal inner problem (Rajeswaran et al. 2019), computed exactly at
     this head size (dense solve, no CG).
+
+    THIS is the variant whose inner problem is the deployed adaptation. The
+    objective solved below — batch-mean loss + λ||θ − θ_meta||² with
+    λ = τ/(2K) — is character-for-character the one ``head_adapt.adapt_head``
+    minimizes at serving time. The OPTIMIZER differs (damped Newton here,
+    AdamW there) and that is fine, indeed preferable: the implicit function
+    theorem is a statement about the stationary point, not the path to it, and
+    Newton converges quadratically on a strictly convex 260-parameter problem.
+    What has to match is the objective and the fact that both actually reach
+    θ*; ``solve_head_proximal`` returns a residual and ``adapt_head`` returns
+    ``grad_norm`` so both are checkable rather than assumed.
 
     Let G(θ; ψ) = loss_s(θ; Zs) + λ·||θ − θ_meta||², θ* = argmin_θ G, and ψ
     any meta-input (θ_meta, or Zs and through it the backbone). From
@@ -381,6 +417,10 @@ def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
     graphs of Zs and Zq (i.e. the backbone). `scale` multiplies the query
     loss (pass 1/meta_batch). Returns (scaled query loss, inner residual).
     """
+    # Per-episode lambda from the shared tau (see inner_adapt for why this is
+    # not a fixed flag). Everything below — the solve, the Hessian's prox term,
+    # and the VJP's anchor term — must use this SAME number.
+    l2sp = l2sp_from_tau(tau, Zs.shape[0])
     Zs_det = Zs.detach()
     ws, bs, residual = solve_head_proximal(Zs_det, vs, w0, b0, loss_fn,
                                            l2sp, max_iter, tol, head_type=head_type)
@@ -453,26 +493,15 @@ def imaml_meta_step(Zs: torch.Tensor, vs: torch.Tensor,
     return float(loss_q.detach()), residual
 
 
-def adapt_head_deployed(Z: torch.Tensor, target: torch.Tensor,
-                        w0: torch.Tensor, b0: torch.Tensor,
-                        loss_fn, steps: int, lr: float, l2sp: float,
-                        ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The DEPLOYED adaptation, for meta-validation: full-batch AdamW on the
-    head with the L2-SP anchor — identical to fine_tune_XLSTM.py, whose
-    mini-batch loop degenerates to one full-batch step per epoch whenever the
-    support fits in a batch (K <= 16 always does). Full-batch => deterministic.
-    """
-    w = w0.detach().clone().requires_grad_(True)
-    b = b0.detach().clone().requires_grad_(True)
-    anchor_w, anchor_b = w0.detach(), b0.detach()
-    opt = torch.optim.AdamW([w, b], lr=lr, weight_decay=0.0)
-    for _ in range(steps):
-        loss = loss_fn(F.linear(Z, w, b), target)
-        loss = loss + l2sp * (((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum())
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    return w.detach(), b.detach()
+# `adapt_head_deployed` used to live here: a THIRD private copy of the deployed
+# adaptation, whose docstring claimed to be "identical to fine_tune_XLSTM.py"
+# because "the mini-batch loop degenerates to one full-batch step per epoch
+# whenever the support fits in a batch (K <= 16 always does)". That held only for
+# the episode sizes here, never for the fine-tuner's real K (~99 on a full
+# driver), and stopped holding at all once the fine-tuner moved to a
+# K-independent full-batch budget with lambda derived from tau. Meta-validation
+# now calls head_adapt.adapt_head_tensors — the same function that serves — so
+# the claim is true by construction rather than by comment.
 
 
 def sample_episode(segs: List[Segment], rng: np.random.Generator,
@@ -488,16 +517,26 @@ def sample_episode(segs: List[Segment], rng: np.random.Generator,
 
 def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str,
                         loss_fn, head_type: str,
-                        steps: int, lr: float, l2sp: float,
+                        steps: int, lr: float, tau: float,
                         ) -> Tuple[float, float]:
     """Meta-validation on ONE held-out driver with the DEPLOYED adaptation:
-    fine_tune_XLSTM-style AdamW on the head over the driver's first K segments
-    (true session prefix), then set-MAE/set-QWK on everything after — the same
-    temporal protocol and the same set-aware metrics as the sweep script."""
+    the driver's first K segments (true session prefix) through the SAME
+    ``head_adapt`` call that serves and that draws the learning curve, then
+    set-MAE/set-QWK on everything after — the same temporal protocol and the
+    same set-aware metrics as the sweep script.
+
+    This is the measurement that decides meta-training early stopping, so it is
+    the one place where using anything other than the deployed adaptation would
+    select a meta-init for a procedure that never runs.
+
+    ``loss_fn`` is unused now that the shared adapter derives it from
+    ``head_type``; it is kept in the signature so callers stay unchanged and the
+    two cannot silently disagree about which loss adaptation used.
+    """
     xs, ls, vs = collate(segs[:K])
     Zs = embed(model, xs, ls, device)
-    w, b = adapt_head_deployed(Zs, vs.to(device), model.head.weight, model.head.bias,
-                               loss_fn, steps, lr, l2sp)
+    w, b, _ = adapt_head_tensors(Zs, vs.to(device), model.head.weight, model.head.bias,
+                                 tau=tau, head_type=head_type, steps=steps, lr=lr)
     xq, lq, vq = collate(segs[K:])
     Zq = embed(model, xq, lq, device)
     with torch.no_grad():
@@ -544,10 +583,17 @@ def main():
                     help="Plain-SGD step size for the head inner loop (the head is a ~260-param "
                          "GLM; SGD needs a larger lr than fine_tune_XLSTM's AdamW). Orders "
                          "first/second only; ignored for imaml.")
-    ap.add_argument("--l2sp",  type=float, default=0.01,
-                    help="λ of the proximal/L2-SP term inside the inner loop, anchoring the "
-                         "adapted head to the meta head. Keep equal to the λ used by "
-                         "fine_tune_XLSTM.py at deployment so meta-training matches it.")
+    ap.add_argument("--tau",  type=float, default=DEFAULT_TAU,
+                    help="PRIOR PRECISION of the proximal/L2-SP term inside the inner loop, "
+                         "anchoring the adapted head to the meta head. The per-episode λ is "
+                         "derived as τ/(2K) from that episode's OWN support size. This is not "
+                         "cosmetic here: episodes deliberately vary K, the inner objective is "
+                         "a batch mean, so a fixed λ realises τ = 2Kλ and the anchor strength "
+                         "would swing from episode to episode as a side effect of the K "
+                         "sampling — variance injected straight into the meta-gradient. Keep "
+                         "equal to the τ used by fine_tune_XLSTM.py at deployment, or "
+                         "meta-training optimizes an initialization for an adaptation that "
+                         "never runs.")
     ap.add_argument("--fo-warmup-epochs", type=int, default=0,
                     help="Derivative-order annealing (MAML++): run the first N meta-epochs "
                          "in first-order mode, then switch to the requested --order. 0 = off. "
@@ -586,14 +632,17 @@ def main():
                     help="Comma-separated participant ids held out for meta-validation "
                          "(drive this externally for leave-one-driver-out). Empty: hold out "
                          "~20%% of drivers at random.")
-    ap.add_argument("--val-adapt-steps", type=int, default=30,
-                    help="Full-batch AdamW steps for meta-validation adaptation. Keep equal to "
-                         "fine_tune_XLSTM's --epochs (30): with K support segments <= its batch "
-                         "size, one fine-tune epoch = one full-batch step, so this reproduces "
-                         "the deployed adaptation exactly.")
-    ap.add_argument("--val-adapt-lr", type=float, default=2e-3,
-                    help="AdamW lr for meta-validation adaptation. Keep equal to "
-                         "fine_tune_XLSTM's --lr (2e-3) for the same reason.")
+    ap.add_argument("--val-adapt-steps", type=int, default=DEFAULT_ADAPT_STEPS,
+                    help="Full-batch steps for meta-validation adaptation, which runs through "
+                         "head_adapt.adapt_head_tensors — the same function that serves. "
+                         "Defaults to head_adapt.DEFAULT_ADAPT_STEPS so it matches without "
+                         "anyone having to keep two numbers in sync. The old default (30, "
+                         "justified by 'one fine-tune epoch = one full-batch step when K <= "
+                         "batch size') was both stale and far short of the MAP: 300 steps at "
+                         "5e-4 still left the objective ~20 % above its optimum.")
+    ap.add_argument("--val-adapt-lr", type=float, default=DEFAULT_ADAPT_LR,
+                    help="lr for meta-validation adaptation; defaults to "
+                         "head_adapt.DEFAULT_ADAPT_LR for the same reason.")
     ap.add_argument("--patience", type=int, default=10,
                     help="Early-stop after this many meta-epochs without val set-MAE improvement.")
     # --- task augmentation ---
@@ -606,15 +655,15 @@ def main():
         raise ValueError(f"Need 1 <= k-min <= k-max, got {args.k_min}, {args.k_max}")
     if args.fo_warmup_epochs < 0:
         raise ValueError(f"--fo-warmup-epochs must be >= 0, got {args.fo_warmup_epochs}")
-    if args.order == "imaml" and args.l2sp <= 0.0:
+    if args.order == "imaml" and args.tau <= 0.0:
         # Without a binding prox term the inner problem is not strictly convex,
         # so its argmin is not unique and the implicit gradient is undefined.
         # Numerically the Hessian is singular too (condition number ~1e17), so
         # this used to surface as a silently wrong solve rather than an error.
         raise ValueError(
-            "--order imaml requires --l2sp > 0: the implicit meta-gradient is "
+            "--order imaml requires --tau > 0: the implicit meta-gradient is "
             "defined by the proximal term, and without it the inner argmin is "
-            f"neither unique nor numerically solvable (got --l2sp {args.l2sp})."
+            f"neither unique nor numerically solvable (got --tau {args.tau})."
         )
     if args.fo_warmup_epochs > 0 and args.order == "first":
         print("[warn] --fo-warmup-epochs has no effect with --order first (already first-order).")
@@ -651,7 +700,7 @@ def main():
         loss_fn = lambda logits, lvl: _ce(logits, levels_to_distribution(lvl))
 
     # --- data: one segment list per driver, chronological ---
-    rows = [normalize_row(r) for r in read_jsonl(pathlib.Path(args.in_jsonl))]
+    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
     if not rows:
         raise ValueError("JSONL is empty or contains no valid rows.")
     df = pd.DataFrame(rows)
@@ -764,16 +813,18 @@ def main():
                     lq_val, res = imaml_meta_step(
                         Zs, vs.to(device), Zq, vq.to(device),
                         model.head.weight, model.head.bias,
-                        loss_fn, args.l2sp, 1.0 / nb,
+                        loss_fn, args.tau, 1.0 / nb,
                         args.imaml_max_iter, args.imaml_tol,
                         head_type=head_type)
                     batch_loss += lq_val * nb # for logging
                     ep_res.append(res)
                 else:
                     # Inner: adapt the head on support with truncated proximal SGD.
-                    w, b = adapt_head(Zs, vs.to(device), model.head.weight, model.head.bias,
-                                      loss_fn, args.inner_steps, args.inner_lr, args.l2sp,
-                                      second_order=second) # new weights and bias
+                    # tau, not lambda: inner_adapt derives this episode's lambda
+                    # from its own support size (see that function).
+                    w, b = inner_adapt(Zs, vs.to(device), model.head.weight, model.head.bias,
+                                       loss_fn, args.inner_steps, args.inner_lr, args.tau,
+                                       second_order=second) # new weights and bias
 
                     # Outer: query loss under the ADAPTED head, backbone in the graph.
                     loss_q = loss_fn(F.linear(Zq, w, b), vq.to(device)) / nb # loss with the new weights and bias on query
@@ -811,7 +862,7 @@ def main():
                     Kc = min(K, len(drivers[pid]) - 1)
                     m, q = evaluate_adaptation(
                         model, drivers[pid], Kc, collate, device, loss_fn, head_type,
-                        args.val_adapt_steps, args.val_adapt_lr, args.l2sp)
+                        args.val_adapt_steps, args.val_adapt_lr, args.tau)
                     maes.append(m); qwks.append(q)
             model.train()
             val_mae, val_qwk = float(np.mean(maes)), float(np.mean(qwks))

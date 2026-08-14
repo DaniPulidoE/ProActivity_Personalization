@@ -47,7 +47,8 @@ except ImportError:  # pragma: no cover - exercised only when xlstm is absent
 # --------------------------------------------------------------------------- #
 # Canonical feature schema (ONE fixed order, used everywhere).
 # --------------------------------------------------------------------------- #
-STATE_NUM = ['perclos', 'gaze_score', 'hr_delta', 'rr_delta', 'blink_rate', 'yawn_rate', 'ear', 'mar']
+# no respiratory rate (pure noise)
+STATE_NUM = ['perclos', 'gaze_score', 'hr_delta', 'blink_rate', 'yawn_rate', 'ear', 'mar']
 # no speed ratio limit because all map has the same speed limit
 # no precipitation or night - no weather in CARLA0.10.0
 STATE_CARLA = ['speed_ratio_max', 'brake', 'steer', 'throttle', 'is_junction', 'lead_distance_m']
@@ -58,7 +59,7 @@ STATE_CAT =  STATE_CAT_ONE_HOT
 
 # one-hot encoding for emotion and lab categories
 EMOTION_VOCAB = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
-LAB_VOCAB = ['face', 'drink'] # leave only phone and drink if we use the detection model !
+LAB_VOCAB = ['face'] # discard drinks due to lack of data
 
 # FCD values, then each NUM (1 value), then each CAT (2 values).
 #D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
@@ -568,7 +569,8 @@ def encode_frame(functionname: str, row: Dict[str, Any]) -> np.ndarray:
     return vec
 
 
-def _stack_cfg(embedding_dim: int, num_blocks: int, num_heads: int, context_length: int):
+def _stack_cfg(embedding_dim: int, num_blocks: int, num_heads: int,
+               context_length: int, dropout: float = 0.0):
     """Build the validated classic mLSTM-only xLSTMBlockStack config."""
     return xLSTMBlockStackConfig(
         mlstm_block=mLSTMBlockConfig(
@@ -584,7 +586,7 @@ def _stack_cfg(embedding_dim: int, num_blocks: int, num_heads: int, context_leng
         embedding_dim=embedding_dim,
         add_post_blocks_norm=True,
         bias=False,
-        dropout=0.0,
+        dropout=dropout,
         slstm_at=[],
     )
 
@@ -599,6 +601,13 @@ class XLSTMSequenceClassifier(nn.Module):
         Class probabilities are recovered with :func:`logits_to_probs`; train
         with :func:`soft_corn_loss`, which accepts a driver's SET of acceptable
         LoAs and reduces exactly to the original CORN loss on single-label data.
+
+    ``dropout`` is applied INSIDE the block stack (``xLSTMBlockStackConfig``),
+    not to the readout. It is a model kwarg, so it is stored in the checkpoint
+    ``arch`` and rebuilt by ``load_checkpoint``; ``model.eval()`` disables it, so
+    validation, fine-tuning's frozen-backbone ``embed_all`` pass and serving all
+    see the deterministic network. Checkpoints written before it existed lack
+    the key and default to 0.0 (the previous behaviour).
     """
 
     def __init__(
@@ -611,6 +620,7 @@ class XLSTMSequenceClassifier(nn.Module):
         context_length: int = DEFAULT_CONTEXT_LENGTH,
         #pool: str = 'last',
         head_type: str = 'softmax',
+        dropout: float = 0.0,
     ):
         super().__init__()
         if not XLSTM_AVAILABLE:
@@ -633,10 +643,11 @@ class XLSTMSequenceClassifier(nn.Module):
         self.context_length = context_length
         #self.pool = pool
         self.head_type = head_type
+        self.dropout = dropout
 
         self.in_proj = nn.Linear(d_in, embedding_dim)
         self.backbone = xLSTMBlockStack(
-            _stack_cfg(embedding_dim, num_blocks, num_heads, context_length)
+            _stack_cfg(embedding_dim, num_blocks, num_heads, context_length, dropout)
         )
         n_out = n_classes - 1 if head_type == 'corn' else n_classes
         self.head = nn.Linear(embedding_dim, n_out)
@@ -717,8 +728,7 @@ def probs_to_label(probs: torch.Tensor, head_type: str = 'softmax') -> torch.Ten
     Why this is not argmax. ``sum_k 1[q_k > 0.5]`` is the **median** of the
     decoded PMF, whereas argmax is its **mode**. They are optimal for different
     losses — the median minimizes expected absolute error, the mode minimizes
-    0/1 error — and on this head they disagree on ~9 % of predictions, by up to
-    3 levels. LoA is ordinal and the design selects models on set-MAE, so the
+    0/1 errorç. LoA is ordinal and the design selects models on set-MAE, so the
     median is both the better-matched estimator and the one the CORN literature
     reports; argmax was the previous behaviour and is kept available as
     ``logits_to_probs(...).argmax(-1)`` for ablations.
@@ -753,7 +763,7 @@ def logits_to_label(logits: torch.Tensor, head_type: str = 'softmax') -> torch.T
 # functions are the single home for turning that vector into training signal;
 # `logits_to_probs` above is their decoding counterpart.
 #
-# Derivation of soft_corn_loss (full write-up: docs/soft_corn_and_oldl.md).
+# Derivation of soft_corn_loss.
 # CORN (Shi, Cao & Raschka 2023) trains unit k as a logistic regression on the
 # HARD conditional subset {i : y_i >= k} with binary target 1[y_i > k]. Taking
 # the expectation of that per-unit BCE under the label distribution -- weight
@@ -773,8 +783,21 @@ def levels_to_distribution(levels: torch.Tensor) -> torch.Tensor:
 
     A single marked level yields the usual one-hot, so single-label data is
     numerically unchanged.
+
+    Raises on rows that are unmarked or carry negative entries.
     """
-    return levels / levels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    total = levels.sum(dim=-1, keepdim=True)
+    # One fused predicate so this costs a single device->host sync per call,
+    # negligible at this head size. The per-condition split below runs only on
+    # the error path, where extra syncs do not matter.
+    if bool(((total <= 0) | (levels < 0).any(dim=-1, keepdim=True)).any()):
+        n_empty = int((total <= 0).sum())
+        n_neg = int((levels < 0).any(dim=-1).sum())
+        raise ValueError(
+            f"levels_to_distribution: {n_empty} row(s) do not sum to a positive "
+            f"value and {n_neg} row(s) contain negative entries. Every labelled "
+            f"window must mark at least one LoA.")
+    return levels / total
 
 
 def levels_to_cumulative(levels: torch.Tensor) -> torch.Tensor:
@@ -801,15 +824,16 @@ def levels_to_subset_weights(levels: torch.Tensor) -> torch.Tensor:
     return torch.cat([ones, q], dim=-1)[..., :-1]              # [1, q_0, ..., q_{K-3}]
 
 
-# Saturation bound on the logits. `logsigmoid` is exactly linear below about
-# -20 and flat above +20 in float32, so |z| = 1e4 is far outside the range where
-# either the loss or its gradient can still change: clamping here is numerically
-# INERT (verified bit-identical over 5000 random batches at logit scales up to
-# 1e3, in both value and gradient). What it buys is a total-function guarantee.
-# Without it a non-finite logit produces NaN rather than a large number, because
-# q_k is exactly 0 for every threshold above the marked level and 0 * (-inf) is
-# NaN, not 0 — one inf would silently poison the whole batch. A genuine NaN in
-# the logits still propagates, so real upstream failures stay visible.
+# Saturation bound guarding `0 * (-inf) = NaN`: q_k is exactly 0 above the marked
+# level, and that product with a non-finite logit is NaN, not the correct 0 — one
+# inf would poison the whole batch. Inert on the loss VALUE (logsigmoid is exactly
+# linear below ~-20 in float32) but NOT on the backward pass: like any logistic
+# BCE this loss is asymptotically LINEAR in the logit, so its gradient is bounded
+# by 1 yet never decays to 0, and `clamp` zeroes a live gradient (-q_k) past the
+# bound. The unit then gets no signal from the loss until weight decay (train) or
+# the L2-SP anchor (fine-tune) pulls it back — both loss-independent, so the
+# freeze is self-healing. By the same mechanism (`clamp`'s backward indicator is
+# False for NaN) a NaN logit gives a NaN loss but a ZERO gradient, not a NaN one.
 _LOGIT_SATURATION = 1e4
 
 
@@ -834,10 +858,21 @@ def soft_corn_loss(logits: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"soft_corn_loss expects (B, K-1) logits and (B, K) levels, got "
             f"{tuple(logits.shape)} and {tuple(levels.shape)}")
-    # Build the targets in at least float32 even under autocast: the
-    # normalization in levels_to_distribution clamps the row sum at 1e-8, which
-    # underflows to 0 in float16 and would turn a degenerate all-zero row into
-    # 0/0 = NaN instead of a harmless zero contribution.
+    # Batch dims must match EXACTLY, not merely broadcast. Checking only the
+    # last dim above lets a (1, K) or (K,) label through, and torch then
+    # broadcasts it over the whole batch — every segment silently trains
+    # against one driver's label, with no error and a perfectly plausible loss
+    # value. Only non-broadcastable batch sizes (e.g. 3 vs 8) fail loudly, so
+    # the dangerous case is exactly the one that used to pass.
+    if logits.shape[:-1] != levels.shape[:-1]:
+        raise ValueError(
+            f"soft_corn_loss batch dims must match exactly: logits "
+            f"{tuple(logits.shape)} vs levels {tuple(levels.shape)}. A (1, K) "
+            f"or (K,) label would broadcast over the batch instead of raising.")
+    # Build the targets in at least float32 even under autocast, so the PMF and
+    # its CDF are not quantized to fp16 before they are used as regression
+    # weights. (The degenerate all-zero row this also used to guard against is
+    # now rejected outright by levels_to_distribution.)
     levels = levels.to(torch.promote_types(levels.dtype, torch.float32))
     p = levels_to_distribution(levels).to(logits.dtype)         # (B, K)   P(y = k)
     q = levels_to_cumulative(levels).to(logits.dtype)           # (B, K-1) P(y > k)
