@@ -176,9 +176,28 @@ def main() -> None:
     epochs = args.epochs if args.epochs is not None else sel.get("epochs")
     if dropout is None or lr is None or epochs is None:
         raise SystemExit(
-            "Need dropout, lr and epochs (E*). Run stage 1 first, or pass them explicitly. "
-            "Training LODO folds at un-chosen hyperparameters would make the floor "
-            "incomparable to everything downstream.")
+            "Need dropout, lr and epochs (E*). Run sweep_population_hparams first, or pass "
+            "them explicitly. Training LODO folds at un-chosen hyperparameters would make "
+            "the floor incomparable to everything downstream.")
+    # E* is applied here with NO validation set and NO early stopping, so nothing
+    # downstream can catch an epoch count past the overfitting knee. Two things
+    # make that acceptable rather than reckless, and both are worth seeing:
+    #   * E* uses the 1-SE rule (earliest epoch statistically indistinguishable
+    #     from the smoothed optimum), so it errs toward under-training.
+    #   * It was selected on 10-driver training sets and is applied to 11-driver
+    #     ones -- ~10 % more segments, hence ~10 % more optimizer STEPS per epoch.
+    # If the sweep's E* came from the argmin instead, say so loudly.
+    if sel:
+        rule = sel.get("epochs_rule", "")
+        n_sel = sel.get("n_train_drivers_at_selection")
+        if "1 SE" not in rule:
+            print(f"[warn] E*={epochs} was not chosen by the 1-SE rule ({rule or 'unknown'}). "
+                  f"With no validation set here, an E* at the argmin of a noisy curve can "
+                  f"sit past the overfitting knee in every fold, undetected.")
+        if n_sel:
+            print(f"[note] E*={epochs} was selected on {n_sel}-driver training sets; these "
+                  f"folds train on 11, i.e. ~{100 * (11 / n_sel - 1):.0f}% more optimizer "
+                  f"steps per epoch at the same epoch count.")
 
     src = pathlib.Path(args.in_jsonl)
     if not src.exists():

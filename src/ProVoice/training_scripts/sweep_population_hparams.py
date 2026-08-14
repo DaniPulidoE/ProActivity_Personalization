@@ -75,7 +75,8 @@ RESULTS_COLUMNS = [
     "dropout", "lr", "fold", "val_pids", "seed",
     "best_set_mae",          # the run's raw minimum (what train_XLSTM selects on)
     "smoothed_best_set_mae", # minimum of the smoothed curve — the ranking quantity
-    "best_epoch_smoothed",   # argmin of the smoothed curve — the E* candidate
+    "best_epoch_smoothed",   # argmin of the smoothed curve — diagnostic only
+    "best_epoch_1se",        # EARLIEST epoch within 1 SE of that minimum — E* comes from this
     "epochs_run",            # < --epochs when early stopping fired
     "set_acc_at_best", "qwk_at_best", "val_n",
 ]
@@ -148,11 +149,27 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
     mae = np.array([float(r["set_mae"]) for r in rows])
     sm = smooth(mae, SMOOTH_WINDOW)
     j = int(np.argmin(sm))
+    # ONE-SE RULE. The argmin of a smoothed curve sits wherever a flat basin
+    # happens to dip lowest, which on a noisy curve is late as often as not —
+    # and E* is applied WITHOUT early stopping in the LODO run, where nothing
+    # would catch an epoch count past the overfitting knee. So take the EARLIEST
+    # epoch that is statistically indistinguishable from the minimum instead.
+    #
+    # The noise scale is estimated from the run's own residuals around its
+    # smoothed curve; the smoothed value averages ~SMOOTH_WINDOW points, so its
+    # standard error is sigma/sqrt(window). Erring early costs a little
+    # under-training; erring late costs overfitting that no later stage detects.
+    resid = mae - sm
+    sigma = float(resid.std(ddof=1)) if len(resid) > 1 else 0.0
+    se_sm = sigma / np.sqrt(min(SMOOTH_WINDOW, len(mae)))
+    within = np.flatnonzero(sm <= sm[j] + se_sm)
+    j1 = int(within[0]) if within.size else j
     ckpt.unlink(missing_ok=True)               # only the curve is needed downstream
     return {
         "best_set_mae": float(mae.min()),
         "smoothed_best_set_mae": float(sm[j]),
         "best_epoch_smoothed": int(rows[j]["epoch"]),
+        "best_epoch_1se": int(rows[j1]["epoch"]),
         "epochs_run": len(rows),
         "set_acc_at_best": float(rows[j]["set_acc"]),
         "qwk_at_best": float(rows[j]["qwk"]),
@@ -246,17 +263,30 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
         by_cfg.setdefault((float(r["dropout"]), float(r["lr"])), []).append(r)
 
     print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'sd':>6} {'se':>6} "
-          f"{'E* med':>7}   (smoothed val set-MAE)")
+          f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11}   (smoothed val set-MAE)")
     table = []
     for (dropout, lr), rs in sorted(by_cfg.items()):
         v = np.array([float(r["smoothed_best_set_mae"]) for r in rs])
-        e = np.array([float(r["best_epoch_smoothed"]) for r in rs])
+        e_arg = np.array([float(r["best_epoch_smoothed"]) for r in rs])
+        # Older CSVs (written before the 1-SE rule) lack the column; fall back to
+        # the argmin so a partially-completed sweep still summarizes rather than
+        # crashing — but say so, because the two are not interchangeable.
+        if all("best_epoch_1se" in r and r["best_epoch_1se"] != "" for r in rs):
+            e_1se = np.array([float(r["best_epoch_1se"]) for r in rs])
+        else:
+            print("[warn] some rows predate the 1-SE rule; falling back to argmin epochs "
+                  "for this config. Delete sweep_results.csv and re-run for a clean E*.")
+            e_1se = e_arg
         se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
+        q1, q3 = np.percentile(e_1se, [25, 75])
         table.append({"dropout": dropout, "lr": lr, "n": len(v),
                       "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0,
-                      "se": se, "e_star": int(np.median(e))})
+                      "se": se, "e_star": int(np.median(e_1se)),
+                      "e_argmin": int(np.median(e_arg)),
+                      "e_iqr": (int(q1), int(q3))})
         print(f"{dropout:8.2f} {lr:7.0e} {len(v):4d} {v.mean():7.3f} "
-              f"{table[-1]['sd']:6.3f} {se:6.3f} {table[-1]['e_star']:7d}")
+              f"{table[-1]['sd']:6.3f} {se:6.3f} {table[-1]['e_star']:8d} "
+              f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}")
 
     best = min(table, key=lambda t: t["mean"])
     # Tie-break toward MORE regularization: within one standard error of the
@@ -272,18 +302,35 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
     sel = {
         "dropout": pick["dropout"], "lr": pick["lr"], "epochs": pick["e_star"],
         "loss": "corn",
+        "epochs_rule": "median over runs of the earliest epoch within 1 SE of the smoothed minimum",
+        "epochs_argmin_median": pick["e_argmin"],
+        "epochs_1se_iqr": list(pick["e_iqr"]),
+        # The LODO run trains on 11 drivers, this sweep on 10 -- ~10% more
+        # segments, so ~10% more optimizer STEPS at the same epoch count. Recorded
+        # so the transfer is visible rather than assumed.
+        "n_train_drivers_at_selection": 10,
         "selected_on": "mean smoothed validation set-MAE over 6 rotating folds x seeds",
         "mean_smoothed_val_set_mae": pick["mean"],
         "between_run_sd": pick["sd"], "se": pick["se"], "n_runs": pick["n"],
-        "note": ("E* is the MEDIAN across runs of the smoothed curve's argmin. Stage 2 "
-                 "trains exactly this many epochs with no validation set, so nothing "
-                 "downstream selects an epoch. These hyperparameters have seen every "
-                 "driver (rotating folds) — disclosed trade, identical for both arms."),
+        "note": ("E* is the median across runs of the EARLIEST epoch within 1 SE of the "
+                 "smoothed minimum, not of the argmin: run_lodo_population applies it "
+                 "with NO validation set and NO early stopping, so an E* past the "
+                 "overfitting knee would go undetected in all 12 folds. Erring early "
+                 "costs mild under-training; erring late costs overfitting nothing "
+                 "catches. Compare epochs_argmin_median -- a large gap means a flat "
+                 "basin (E* barely matters) and a small one means a sharp optimum "
+                 "(check epochs_1se_iqr for stability). These hyperparameters have seen "
+                 "every driver (rotating folds) -- disclosed trade, identical for both "
+                 "arms."),
     }
     out = outdir / "selected_population.json"
     out.write_text(json.dumps(sel, indent=2), encoding="utf-8")
     print(f"\n[selected] dropout={pick['dropout']} lr={pick['lr']:g} E*={pick['e_star']} "
-          f"(mean smoothed val set-MAE {pick['mean']:.3f})")
+          f"(1-SE rule; argmin would give {pick['e_argmin']}, IQR {pick['e_iqr']})")
+    print(f"           mean smoothed val set-MAE {pick['mean']:.3f}")
+    if pick["e_iqr"][1] - pick["e_iqr"][0] > max(5, 0.5 * pick["e_star"]):
+        print(f"[warn] E* varies widely across runs (IQR {pick['e_iqr']}) — the optimum is "
+              f"not well determined. Consider more seeds before committing to it.")
     print(f"[OK] -> {out}")
 
 

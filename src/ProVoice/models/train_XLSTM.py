@@ -485,11 +485,18 @@ def main():
     ap.add_argument("--embedding-dim", dest="embedding_dim", type=int, default=64)
     ap.add_argument("--num-blocks", dest="num_blocks", type=int, default=2)
     ap.add_argument("--num-heads", dest="num_heads", type=int, default=4)
-    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=20.0,
+    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=10.0,
                     help="Truncate each segment to its LAST k seconds before encoding "
                          "(by frame timestamps, so it is robust to the actual sampling "
-                         "rate). Default 20 = the full label window. 0 disables. "
-                         "Stored in the checkpoint so fine-tuning and inference inherit it.")
+                         "rate). Default 10 = the second HALF of the 20 s label window; "
+                         "20 would be the whole window. 0 disables. Stored in the "
+                         "checkpoint so fine-tuning and inference inherit it. "
+                         "NOTE this is the model's INPUT window, not the label cadence: "
+                         "the drive UI still asks once per 20 s, so one segment is still "
+                         "one label and scripts/sweep_train_frac.SEGMENT_SECONDS stays 20. "
+                         "At the default resample_hz this makes context_length 100, so a "
+                         "checkpoint trained at 20 s is not interchangeable with one "
+                         "trained at 10 s — the stored arch keeps them apart.")
     ap.add_argument("--resample-hz", dest="resample_hz", type=float, default=DEFAULT_RESAMPLE_HZ,
                     help="Resample every segment onto a fixed time grid at this rate "
                          "AFTER the window_seconds truncation, so the number of "
@@ -501,14 +508,18 @@ def main():
                          "xlstm_model.RESAMPLE_GAP_S are held rather than interpolated. "
                          "0 disables. Stored in the checkpoint so fine-tuning and "
                          "inference inherit it.")
-    ap.add_argument("--loss", choices=["ce", "corn"], default="ce",
-                    help="'ce': softmax head + cross-entropy (nominal — blind to ordinal "
-                         "distance). 'corn': rank-consistent ordinal head (K-1 conditional "
-                         "logits) trained with soft-CORN (Shi et al. 2023, generalized to a "
-                         "SET of marked LoAs; see docs/soft_corn_and_oldl.md). Both accept "
-                         "multi-label windows. The choice is baked into the checkpoint and "
-                         "picked up automatically by fine_tune_XLSTM.py and the decision "
-                         "engine; only 'corn' supports the Laplace UQ layer.")
+    ap.add_argument("--loss", choices=["ce", "corn"], default="corn",
+                    help="DEFAULT 'corn': rank-consistent ordinal head (K-1 conditional "
+                         "logits) trained with SOFT-CORN (Shi et al. 2023, generalized to a "
+                         "SET of marked LoAs; see docs/soft_corn_and_oldl.md). This is the "
+                         "thesis path — LoA is ordinal, the design selects on set-MAE, and "
+                         "the Laplace UQ layer REFUSES a non-CORN head — so it is the "
+                         "default rather than something every caller has to remember. "
+                         "'ce' (softmax + cross-entropy) is kept as the nominal-loss "
+                         "ablation; it is blind to ordinal distance. Both accept "
+                         "multi-label windows. The choice is baked into the checkpoint as "
+                         "head_type and picked up automatically by fine_tune_XLSTM.py, the "
+                         "sweep, xlstm_maml.py and the decision engine.")
     args = ap.parse_args()
     head_type = "corn" if args.loss == "corn" else "softmax"
 
