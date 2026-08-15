@@ -132,7 +132,14 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="in_jsonl", default="data/labeled_data.jsonl")
     ap.add_argument("--ckpt-dir", dest="ckpt_dir", default="trained_models/lodo",
-                    help="Stage-2 output; expects pop_heldout_<pid>.pt per driver.")
+                    help="Per-fold checkpoint directory; expects <prefix><pid>.pt.")
+    ap.add_argument("--ckpt-prefix", dest="ckpt_prefix", default="pop_heldout_",
+                    help="Filename prefix for the per-driver checkpoints. 'pop_heldout_' is "
+                         "run_lodo_population's output (the L2-SP arm); pass 'anil_heldout_' "
+                         "to draw the same curve from run_lodo_anil's meta-inits. The two "
+                         "arms differ ONLY in which directory/prefix is read — same tau, "
+                         "same adaptation, same tail — which is what makes the curves "
+                         "comparable.")
     ap.add_argument("--outdir", default="results/l2sp_sweep")
     ap.add_argument("--taus", default=",".join(str(t) for t in TAU_GRID))
     ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
@@ -165,9 +172,9 @@ def main() -> None:
     for pid in ALL_PIDS:
         if want and pid not in want:
             continue
-        ckpt = ckpt_dir / f"pop_heldout_{pid}.pt"
+        ckpt = ckpt_dir / f"{args.ckpt_prefix}{pid}.pt"
         if not ckpt.exists():
-            print(f"[skip] {pid}: no {ckpt} — run stage 2 first")
+            print(f"[skip] {pid}: no {ckpt} — run the matching LODO stage first")
             continue
         drows = [normalize_row(r) for r in iter_jsonl(src)
                  if str(r.get("participantid", "")) == pid]

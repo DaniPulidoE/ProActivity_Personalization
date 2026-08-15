@@ -1,6 +1,6 @@
 # Usage: python -m ProVoice.train_XLSTM --in data/with_segments.jsonl --label-map data/labels.csv --out trained_models/state_xlstm.pt
-import argparse, csv, json, pathlib, random
-from typing import List, Dict, Any, Tuple
+import argparse, csv, hashlib, json, pathlib, random
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -158,6 +158,129 @@ def load_label_map(path: str | None) -> Dict[str, List[int]]: # NOT USED !!!
     return m
 
 
+# --------------------------------------------------------------------------- #
+# Encoded-segment cache.
+#
+# Every run re-parses the same 971 MB JSONL to produce the same ~1,470 encoded
+# segments: 24 s of single-threaded CPU per subprocess, and the pipeline launches
+# 420 of them. The encoding depends only on (source file, window_seconds,
+# resample_hz) — NOT on the train/val split, the seed, dropout or lr — so the
+# whole sweep can read one cache. At (100, 33) float32 per segment that is ~19 MB
+# against 971 MB, which is also what makes running many trainers concurrently
+# affordable: per-process peak drops from ~0.6 GB to a few tens of MB.
+#
+# THE CACHE IS KEYED BY A FINGERPRINT, NOT BY A FILENAME. `D_IN` went 35 -> 33 on
+# 2026-08-14 and invalidated every checkpoint; a cache keyed by name alone would
+# reintroduce exactly that failure, silently, as training data. `load_segment_cache`
+# refuses anything whose source file, window, grid or feature contract has moved.
+# --------------------------------------------------------------------------- #
+SEGMENT_CACHE_VERSION = 1
+
+
+def cache_name(window_seconds: float, resample_hz: float) -> str:
+    """Canonical filename for a cache. Lives here, next to the format, so the
+    builder and every consumer derive it from one definition."""
+    return f"segments_w{window_seconds:g}_hz{resample_hz:g}.npz"
+
+
+def _file_fingerprint(path: str | pathlib.Path | None) -> Dict[str, Any]:
+    if not path:
+        return {}
+    p = pathlib.Path(path)
+    st = p.stat()
+    return {"name": p.name, "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def cache_meta(in_jsonl: str, label_map: str | None,
+               window_seconds: float | None, resample_hz: float | None) -> Dict[str, Any]:
+    """The identity of a cache: everything the encoding depends on.
+
+    `features_sha` covers the feature CONTRACT (names and order), so a schema
+    change invalidates the cache instead of feeding a stale 35-dim encoding to a
+    33-dim model — the failure that deleted the last population checkpoint.
+    """
+    return {
+        "version": SEGMENT_CACHE_VERSION,
+        "source": _file_fingerprint(in_jsonl),
+        "label_map": _file_fingerprint(label_map),
+        "window_seconds": float(window_seconds) if window_seconds else 0.0,
+        "resample_hz": float(resample_hz) if resample_hz else 0.0,
+        "d_in": int(D_IN),
+        "features_sha": hashlib.sha256(",".join(FEATURE_NAMES).encode()).hexdigest()[:16],
+    }
+
+
+def save_segment_cache(path: pathlib.Path, groups: List[Tuple[np.ndarray, np.ndarray]],
+                       segment_ids: List[str], participant_ids: List[str],
+                       pid_order: List[str], seg_order: List[str],
+                       meta: Dict[str, Any]) -> None:
+    """Write the encoded segments.
+
+    Segments are stored CONCATENATED with offsets rather than padded to a common
+    length: `make_collate` derives each item's `lengths` entry from its own T, so
+    padding here would either have to be undone exactly or would silently extend
+    every sequence to the longest one in the file.
+    """
+    x_flat = (np.concatenate([g[0] for g in groups], axis=0) if groups
+              else np.zeros((0, D_IN), dtype=np.float32))
+    offsets = np.zeros(len(groups) + 1, dtype=np.int64)
+    if groups:
+        offsets[1:] = np.cumsum([g[0].shape[0] for g in groups])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        x_flat=x_flat.astype(np.float32),
+        offsets=offsets,
+        levels=(np.stack([g[1] for g in groups], axis=0) if groups
+                else np.zeros((0, len(LEVELS)), dtype=np.float32)).astype(np.float32),
+        segment_id=np.asarray(segment_ids, dtype=np.str_),
+        participantid=np.asarray(participant_ids, dtype=np.str_),
+        # First-appearance order in the SOURCE file, not the sorted groupby order.
+        # The seeded 80/20 participant split shuffles this list, so storing the
+        # sorted order instead would give cached and uncached runs different
+        # splits at the same --seed.
+        pid_order=np.asarray(pid_order, dtype=np.str_),
+        seg_order=np.asarray(seg_order, dtype=np.str_),
+        meta=np.asarray(json.dumps(meta), dtype=np.str_),
+    )
+
+
+def load_segment_cache(path: str | pathlib.Path, expect: Dict[str, Any],
+                       strict: bool = True) -> Optional[Dict[str, Any]]:
+    """Load a cache, or return None if it is absent or stale.
+
+    `strict` raises on a mismatch instead of returning None. The sweep wants that:
+    silently falling back to a 24 s re-parse across 420 runs would look like the
+    cache is working while delivering none of the speedup.
+    """
+    p = pathlib.Path(path)
+    if not p.exists():
+        if strict:
+            raise SystemExit(f"--cache {p} does not exist. Build it with:\n"
+                             f"    python -m scripts.build_segment_cache --in <jsonl> "
+                             f"--window-seconds {expect.get('window_seconds')} "
+                             f"--out {p}")
+        return None
+    with np.load(p, allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"]))
+        diff = {k: (meta.get(k), expect[k]) for k in expect if meta.get(k) != expect[k]}
+        if diff:
+            msg = (f"cache {p.name} is STALE — rebuild it. Mismatched: "
+                   + "; ".join(f"{k}: cache={c!r} run={r!r}" for k, (c, r) in diff.items()))
+            if strict:
+                raise SystemExit(msg)
+            print(f"[cache][warn] {msg}")
+            return None
+        return {
+            "x_flat": z["x_flat"], "offsets": z["offsets"], "levels": z["levels"],
+            "segment_id": [str(s) for s in z["segment_id"]],
+            "participantid": [str(s) for s in z["participantid"]],
+            "pid_order": [str(s) for s in z["pid_order"]],
+            "seg_order": [str(s) for s in z["seg_order"]],
+            "meta": meta,
+        }
+
+
 class SeqDataset(Dataset):
     def __init__(
         self,
@@ -201,8 +324,81 @@ class SeqDataset(Dataset):
                 f"{skipped[:5]}{' ...' if len(skipped) > 5 else ''}")
 
 
+    @classmethod
+    def from_cache(cls, cache: Dict[str, Any], context_length: int,
+                   pids: Optional[set] = None,
+                   segment_ids: Optional[set] = None) -> "SeqDataset":
+        """Build from a pre-encoded cache instead of a DataFrame.
+
+        Bypasses __init__ deliberately: the encoding it would redo is exactly what
+        the cache holds, and `groups` is the only attribute anything downstream
+        reads (`make_collate`, the model, both losses and every metric take items,
+        never the frame). Selection is by participant (the normal split) or by
+        segment id (the single-participant fallback).
+        """
+        obj = cls.__new__(cls)
+        obj.context_length = context_length
+        obj.groups = []
+        x_flat, off, lv = cache["x_flat"], cache["offsets"], cache["levels"]
+        for i, (sid, pid) in enumerate(zip(cache["segment_id"], cache["participantid"])):
+            if pids is not None and str(pid) not in pids:
+                continue
+            if segment_ids is not None and str(sid) not in segment_ids:
+                continue
+            obj.groups.append((x_flat[off[i]:off[i + 1]], lv[i]))
+        return obj
+
     def __len__(self): return len(self.groups)
     def __getitem__(self, i): return self.groups[i]
+
+
+def choose_split(pid_order: List[str], seg_order: List[str], no_val: bool,
+                 val_pids_arg: str, seed: int) -> Tuple[Optional[set], Optional[set],
+                                                        Optional[set], Optional[set]]:
+    """Decide the train/val split. Returns (tr_pids, te_pids, tr_segs, te_segs).
+
+    Exactly one pair is non-None: participant-level normally, segment-level only
+    in the single-participant fallback. Shared by the JSONL and cache paths so a
+    cached run and an uncached one at the same --seed cannot land on different
+    splits — which is why the cache stores FIRST-APPEARANCE order rather than the
+    sorted groupby order it would otherwise be natural to write.
+    """
+    if not pid_order:
+        raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
+    if no_val:
+        print(f"[split] --no-val: training on ALL {len(pid_order)} participant(s), "
+              f"no validation set, no epoch selection")
+        return set(str(p) for p in pid_order), set(), None, None
+
+    have = set(str(p) for p in pid_order)
+    if val_pids_arg:
+        want = [p.strip() for p in val_pids_arg.split(",") if p.strip()]
+        missing = [p for p in want if p not in have]
+        if missing:
+            raise ValueError(
+                f"--val-pids names participant(s) not present in the data: {missing}. "
+                f"Available: {sorted(have)}")
+        te_pids = set(want)
+        tr_pids = have - te_pids
+        if not tr_pids:
+            raise ValueError("--val-pids holds out every participant; nothing left to train on.")
+        print(f"[split] EXPLICIT val participants={sorted(te_pids)}  "
+              f"train participants={sorted(tr_pids)}")
+        return tr_pids, te_pids, None, None
+
+    rng = pd.Series(list(pid_order)).sample(frac=1.0, random_state=seed).values
+    if len(rng) >= 2:
+        ntr = max(1, int(0.8 * len(rng)))
+        tr_pids, te_pids = set(str(p) for p in rng[:ntr]), set(str(p) for p in rng[ntr:])
+        print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
+        return tr_pids, te_pids, None, None
+
+    print(f"[split] only {len(rng)} participant(s) — falling back to segment-level 80/20 split")
+    gids = pd.Series(list(seg_order)).sample(frac=1.0, random_state=seed).values
+    ntr = max(1, int(0.8 * len(gids)))
+    tr_segs, te_segs = set(str(g) for g in gids[:ntr]), set(str(g) for g in gids[ntr:])
+    print(f"[split] train segments={len(tr_segs)}  val segments={len(te_segs)}")
+    return None, None, tr_segs, te_segs
 
 
 def make_collate(context_length: int):
@@ -427,6 +623,118 @@ def constant_baseline(levels: np.ndarray, n_classes: int = 5) -> Dict[str, float
             "const_loa_acc": c_acc, "const_set_acc": float(accs[c_acc])}
 
 
+def prepare_frame(df: pd.DataFrame, label_map: str | None) -> pd.DataFrame:
+    """Apply the label map and coerce every model-input column to its own dtype.
+
+    Shared by the trainer and scripts/build_segment_cache.py, so a cache cannot
+    be encoded from differently-coerced columns than a direct run would use.
+    """
+    if label_map:
+        lm = pd.read_csv(label_map)
+        miss = [k for k in (["segment_id"] + LEVELS) if k not in lm.columns]
+        if miss:
+            raise ValueError(f"--label-map missing columns: {miss}")
+        df = df.merge(lm, on="segment_id", how="left", suffixes=("", "_map"))
+        for k in LEVELS:
+            if k not in df.columns or df[k].isna().all():
+                df[k] = df.get(k + "_map")
+            df[k] = df[k].fillna(0).astype(int)
+            if k + "_map" in df.columns: df.drop(columns=[k + "_map"], inplace=True)
+
+    if 'segment_id' not in df.columns or df['segment_id'].eq("").all():
+        raise ValueError("Missing segment_id; cannot build sequences.")
+    for k in STATE_CAT:
+        if k not in df.columns: df[k] = ""
+        df[k] = df[k].fillna("").astype(str)
+    for k in STATE_NUM:
+        if k not in df.columns: df[k] = 0.0
+        df[k] = df[k].apply(_as01)
+    for k in STATE_CARLA:
+        # SENTINEL_VALUES is the single source of truth for which columns have a
+        # reserved "missing" marker; encode_frame applies the same mapping at
+        # serving time. Hard-coding the name here would let the two drift.
+        default = SENTINEL_VALUES.get(k, 0.0)
+        if k not in df.columns: df[k] = default
+        df[k] = df[k].fillna(default)
+    return df
+
+
+def datasets_from_jsonl(args, resample_hz) -> Tuple[Any, Any]:
+    """Parse, encode and split the source JSONL — the original path.
+
+    ~24 s of single-threaded CPU on the 971 MB file. `--cache` skips it; see
+    datasets_from_cache and scripts/build_segment_cache.py.
+    """
+    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
+    if not rows:
+        raise ValueError("JSONL is empty or contains no valid rows.")
+    df = prepare_frame(pd.DataFrame(rows), args.label_map)
+    if df[SPLIT_VARIABLE].eq("").all():
+        raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
+
+    # First-appearance order, which is what choose_split shuffles. The cache
+    # stores the same order so the two paths split identically at a given --seed.
+    tr_pids, te_pids, tr_segs, te_segs = choose_split(
+        [str(p) for p in df[SPLIT_VARIABLE].drop_duplicates()],
+        [str(g) for g in df['segment_id'].drop_duplicates()],
+        args.no_val, args.val_pids, args.seed)
+
+    def sel(pids, segs):
+        if pids is not None:
+            return df[df[SPLIT_VARIABLE].astype(str).isin(pids)].reset_index(drop=True)
+        return df[df['segment_id'].astype(str).isin(segs)].reset_index(drop=True)
+
+    tr_df = sel(tr_pids, tr_segs)
+    te_df = df.iloc[0:0] if args.no_val else sel(te_pids, te_segs)
+
+    log_fh = open(args.log_path, "w", encoding="utf-8") if args.log_path else None
+    if log_fh:
+        print(f"[log] writing feature log → {args.log_path}")
+    try:
+        train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train",
+                              log_fh=log_fh, window_seconds=args.window_seconds,
+                              resample_hz=resample_hz)
+        # Under --no-val there is no validation frame to build a dataset from, and
+        # SeqDataset rightly refuses an empty one (its segment_id assert). Skip the
+        # construction rather than weakening that guard, which exists to catch a
+        # genuinely empty split in the normal path.
+        test_ds = ([] if args.no_val else
+                   SeqDataset(te_df, context_length=args.context_length, split="val",
+                              log_fh=log_fh, window_seconds=args.window_seconds,
+                              resample_hz=resample_hz))
+    finally:
+        if log_fh:
+            log_fh.close()
+    return train_ds, test_ds
+
+
+def datasets_from_cache(args, resample_hz) -> Tuple[Any, Any]:
+    """Build the split from pre-encoded segments — skips the 24 s parse entirely.
+
+    The cache is fingerprinted against (source file, label map, window, grid,
+    feature contract), so a mismatch is a hard error rather than a silent
+    fallback: a cache that quietly re-parsed would look like it was working while
+    delivering none of the speedup, and one that quietly loaded a stale encoding
+    would be the D_IN 35->33 failure again, this time as training data.
+    """
+    cache = load_segment_cache(
+        args.cache, cache_meta(args.in_jsonl, args.label_map,
+                               args.window_seconds, resample_hz))
+    if args.log_path:
+        print("[log][warn] --log is ignored with --cache: the per-frame feature log is "
+              "written during encoding, which the cache skips. Re-run without --cache.")
+    tr_pids, te_pids, tr_segs, te_segs = choose_split(
+        cache["pid_order"], cache["seg_order"], args.no_val, args.val_pids, args.seed)
+    train_ds = SeqDataset.from_cache(cache, args.context_length,
+                                     pids=tr_pids, segment_ids=tr_segs)
+    test_ds = ([] if args.no_val else
+               SeqDataset.from_cache(cache, args.context_length,
+                                     pids=te_pids, segment_ids=te_segs))
+    print(f"[cache] {pathlib.Path(args.cache).name}: {len(train_ds)} train + "
+          f"{len(test_ds)} val segments")
+    return train_ds, test_ds
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
@@ -437,6 +745,16 @@ def main():
                          "object per frame (~thousands of large lines on a full dataset). "
                          "Pass a path to enable for debugging.")
     ap.add_argument("--label-map", dest="label_map", default=None, help="CSV with columns: segment_id, Level_1..Level_5")
+    ap.add_argument("--cache", default="",
+                    help="Pre-encoded segment cache (.npz) from scripts/build_segment_cache.py. "
+                         "Skips the ~24 s parse+encode of the source JSONL, which is otherwise "
+                         "paid once per process — 420 times across the population pipeline — "
+                         "and drops per-process peak RSS from ~0.6 GB to a few tens of MB, "
+                         "which is what makes --jobs > 1 in the sweep affordable. The cache is "
+                         "fingerprinted against the source file, label map, window_seconds, "
+                         "resample_hz and the feature contract; a mismatch is a hard error, "
+                         "never a silent re-parse. Encoding does not depend on the split, seed, "
+                         "dropout or lr, so one cache per (window, grid) serves the whole sweep.")
     ap.add_argument("--val-pids", dest="val_pids", default="",
                     help="Comma-separated participantids to use as the validation set, e.g. "
                          "'001,005'. Overrides the default seeded 80/20 participant split, "
@@ -604,106 +922,8 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    rows = [normalize_row(r) for r in iter_jsonl(pathlib.Path(args.in_jsonl))]
-    if not rows:
-        raise ValueError("JSONL is empty or contains no valid rows.")
-    df = pd.DataFrame(rows)
-
-    if args.label_map:
-        lm = pd.read_csv(args.label_map)
-        miss = [k for k in (["segment_id"] + LEVELS) if k not in lm.columns]
-        if miss:
-            raise ValueError(f"--label-map missing columns: {miss}")
-        df = df.merge(lm, on="segment_id", how="left", suffixes=("", "_map"))
-        for k in LEVELS:
-            if k not in df.columns or df[k].isna().all():
-                df[k] = df.get(k + "_map")
-            df[k] = df[k].fillna(0).astype(int)
-            if k + "_map" in df.columns: df.drop(columns=[k + "_map"], inplace=True)
-
-    if 'segment_id' not in df.columns or df['segment_id'].eq("").all():
-        raise ValueError("Missing segment_id; cannot build sequences.")
-    for k in STATE_CAT:
-        if k not in df.columns: df[k] = ""
-        df[k] = df[k].fillna("").astype(str)
-    for k in STATE_NUM:
-        if k not in df.columns: df[k] = 0.0
-        df[k] = df[k].apply(_as01)
-    for k in STATE_CARLA:
-        # SENTINEL_VALUES is the single source of truth for which columns have a
-        # reserved "missing" marker; encode_frame applies the same mapping at
-        # serving time. Hard-coding the name here would let the two drift.
-        default = SENTINEL_VALUES.get(k, 0.0)
-        if k not in df.columns: df[k] = default
-        df[k] = df[k].fillna(default)
-    
-    """ Original case: train-val split done randomly, not by participant
-    gids = df['segment_id'].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
-    ntr = max(1, int(0.8 * len(gids)))
-    tr_ids, te_ids = set(gids[:ntr]), set(gids[ntr:])
-    tr_df = df[df['segment_id'].isin(tr_ids)].reset_index(drop=True)
-    te_df = df[df['segment_id'].isin(te_ids)].reset_index(drop=True)
-    """
-    # Train-validation split: by participant when ≥2 participants, else by segment.
-    if df[SPLIT_VARIABLE].eq("").all():
-        raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
-    pids = df[SPLIT_VARIABLE].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
-    if args.no_val:
-        # LODO population training: every provided driver trains, nothing is held
-        # back, no epoch is selected. The held-out driver is not in this file at
-        # all, and is scored by the caller AFTER training — so there is no path
-        # by which a validation signal could pick the checkpoint.
-        print(f"[split] --no-val: training on ALL {len(pids)} participant(s), "
-              f"no validation set, no epoch selection")
-        tr_df = df.reset_index(drop=True)
-        te_df = df.iloc[0:0]
-    elif args.val_pids:
-        want = [p.strip() for p in args.val_pids.split(",") if p.strip()]
-        have = set(str(p) for p in pids)
-        missing = [p for p in want if p not in have]
-        if missing:
-            raise ValueError(
-                f"--val-pids names participant(s) not present in the data: {missing}. "
-                f"Available: {sorted(have)}")
-        te_pids = set(want)
-        tr_pids = have - te_pids
-        if not tr_pids:
-            raise ValueError("--val-pids holds out every participant; nothing left to train on.")
-        print(f"[split] EXPLICIT val participants={sorted(te_pids)}  "
-              f"train participants={sorted(tr_pids)}")
-        tr_df = df[df[SPLIT_VARIABLE].astype(str).isin(tr_pids)].reset_index(drop=True)
-        te_df = df[df[SPLIT_VARIABLE].astype(str).isin(te_pids)].reset_index(drop=True)
-    elif len(pids) >= 2:
-        ntr = max(1, int(0.8 * len(pids)))
-        tr_pids, te_pids = set(pids[:ntr]), set(pids[ntr:])
-        print(f"[split] train participants={sorted(tr_pids)}  val participants={sorted(te_pids)}")
-        tr_df = df[df[SPLIT_VARIABLE].isin(tr_pids)].reset_index(drop=True)
-        te_df = df[df[SPLIT_VARIABLE].isin(te_pids)].reset_index(drop=True)
-    else:
-        print(f"[split] only {len(pids)} participant(s) — falling back to segment-level 80/20 split")
-        gids = df['segment_id'].drop_duplicates().sample(frac=1.0, random_state=args.seed).values
-        ntr = max(1, int(0.8 * len(gids)))
-        tr_ids, te_ids = set(gids[:ntr]), set(gids[ntr:])
-        tr_df = df[df['segment_id'].isin(tr_ids)].reset_index(drop=True)
-        te_df = df[df['segment_id'].isin(te_ids)].reset_index(drop=True)
-        print(f"[split] train segments={len(tr_ids)}  val segments={len(te_ids)}")
-
-    log_fh = open(args.log_path, "w", encoding="utf-8") if args.log_path else None
-    if log_fh:
-        print(f"[log] writing feature log → {args.log_path}")
-    try:
-      train_ds = SeqDataset(tr_df, context_length=args.context_length, split="train", log_fh=log_fh,
-                            window_seconds=args.window_seconds, resample_hz=resample_hz)
-      # Under --no-val there is no validation frame to build a dataset from, and
-      # SeqDataset rightly refuses an empty one (its segment_id assert). Skip the
-      # construction rather than weakening that guard, which exists to catch a
-      # genuinely empty split in the normal path.
-      test_ds  = ([] if args.no_val else
-                  SeqDataset(te_df, context_length=args.context_length, split="val", log_fh=log_fh,
-                             window_seconds=args.window_seconds, resample_hz=resample_hz))
-    finally:
-      if log_fh:
-          log_fh.close()
+    train_ds, test_ds = (datasets_from_cache(args, resample_hz) if args.cache
+                         else datasets_from_jsonl(args, resample_hz))
     if len(train_ds) == 0 or (len(test_ds) == 0 and not args.no_val):
         raise ValueError(f"Insufficient segments: train={len(train_ds)}, val={len(test_ds)}. Ensure Level_* labels exist.")
     collate = make_collate(args.context_length)

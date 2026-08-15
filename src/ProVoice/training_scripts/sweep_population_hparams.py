@@ -55,8 +55,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import csv
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -362,12 +364,43 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
 def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed: int,
             epochs: int, patience: int, min_delta: float, min_select_epoch: int,
             window_seconds: float, loss: str, workdir: pathlib.Path,
-            extra: List[str]) -> Optional[Dict[str, float]]:
+            extra: List[str], cache: str = "",
+            threads: int = 0) -> Optional[Dict[str, float]]:
     """One training run. Returns its curve summary, or None if it failed.
 
     Runs train_XLSTM as a SUBPROCESS rather than importing it: each run needs a
     fresh process-global torch RNG state and a clean CUDA allocator, and a crash
     in run 97 of 180 should cost that run, not the sweep.
+
+    ``threads`` caps the child's intra-op thread pool, which is what lets ``--jobs``
+    trade width for count. This model does not scale inside a process: at 12 torch
+    threads it is only **1.82x** faster than at 1, and 16 threads is slower than 4.
+    The tensors are too small to amortize the synchronization and the rest goes
+    into barrier spin -- which Windows reports as >90% CPU while throughput stays
+    flat.
+
+    MEASURED aggregate step throughput (12-physical/16-logical box, real concurrent
+    processes -- NOT extrapolated from the single-process thread curve, which
+    overstates this badly by assuming idle cores deliver full speed):
+
+        1 proc x 16 thr   15.8 steps/s   (baseline)
+        4 proc x  4 thr   31.8           2.01x
+        8 proc x  1 thr   32.1           2.04x
+       12 proc x  1 thr   34.7           2.20x
+
+    Per-process step time degrades from 94 ms alone to 346 ms at 12-way, so the
+    spare cores are contended rather than idle -- the ceiling is ~2x, not the ~6x
+    the thread curve alone suggests. END-TO-END on a real 4-run sweep, which also
+    pays the ~4.7 s per-process fixed cost: 259 s sequential -> 112 s at 4x4,
+    **2.31x**. 4x4 beat 8x1 in every measurement.
+
+    DETERMINISM: torch CPU reductions depend on the thread count, so the SAME seed
+    at a different --threads-per-job produces a slightly different trajectory
+    (verified: 25 identical steps diverge at the 8th significant digit; the same
+    thread count reproduces bit-exactly). Each run remains a valid sample, but a
+    sweep half-run at one setting and resumed at another mixes two numeric
+    regimes. Keep --jobs/--threads-per-job FIXED for a whole stage, the same way
+    --decision-hz is held fixed across participants.
     """
     tag = run_tag(dropout, lr, val_pids, seed, window_seconds, loss)
     ckpt = workdir / f"ckpt_{tag}.pt"          # written, then discarded — stage 2 retrains
@@ -380,7 +413,17 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
            "--min-delta", str(min_delta),
            "--min-select-epoch", str(min_select_epoch),
            "--window-seconds", str(window_seconds)] + extra
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if cache:
+        cmd += ["--cache", cache]
+    env = dict(os.environ)
+    if threads > 0:
+        # Set in the ENVIRONMENT, not via a trainer flag: torch reads these when it
+        # is imported, so a flag parsed in main() would be too late to shrink the
+        # pool that has already been built.
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS"):
+            env[var] = str(threads)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
         print(f"  [FAIL] {tag} (exit {proc.returncode})")
         print("  " + "\n  ".join(proc.stderr.strip().splitlines()[-8:]))
@@ -529,7 +572,46 @@ def main() -> None:
     ap.add_argument("--trainer-arg", dest="trainer_args", action="append", default=[],
                     help="Extra flag passed through to train_XLSTM, repeatable, e.g. "
                          "--trainer-arg=--grad-clip --trainer-arg=0.5")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Concurrent training runs. The runs are independent, and this model "
+                         "does not scale INSIDE a process (12 torch threads is only 1.82x "
+                         "faster than 1), so throughput comes from count rather than width. "
+                         "MEASURED ceiling is ~2x, not the ~6x the thread curve implies, "
+                         "because the spare cores are contended rather than free. "
+                         "'--jobs 4 --threads-per-job 4' (the default pairing on a 16-thread "
+                         "box) measured 2.31x end-to-end and beat 8x1 in every test. "
+                         "KEEP THIS FIXED for a whole stage: thread count changes float "
+                         "reduction order, so resuming at a different setting mixes two "
+                         "numeric regimes into one results table. "
+                         "STRONGLY prefer --cache with this: without it every concurrent "
+                         "job re-parses the 971 MB JSONL and peaks ~0.6 GB, so 12 jobs is "
+                         "~7 GB of RAM and 12-way disk contention for no reason.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch intra-op threads per run (0 = auto: cpu_count // jobs, "
+                         "floored at 1). Set as an environment variable on the child, since "
+                         "torch sizes its pool at import.")
+    ap.add_argument("--cache", default="",
+                    help="Pre-encoded segment cache (.npz), passed through to the trainer. "
+                         "Build with scripts/build_segment_cache.py. Saves ~24 s per run "
+                         "(~2.8 h over the pipeline's 420 runs) and, more importantly, makes "
+                         "--jobs practical by cutting per-process peak RSS from ~0.6 GB to "
+                         "tens of MB. Must match --window-seconds; the trainer errors on a "
+                         "stale or mismatched cache rather than silently re-parsing.")
     args = ap.parse_args()
+    args.jobs = max(1, args.jobs)
+    # At --jobs 1 leave torch's own default ALONE. os.cpu_count() reports LOGICAL
+    # cores (16 here) while torch defaults to PHYSICAL (12), and 16 threads measured
+    # SLOWER than 12 (49.0 vs 41.0 ms/step) -- so deriving 16//1 here would have
+    # silently made the default single-job path ~20% slower than before this flag
+    # existed. Auto only ever divides the machine up; it never widens a run.
+    threads = (args.threads_per_job if args.threads_per_job > 0
+               else (0 if args.jobs == 1 else max(1, (os.cpu_count() or 4) // args.jobs)))
+    if args.jobs > 1 and not args.cache:
+        print(f"[warn] --jobs {args.jobs} without --cache: each run will re-parse the source "
+              f"JSONL (~24 s, ~0.6 GB peak), so expect ~{0.6 * args.jobs:.1f} GB of RAM and "
+              f"heavy disk contention at startup. Build a cache first:\n"
+              f"    python -m scripts.build_segment_cache --in {args.in_jsonl} "
+              f"--windows {args.window_seconds:g}")
 
     dropouts = [float(x) for x in args.dropouts.split(",") if x.strip()]
     lrs = [float(x) for x in args.lrs.split(",") if x.strip()]
@@ -570,54 +652,105 @@ def main() -> None:
         writer.writerow(RESULTS_COLUMNS)
         fh.flush()
 
-    n = 0
+    # Flatten to a work list first, so --jobs can dispatch across configs rather
+    # than only within the innermost seed loop.
+    tasks = []
     for dropout in dropouts:
         for lr in lrs:
             for i in fold_idx:
                 val_pids = list(VALIDATION_FOLDS[i])
                 base = fold_baseline(labels, val_pids)
                 for seed in seeds:
-                    n += 1
-                    key = (dropout, lr, args.window_seconds, args.loss, i, seed)
-                    if key in done:
+                    if (dropout, lr, args.window_seconds, args.loss, i, seed) in done:
                         continue
-                    print(f"[{n}/{total}] dropout={dropout} lr={lr:g} "
-                          f"fold={i}{val_pids} seed={seed}", flush=True)
-                    r = run_one(args.in_jsonl, dropout, lr, val_pids, seed,
-                                args.epochs, args.patience, args.min_delta,
-                                args.min_select_epoch, args.window_seconds,
-                                args.loss, workdir, args.trainer_args)
-                    if r is None:
-                        continue
-                    r.update(base)
-                    # The identity prefix and RESULTS_COLUMNS must stay in step;
-                    # N_ID is derived from the column list rather than written as
-                    # a literal, which is what let a sixth identity column slip
-                    # past a hard-coded [5:].
-                    writer.writerow([dropout, lr, args.window_seconds, args.loss, i,
-                                     "|".join(val_pids), seed] +
-                                    [r[c] for c in RESULTS_COLUMNS[N_ID:]])
-                    fh.flush()
-                    d = r["smoothed_best_set_mae"] - base["const_set_mae"]
-                    print(f"      set-MAE raw={r['best_set_mae']:.3f} "
-                          f"smoothed={r['smoothed_best_set_mae']:.3f} "
-                          f"@epoch {r['best_epoch_smoothed']} "
-                          f"(1se {r['best_epoch_1se']}, {r['epochs_run']} epochs run) "
-                          f"| const {base['const_set_mae']:.3f} -> {d:+.3f}"
-                          f"{'' if d < 0 else '  WORSE THAN CONSTANT'}")
-                    # Three histograms, normalized to shares so unequal totals
-                    # (train has ~5x the segments of val) do not hide the shape.
-                    def pct(v):
-                        t = sum(v) or 1
-                        return "[" + " ".join(f"{100*x/t:4.1f}" for x in v) + "]"
-                    pv = [int(r[f"pred_loa{c}"]) for c in range(5)]
-                    lv = [base[f"lbl_loa{c}"] for c in range(5)]
-                    tv = [base[f"trn_loa{c}"] for c in range(5)]
-                    print(f"      @epoch {r['metrics_epoch']}  %LoA0..4  "
-                          f"pred {pct(pv)}  val {pct(lv)}  train {pct(tv)}")
-                    print(f"      argmax MAE={r['mae_argmax']:.3f} "
-                          f"median MAE={r['mae_median']:.3f}")
-    fh.close()
+                    tasks.append((dropout, lr, i, val_pids, seed, base))
+
+    print(f"[run] {len(tasks)} run(s) to do of {total}; {args.jobs} concurrent x "
+          + (f"{threads} torch thread(s) each" if threads else "torch default threads"),
+          flush=True)
+
+    def report(t, r) -> str:
+        """The per-run block, built as ONE string. With --jobs > 1 several runs
+        finish at once, and separate print() calls would interleave line by line."""
+        dropout, lr, i, val_pids, seed, base = t
+        d = r["smoothed_best_set_mae"] - base["const_set_mae"]
+        def pct(v):
+            tot = sum(v) or 1
+            return "[" + " ".join(f"{100*x/tot:4.1f}" for x in v) + "]"
+        pv = [int(r[f"pred_loa{c}"]) for c in range(5)]
+        lv = [base[f"lbl_loa{c}"] for c in range(5)]
+        tv = [base[f"trn_loa{c}"] for c in range(5)]
+        return (f"      set-MAE raw={r['best_set_mae']:.3f} "
+                f"smoothed={r['smoothed_best_set_mae']:.3f} "
+                f"@epoch {r['best_epoch_smoothed']} "
+                f"(1se {r['best_epoch_1se']}, {r['epochs_run']} epochs run) "
+                f"| const {base['const_set_mae']:.3f} -> {d:+.3f}"
+                f"{'' if d < 0 else '  WORSE THAN CONSTANT'}\n"
+                # Three histograms, normalized to shares so unequal totals
+                # (train has ~5x the segments of val) do not hide the shape.
+                f"      @epoch {r['metrics_epoch']}  %LoA0..4  "
+                f"pred {pct(pv)}  val {pct(lv)}  train {pct(tv)}\n"
+                f"      argmax MAE={r['mae_argmax']:.3f} "
+                f"median MAE={r['mae_median']:.3f}")
+
+    def work(t):
+        dropout, lr, i, val_pids, seed, _base = t
+        return t, run_one(args.in_jsonl, dropout, lr, val_pids, seed,
+                          args.epochs, args.patience, args.min_delta,
+                          args.min_select_epoch, args.window_seconds,
+                          args.loss, workdir, args.trainer_args,
+                          cache=args.cache, threads=threads)
+
+    # Only THIS thread touches the writer, so the CSV needs no lock: the pool
+    # workers just block on their subprocess and hand back the parsed curve.
+    n_done = n_failed = 0
+    ex = cf.ThreadPoolExecutor(max_workers=args.jobs)
+    futs = {ex.submit(work, t): t for t in tasks}
+    try:
+        for fut in cf.as_completed(futs):
+            n_done += 1
+            try:
+                t, r = fut.result()
+            except Exception as e:
+                # ONE run must not take down the batch. curve_stats parses a CSV a
+                # crashed trainer may have left torn mid-line (read_done already
+                # anticipates exactly that), so this is a realistic failure, not a
+                # theoretical one — and at run 97 of 180 re-raising would discard
+                # the summary for the 96 that succeeded.
+                n_failed += 1
+                d, l, i, vp, s, _ = futs[fut]
+                print(f"[ERROR] dropout={d} lr={l:g} fold={i}{vp} seed={s}: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                continue
+            dropout, lr, i, val_pids, seed, base = t
+            if r is None:
+                n_failed += 1
+                continue
+            r.update(base)
+            # The identity prefix and RESULTS_COLUMNS must stay in step;
+            # N_ID is derived from the column list rather than written as
+            # a literal, which is what let a sixth identity column slip
+            # past a hard-coded [5:].
+            writer.writerow([dropout, lr, args.window_seconds, args.loss, i,
+                             "|".join(val_pids), seed] +
+                            [r[c] for c in RESULTS_COLUMNS[N_ID:]])
+            fh.flush()
+            print(f"[{n_done}/{len(tasks)}] dropout={dropout} lr={lr:g} "
+                  f"fold={i}{val_pids} seed={seed}\n" + report(t, r), flush=True)
+    except KeyboardInterrupt:
+        # Drop everything not yet started, so Ctrl-C stops in seconds rather than
+        # after the whole remaining queue drains. Runs already in flight still
+        # finish (they cannot be killed through a Future); their rows are already
+        # on disk, and the resume key skips them next time either way.
+        print(f"\n[interrupt] cancelling {sum(f.cancel() for f in futs)} queued run(s); "
+              f"waiting for the {args.jobs} in flight to finish...", flush=True)
+    finally:
+        ex.shutdown(wait=True)
+        fh.close()          # never left open: rows are flushed per-run, but the
+                            # handle must not leak if the loop exits abnormally
+    if n_failed:
+        print(f"[warn] {n_failed} run(s) failed and were not recorded; re-run the same "
+              f"command to retry just those (completed runs are skipped).")
     summarize(results_csv, outdir)
 
 

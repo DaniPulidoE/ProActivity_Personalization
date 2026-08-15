@@ -65,6 +65,8 @@ import sys
 import time
 from typing import Dict, List, Optional
 
+from ProVoice.models.train_XLSTM import cache_name
+from ProVoice.models.xlstm_model import DEFAULT_RESAMPLE_HZ
 from ProVoice.training_scripts.folds import VALIDATION_FOLDS
 from ProVoice.training_scripts.sweep_population_hparams import DROPOUTS, LRS, SEEDS
 
@@ -127,7 +129,20 @@ def run_stage(stage: Dict, base: pathlib.Path, args, dropouts: List[float],
            "--lrs", ",".join(str(l) for l in lrs),
            "--seeds", ",".join(str(s) for s in seeds),
            "--epochs", str(args.epochs), "--patience", str(args.patience),
-           "--min-select-epoch", str(args.min_select_epoch)]
+           "--min-select-epoch", str(args.min_select_epoch),
+           "--jobs", str(args.jobs)]
+    if args.threads_per_job > 0:
+        cmd += ["--threads-per-job", str(args.threads_per_job)]
+    # Each stage needs the cache built for ITS OWN window — the encoding differs,
+    # and the trainer errors rather than accepting a mismatched one.
+    if args.cache_dir:
+        cache = pathlib.Path(args.cache_dir) / cache_name(stage["window"], args.resample_hz)
+        if not cache.exists():
+            print(f"[{stage['name']}] SKIPPED — no cache for this window at {cache}. Build it:\n"
+                  f"    python -m scripts.build_segment_cache --in {args.in_jsonl} "
+                  f"--outdir {args.cache_dir} --windows {stage['window']:g}")
+            return False
+        cmd += ["--cache", str(cache)]
     t0 = time.time()
     # Streamed, not captured: these stages run for hours and the caller needs to
     # see progress. A failure is caught by the return code and by the row count.
@@ -198,6 +213,24 @@ def main() -> None:
                     help="Comma-separated stage names to run (default: all four, in order).")
     ap.add_argument("--status", action="store_true",
                     help="Report progress and exit without running anything.")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Concurrent training runs per stage. See the same flag on "
+                         "sweep_population_hparams for the measurements: this model gains "
+                         "little from torch intra-op threads (1.82x at 12), and concurrency "
+                         "tops out around 2.0-2.2x because the spare cores are contended "
+                         "rather than idle. '--jobs 4 --threads-per-job 4' is the sweet spot.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch threads per run (0 = auto: cpu_count // jobs).")
+    ap.add_argument("--cache-dir", dest="cache_dir", default="data/cache",
+                    help="Directory of pre-encoded segment caches, one per window. Saves the "
+                         "~24 s parse each of the 420 runs would otherwise repeat and keeps "
+                         "concurrent runs small enough in RAM to be worth launching. Build "
+                         "all three windows at once with scripts/build_segment_cache.py. "
+                         "Pass '' to disable and read the JSONL directly.")
+    ap.add_argument("--resample-hz", dest="resample_hz", type=float,
+                    default=DEFAULT_RESAMPLE_HZ,
+                    help="Only used to locate the cache file; the trainer's own default is "
+                         "authoritative for training.")
     args = ap.parse_args()
 
     base = pathlib.Path(args.outdir)

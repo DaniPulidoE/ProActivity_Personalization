@@ -1,13 +1,27 @@
-# ANIL meta-training for the xLSTM LoA model (second-order by default,
-# first-order as ablation via --order).
+# ANIL meta-training for the xLSTM LoA model (iMAML by default since 2026-08-14;
+# second- and first-order are ablations via --order).
 #
 # ANIL (Raghu et al. 2020) = MAML with the inner loop restricted to the output
-# head. The inner loop here is a few PROXIMAL SGD steps on the soft-CORN/softmax
-# head *including the L2-SP anchor term* — i.e. exactly the adaptation that is
-# deployed per-driver by fine_tune_XLSTM.py — so meta-training optimizes the
-# initialization for the adaptation procedure actually used at test time.
+# head, including the L2-SP anchor term — i.e. the same objective the deployed
+# per-driver adaptation minimizes.
+#
+# WHY iMAML IS THE DEFAULT rather than an upgrade to adopt later. The deployed
+# adaptation (head_adapt.adapt_head) runs 2000 full-batch AdamW steps to the MAP.
+# A path-differentiated outer loop must backprop THROUGH the inner trajectory, so
+# its inner loop has to be a handful of graph-resident SGD steps — it structurally
+# cannot be the deployed procedure, only an approximation of it. Implicit
+# differentiation needs the inner problem's SOLUTION and never its path, so iMAML
+# meta-learns the anchor of exactly the objective that gets served. Verified
+# numerically on participant 001 at tau=2: max|theta_newton - theta_adam| is
+# 1.6e-05 at K=5 and <= 3.4e-06 for K in {10, 30, 99}.
+#
+# The reverse fix — serving a truncated few-step head so deployment matches
+# path-differentiated meta-training — is ruled out by the UQ layer: the Laplace
+# expansion is taken about the MAP, so a truncated head would make the posterior
+# valid for the L2-SP arm and invalid for ANIL, which the design forbids.
+#
 # The outer loop runs in one of three modes (--order):
-#   - 'second' (default — standard ANIL as published): the inner-loop
+#   - 'second' (ABLATION — standard ANIL as published): the inner-loop
 #     trajectory is differentiated exactly (create_graph, no detach). Support
 #     embeddings stay in the graph, so the backbone receives BOTH the query
 #     pathway and the support pathway (how the support embeddings shaped the
@@ -15,12 +29,12 @@
 #     adaptability). The double backward is confined to the tiny head + loss;
 #     the xLSTM backbone itself only ever does ordinary first-order backprop,
 #     so no second derivatives pass through the recurrent unroll.
-#   - 'first' (FOMAML-style ablation, FO-ANIL — Yüksel et al. 2024): support
+#   - 'first' (ABLATION, FOMAML-style FO-ANIL — Yuksel et al. 2024): support
 #     embeddings are computed under no_grad (dropping the support pathway) and
 #     the gradient w.r.t. the head INITIALIZATION is approximated by the
 #     gradient at the ADAPTED head parameters. Cheaper, immune to
 #     inner-Jacobian amplification, but biased toward joint training.
-#   - 'imaml' (implicit MAML, Rajeswaran et al. 2019): the inner problem is
+#   - 'imaml' (DEFAULT — implicit MAML, Rajeswaran et al. 2019): the inner problem is
 #     SOLVED to its argmin (full-batch LBFGS) and the meta-gradient comes from
 #     implicit differentiation of the stationarity condition — i.e.
 #     meta-learning the anchor of the CONVERGED L2-SP adaptation, independent
@@ -74,7 +88,7 @@
 #       --init trained_models/state_xlstm.pt \
 #       --out trained_models/state_xlstm_anil.pt \
 #       --val-pids p013,p014
-import argparse, pathlib
+import argparse, csv, pathlib
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -547,9 +561,10 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
 
 def main():
     ap = argparse.ArgumentParser(
-        description="ANIL meta-training of the xLSTM LoA model "
-                    "(head-only proximal inner loop, full-model outer loop; "
-                    "--order selects exact second-order or FOMAML-style first-order).")
+        description="ANIL meta-training of the xLSTM LoA model (head-only proximal "
+                    "inner loop, full-model outer loop). --order defaults to 'imaml', "
+                    "the only variant whose inner problem IS the deployed adaptation; "
+                    "'second'/'first' are ablations.")
     ap.add_argument("--in",     dest="in_jsonl", required=True,
                     help="Multi-driver labeled JSONL (needs participantid per row).")
     ap.add_argument("--init",   dest="init_pt", default="trained_models/state_xlstm.pt",
@@ -569,14 +584,23 @@ def main():
                          "deployment match, few distinct episodes). 'any': support starts at a "
                          "random segment — a pseudo session start; more episode diversity.")
     # --- inner loop (must mirror the deployed L2-SP head adaptation) ---
-    ap.add_argument("--order", choices=["second", "first", "imaml"], default="second",
-                    help="'second' (standard ANIL): differentiate exactly through the inner "
-                         "loop; the backbone also receives the support-pathway gradient. "
-                         "'first' (FO-ANIL ablation): gradients taken at the adapted head, "
-                         "support embedded under no_grad — cheaper, biased toward joint training. "
-                         "'imaml': solve the inner problem to its argmin (LBFGS) and use exact "
-                         "implicit gradients — meta-learns the anchor of the CONVERGED L2-SP "
-                         "adaptation; inner-steps/inner-lr are ignored, and λ should be binding.")
+    ap.add_argument("--order", choices=["imaml", "second", "first"], default="imaml",
+                    help="DEFAULT 'imaml': solve the inner problem to its argmin (damped "
+                         "Newton on a CORN head, LBFGS on a softmax one) and use exact "
+                         "implicit gradients. This is the primary variant because it is the "
+                         "only one whose inner problem IS the deployed adaptation: implicit "
+                         "differentiation needs the inner problem's SOLUTION, never its path, "
+                         "so it meta-learns the anchor of the same converged L2-SP objective "
+                         "head_adapt.adapt_head minimizes at serving. --inner-steps/--inner-lr "
+                         "are ignored; --tau must be > 0 or the inner argmin is neither unique "
+                         "nor solvable.\n"
+                         "'second' (standard ANIL) and 'first' (FO-ANIL) are ABLATIONS. They "
+                         "differentiate through the inner TRAJECTORY, so it must be a handful "
+                         "of graph-resident SGD steps rather than 2000 AdamW steps to "
+                         "convergence — meaning they structurally cannot run the deployed "
+                         "adaptation as their inner loop, and the reverse fix (serving a "
+                         "truncated head) is blocked by the Laplace layer, which expands about "
+                         "the MAP. 'first' is additionally biased toward joint training.")
     ap.add_argument("--inner-steps", type=int, default=5,
                     help="Head inner-loop SGD steps (orders first/second; ignored for imaml).")
     ap.add_argument("--inner-lr",    type=float, default=0.1,
@@ -643,6 +667,14 @@ def main():
     ap.add_argument("--val-adapt-lr", type=float, default=DEFAULT_ADAPT_LR,
                     help="lr for meta-validation adaptation; defaults to "
                          "head_adapt.DEFAULT_ADAPT_LR for the same reason.")
+    ap.add_argument("--metrics-csv", dest="metrics_csv", default="",
+                    help="Write one row per meta-epoch: the meta-TRAINING query loss and the "
+                         "meta-VALIDATION adaptation metrics, side by side. The ANIL sweep "
+                         "reads these curves to extract M* rather than parsing stdout. Both "
+                         "signals are recorded because they answer different questions and "
+                         "are computed on different episode distributions — query_loss on "
+                         "`--episode-start any` training episodes, val_set_mae on the true "
+                         "session prefix through the DEPLOYED adaptation.")
     ap.add_argument("--patience", type=int, default=10,
                     help="Early-stop after this many meta-epochs without val set-MAE improvement.")
     # --- task augmentation ---
@@ -768,6 +800,26 @@ def main():
     # support-size range (clipped per driver so a query tail always remains).
     val_ks = sorted({args.k_min, args.k_max})
 
+    # Per-epoch metrics for the sweep. TWO signals, deliberately both:
+    #   query_loss  — meta-TRAINING progress, on `--episode-start any` episodes.
+    #   val_set_mae — meta-VALIDATION, on the deployed adaptation over the true
+    #                 session PREFIX of held-out drivers.
+    # They are computed on DIFFERENT episode distributions by design (see
+    # docs/meta_optimization_options.md), so a gap between them is not evidence
+    # of meta-overfitting and must not be read as one. Selection and M* key off
+    # val_set_mae alone; query_loss is here to show whether meta-training is
+    # progressing at all, which val_set_mae cannot distinguish from a bad init.
+    metrics_fh = None
+    metrics_writer = None
+    if args.metrics_csv:
+        mp = pathlib.Path(args.metrics_csv); mp.parent.mkdir(parents=True, exist_ok=True)
+        metrics_fh = mp.open("w", newline="", encoding="utf-8")
+        metrics_writer = csv.writer(metrics_fh)
+        metrics_writer.writerow([
+            "epoch", "order_this_epoch", "query_loss",
+            "val_set_mae", "val_set_qwk", "val_n_drivers", "val_ks",
+            "inner_res_max", "inner_unconverged", "n_episodes"])
+
     best_val = float("inf")
     bad_epochs = 0
     for ep in range(args.meta_epochs):
@@ -869,6 +921,14 @@ def main():
             print(f"[epoch {ep:02d}] query_loss={train_loss:.4f} "
                   f"val_set-MAE={val_mae:.3f} val_set-QWK={val_qwk:.3f} "
                   f"(drivers={len(val_pids)}, K={val_ks}){res_note}")
+            if metrics_writer is not None:
+                metrics_writer.writerow([
+                    ep, ("first" if warm else args.order), train_loss,
+                    val_mae, val_qwk, len(val_pids), "|".join(str(k) for k in val_ks),
+                    (max(ep_res) if ep_res else ""),
+                    (sum(r > args.imaml_tol for r in ep_res) if ep_res else ""),
+                    len(ep_losses)])
+                metrics_fh.flush()   # the sweep reads these while the run is in flight
             if val_mae < best_val:
                 best_val = val_mae
                 bad_epochs = 0
@@ -881,7 +941,17 @@ def main():
                     break
         else:
             print(f"[epoch {ep:02d}] query_loss={train_loss:.4f}{res_note}")
+            if metrics_writer is not None:
+                metrics_writer.writerow([
+                    ep, ("first" if warm else args.order), train_loss,
+                    "", "", 0, "", (max(ep_res) if ep_res else ""),
+                    (sum(r > args.imaml_tol for r in ep_res) if ep_res else ""),
+                    len(ep_losses)])
+                metrics_fh.flush()
             save_checkpoint(model, str(outp), arch=arch)
+
+    if metrics_fh is not None:
+        metrics_fh.close()
 
     if val_pids:
         print(f"[BEST] val_set-MAE={best_val:.3f} -> {outp}")
