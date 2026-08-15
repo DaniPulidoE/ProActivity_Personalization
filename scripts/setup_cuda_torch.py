@@ -28,6 +28,21 @@ training run pinned at 100% CPU with an idle GPU, with the actual cause
 several steps upstream and about OpenCV. ``purge_opencv()`` deletes the
 directories directly instead, which needs no metadata to be intact.
 
+DO NOT RUN THIS (or the project) FROM A ONEDRIVE-SYNCED FOLDER
+--------------------------------------------------------------
+A venv is tens of thousands of small files. OneDrive keeps handles open
+while it uploads them and, with Files On-Demand, replaces unused ones
+with cloud placeholders that must be rehydrated on read. Both break
+package installs with ``PermissionError: [WinError 5] Access is
+denied``, at a different file each time. Training makes it worse: the
+population pipeline writes 420 checkpoints and metric CSVs, and the
+dataset is ~1 GB.
+
+Keep the repo on a local path (``C:\\dev\\...``). Note that a venv
+cannot simply be MOVED there -- ``.venv/pyvenv.cfg`` and the console
+scripts hold absolute paths -- so delete ``.venv`` and re-run ``uv
+sync`` after relocating.
+
 Usage::
 
     uv sync                                  # CPU torch, resolvable lock
@@ -85,9 +100,29 @@ def purge_opencv() -> None:
     if not targets:
         print("[setup] no existing OpenCV install found — nothing to purge")
         return
+    failed: list[tuple[pathlib.Path, str]] = []
     for t in targets:
         print(f"[setup] removing {t.relative_to(site)}")
-        shutil.rmtree(t, ignore_errors=True)
+        # NOT ignore_errors=True: a half-deleted cv2/ tree is worse than no
+        # deletion at all, because the reinstall then lands on top of it and the
+        # next failure surfaces from inside uv, several steps from the cause.
+        # onexc, not onerror: onerror is deprecated in 3.12, which this project pins.
+        shutil.rmtree(t, onexc=lambda f, p, e: failed.append((pathlib.Path(p), str(e))))
+    if failed:
+        print("\n[setup] FAILED to remove:")
+        for p, err in failed:
+            print(f"    {p}\n        {err}")
+        raise SystemExit(
+            "\n[setup] Something is holding these files open. On Windows the usual\n"
+            "causes, in order of likelihood:\n"
+            "  1. ONEDRIVE is syncing this folder. A venv is tens of thousands of\n"
+            "     small files; OneDrive keeps handles open and turns unused ones into\n"
+            "     cloud placeholders, so installs hit 'Access is denied' at random.\n"
+            "     Pause syncing from the tray icon and re-run. This project should\n"
+            "     NOT live inside a OneDrive folder at all -- see the module docstring.\n"
+            "  2. An editor, terminal or python.exe still has the venv loaded.\n"
+            "  3. Antivirus is scanning a freshly written DLL.\n"
+            "If it persists, delete the listed paths by hand and re-run.")
 
 
 def main() -> None:
