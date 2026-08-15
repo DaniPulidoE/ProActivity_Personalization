@@ -14,6 +14,9 @@ from __future__ import annotations
 import ast
 import json
 import math
+import os
+import pathlib
+import sysconfig
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,9 +28,85 @@ import torch.nn.functional as F
 
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
 
-# Guarded import of the heavy xlstm symbols. The verified import path is pure
-# torch (no triton/ninja/CUDA), but we still guard so this module imports even if
-# the dependency is missing -- callers can inspect XLSTM_AVAILABLE.
+def _ensure_cuda_home() -> None:
+    """Make ``import xlstm`` survive a GPU box that has no CUDA *Toolkit*.
+
+    ``xlstm/__init__.py`` imports sLSTM unconditionally, and sLSTM's
+    ``src/cuda_init.py`` runs, AT IMPORT TIME and guarded only by
+    ``if torch.cuda.is_available():``::
+
+        os.environ["CUDA_LIB"] = os.path.join(os.path.split(
+            torch.utils.cpp_extension.include_paths(device_type="cuda")[-1])[0], "lib")
+
+    That helper ends in ``_join_cuda_home``, which raises::
+
+        OSError: CUDA_HOME environment variable is not set.
+
+    whenever the CUDA Toolkit (``nvcc`` + headers) is absent. It normally IS
+    absent: the NVIDIA driver ships the CUDA *runtime*, not the SDK, and the
+    ``+cu128`` wheel bundles runtime libraries only. The net effect is backwards
+    -- ``import xlstm`` works on a CPU-only box and fails on a GPU one, which is
+    why this surfaced only after the CUDA overlay was installed.
+
+    Nothing here compiles those kernels: ``_stack_cfg`` builds an mLSTM-ONLY
+    stack (pure PyTorch). ``cuda_init`` merely interpolates the path into
+    ``os.environ["CUDA_LIB"]`` and never opens it, so pointing CUDA_HOME at the
+    CUDA runtime the torch wheel already ships is enough to get past the import.
+
+    Deliberately does nothing when CUDA_HOME is already set: on a machine with a
+    real Toolkit, overwriting it would break anything that genuinely compiles.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return          # CPU-only: cuda_init's guard skips the whole block
+    except Exception:       # pragma: no cover - torch too broken to ask
+        return
+
+    site = pathlib.Path(sysconfig.get_paths()["purelib"])
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    warn = False
+    if not home:
+        for cand in (site / "nvidia" / "cuda_runtime", site / "nvidia" / "cuda_nvcc"):
+            if (cand / "include").is_dir():
+                home = str(cand)
+                break
+        else:
+            # Nothing bundled found. Any existing directory still gets the import
+            # through, because the value is only ever string-formatted on this
+            # path. If a future change DOES need real kernels, the thing to fix
+            # is the missing Toolkit, not this line.
+            home, warn = str(site), True
+    os.environ["CUDA_HOME"] = home
+
+    # Setting the environment variable is NOT sufficient on its own. torch reads
+    # it ONCE, in torch.utils.cpp_extension's module body, and freezes the result
+    # in a module-level CUDA_HOME constant; _join_cuda_home then tests that
+    # constant, not os.environ. If anything imported cpp_extension before this
+    # runs, the constant is already None and the env var is ignored. Assigning it
+    # directly covers both orderings, so this cannot depend on import sequence.
+    try:
+        import torch.utils.cpp_extension as _ce
+        if getattr(_ce, "CUDA_HOME", None) is None:
+            _ce.CUDA_HOME = home
+    except Exception:       # pragma: no cover
+        pass
+
+    if warn:
+        print("[xlstm][warn] CUDA is available but no CUDA Toolkit was found; CUDA_HOME "
+              f"set to {site} purely to get xlstm's unused sLSTM import past "
+              "_join_cuda_home. Fine for the mLSTM-only stack used here; install the "
+              "real Toolkit before compiling any CUDA kernel.")
+
+
+_ensure_cuda_home()
+
+# Guarded import of the heavy xlstm symbols. The COMPUTE path is pure torch (no
+# triton/ninja/CUDA), but the IMPORT path is not on a GPU box -- see
+# _ensure_cuda_home above, which must run first.
+#
+# OSError is caught alongside ImportError because that is the shape the missing
+# CUDA Toolkit takes; without it the failure is an unhandled traceback rather
+# than a clean XLSTM_AVAILABLE = False.
 try:
     from xlstm import (
         xLSTMBlockStack,
@@ -36,7 +115,8 @@ try:
         mLSTMLayerConfig,
     )
     XLSTM_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only when xlstm is absent
+except (ImportError, OSError) as _xlstm_err:  # pragma: no cover
+    print(f"[xlstm][warn] xlstm unavailable: {type(_xlstm_err).__name__}: {_xlstm_err}")
     xLSTMBlockStack = None
     xLSTMBlockStackConfig = None
     mLSTMBlockConfig = None
