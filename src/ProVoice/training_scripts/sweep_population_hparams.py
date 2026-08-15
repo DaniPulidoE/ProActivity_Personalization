@@ -64,7 +64,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ProVoice.models.train_XLSTM import constant_baseline, iter_jsonl
 from ProVoice.training_scripts.folds import VALIDATION_FOLDS, train_pids_for_validation_fold
+
+LEVELS = [f"Level_{i}" for i in range(1, 6)]
+# FOLD-DERIVED columns: functions of the validation drivers alone, so they can be
+# backfilled into an existing results file from its `val_pids` column without
+# re-running anything. (pred_loa* cannot — those need the model at its selected
+# epoch, and the sweep deletes checkpoints.)
+BASELINE_COLUMNS = (["const_set_mae", "const_loa_mae", "const_set_acc", "const_loa_acc"]
+                    + [f"lbl_loa{c}" for c in range(5)]     # VAL drivers' marks
+                    + [f"trn_loa{c}" for c in range(5)])    # TRAIN drivers' marks
 
 DROPOUTS = (0.10, 0.15, 0.20)
 LRS = (1e-3, 2e-3)
@@ -72,14 +82,151 @@ SEEDS = (0, 1, 2, 3, 4)
 SMOOTH_WINDOW = 5          # epochs, centred — see "HOW E* IS EXTRACTED"
 
 RESULTS_COLUMNS = [
-    "dropout", "lr", "fold", "val_pids", "seed",
+    "dropout", "lr", "window_seconds", "loss", "fold", "val_pids", "seed",
     "best_set_mae",          # the run's raw minimum (what train_XLSTM selects on)
     "smoothed_best_set_mae", # minimum of the smoothed curve — the ranking quantity
     "best_epoch_smoothed",   # argmin of the smoothed curve — diagnostic only
     "best_epoch_1se",        # EARLIEST epoch within 1 SE of that minimum — E* comes from this
+    # WHICH EPOCH every *_at_best column and the prediction histogram describe.
+    # It equals best_epoch_smoothed, NOT best_epoch_1se: the reported metrics
+    # characterize the config at its best, while E* (and therefore the model
+    # run_lodo_population actually builds) comes from the earlier 1-SE epoch.
+    # They coincide on a sharp optimum and diverge on a flat basin, so record it
+    # rather than leaving a reader to assume.
+    "metrics_epoch",
     "epochs_run",            # < --epochs when early stopping fired
     "set_acc_at_best", "qwk_at_best", "val_n",
+    # Both decoders at the selected epoch, so a CE-vs-CORN comparison can hold
+    # the decoder fixed post hoc instead of re-running the sweep. argmax is the
+    # MODE (optimal for accuracy), median the rank rule (optimal for MAE).
+    "mae_argmax", "acc_argmax", "mae_median", "acc_median",
+    # PREDICTION HISTOGRAM at the selected epoch: how many of the val segments
+    # were predicted at each LoA, next to how many marked each LoA. A run whose
+    # predictions pile onto one level is reproducing the marginal, and its
+    # set-MAE is the constant baseline in disguise — invisible in the aggregate
+    # metrics, obvious here.
+    "pred_loa0", "pred_loa1", "pred_loa2", "pred_loa3", "pred_loa4",
+    # The constant floor and BOTH label marginals (lbl_* = val drivers,
+    # trn_* = train drivers). Functions of the fold alone — not of dropout, lr,
+    # seed or epoch — which is what makes them backfillable from `val_pids`.
+    # Listed ONLY here: naming lbl_loa* separately above as well produced a CSV
+    # with five duplicated headers.
+    *BASELINE_COLUMNS,
 ]
+assert len(set(RESULTS_COLUMNS)) == len(RESULTS_COLUMNS), (
+    "duplicate column(s) in RESULTS_COLUMNS: "
+    f"{sorted({c for c in RESULTS_COLUMNS if RESULTS_COLUMNS.count(c) > 1})}")
+
+# Identity prefix: written explicitly by the caller, everything after it comes
+# from the run's own stats dict. Derived, not a literal, so adding an identity
+# column cannot silently misalign the row (it did once, via a hard-coded [5:]).
+ID_COLUMNS = ["dropout", "lr", "window_seconds", "loss", "fold", "val_pids", "seed"]
+N_ID = len(ID_COLUMNS)
+assert RESULTS_COLUMNS[:N_ID] == ID_COLUMNS, (
+    f"RESULTS_COLUMNS must start with {ID_COLUMNS}, got {RESULTS_COLUMNS[:N_ID]}")
+
+
+def load_segment_labels(path: pathlib.Path) -> Dict[str, List[List[int]]]:
+    """``participantid -> [multi-hot marks per segment]``, streamed.
+
+    One row per SEGMENT, not per frame: the file repeats a segment's label on
+    every one of its ~190 frames, so de-duplicating on segment_id is what keeps
+    this to ~1,446 tiny lists instead of half a million.
+    """
+    seen = set()
+    out: Dict[str, List[List[int]]] = {}
+    for r in iter_jsonl(path):
+        sid = r.get("segment_id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        marks = [int(float(r.get(k) or 0) > 0) for k in LEVELS]
+        if not any(marks):
+            continue
+        out.setdefault(str(r.get("participantid", "")), []).append(marks)
+    return out
+
+
+def _marks(labels: Dict[str, List[List[int]]], pids: List[str]) -> np.ndarray:
+    return np.asarray([m for p in pids for m in labels.get(str(p), [])], dtype=float)
+
+
+def fold_baseline(labels: Dict[str, List[List[int]]], val_pids: List[str]) -> Dict[str, float]:
+    """Constant floor plus BOTH label marginals for a fold.
+
+    Three histograms are needed to read a run, not one:
+
+      * ``trn_loa0..4`` — what the TRAINING drivers marked. This is the marginal
+        the model is rewarded for reproducing.
+      * ``lbl_loa0..4`` — what the VALIDATION drivers marked. This is what it is
+        scored against.
+      * ``pred_loa0..4`` — what it actually predicted (added per run, not here).
+
+    The diagnosis follows from comparing them. Predictions tracking ``trn`` while
+    ``lbl`` says something else is not a broken model — it is a model that
+    learned its training drivers correctly and found they do not generalize,
+    which on this cohort is the expected outcome (driver identity is worth ~4x
+    more MAE than the task). Predictions tracking neither, piled on one level,
+    is collapse. Aggregate set-MAE cannot tell those two apart.
+    """
+    val = _marks(labels, val_pids)
+    held = {str(p) for p in val_pids}
+    trn = _marks(labels, [p for p in labels if p not in held])
+    out = dict(constant_baseline(val, 5))
+    vc = val.sum(axis=0).astype(int) if val.size else np.zeros(5, dtype=int)
+    tc = trn.sum(axis=0).astype(int) if trn.size else np.zeros(5, dtype=int)
+    for c in range(5):
+        out[f"lbl_loa{c}"] = int(vc[c])
+        out[f"trn_loa{c}"] = int(tc[c])
+    return out
+
+
+def backfill_baselines(results_csv: pathlib.Path, labels: Dict[str, List[List[int]]]) -> bool:
+    """Add the baseline columns to an existing results file, in place.
+
+    The whole point of keying the baseline on the fold: a sweep that has already
+    burned hours of GPU does not need re-running to gain this reference. Each row
+    carries `val_pids`, which is all the baseline depends on.
+
+    Returns True if the file was rewritten. Writes to a temp file and replaces,
+    so an interrupted backfill cannot truncate the results.
+    """
+    if not results_csv.exists():
+        return False
+    with results_csv.open("r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        fieldnames = list(rd.fieldnames or [])
+        rows = list(rd)
+    if not rows or all(c in fieldnames for c in BASELINE_COLUMNS):
+        return False
+
+    cache: Dict[str, Dict[str, float]] = {}
+    n_filled = 0
+    for r in rows:
+        key = r.get("val_pids", "")
+        if key not in cache:
+            cache[key] = fold_baseline(labels, [p for p in key.split("|") if p])
+        r.update({k: cache[key][k] for k in BASELINE_COLUMNS})
+        n_filled += 1
+
+    out_fields = fieldnames + [c for c in BASELINE_COLUMNS if c not in fieldnames]
+    tmp = results_csv.with_suffix(".csv.tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=out_fields)
+        w.writeheader()
+        w.writerows(rows)
+    tmp.replace(results_csv)
+    print(f"[backfill] added the fold-derived columns to {n_filled} existing row(s) in "
+          f"{results_csv.name} — no re-running needed")
+    for key, b in sorted(cache.items()):
+        marg = [b[f"lbl_loa{c}"] for c in range(5)]
+        print(f"    val={key or '(none)'}: best constant set-MAE={b['const_set_mae']:.3f} "
+              f"@LoA{b['const_loa_mae']} | set-acc={b['const_set_acc']:.3f} "
+              f"@LoA{b['const_loa_acc']} | label marks[LoA0..4]={marg}")
+    print("    NOTE pred_loa0..4 and the per-decoder metrics stay blank on these rows: "
+          "they need the model at its selected epoch, and completed runs' checkpoints "
+          "were deleted. New runs fill them in.")
+    return True
 
 
 def smooth(y: np.ndarray, window: int) -> np.ndarray:
@@ -101,54 +248,72 @@ def smooth(y: np.ndarray, window: int) -> np.ndarray:
 
 
 def read_done(path: pathlib.Path) -> set:
-    """Already-completed ``(dropout, lr, fold, seed)`` keys, for resuming."""
+    """Already-completed run keys, for resuming.
+
+    The key is ``(dropout, lr, window_seconds, loss, fold, seed)`` — all six.
+    window and loss are in it because a 5 s and a 10 s run, or a corn and a ce
+    run, at otherwise identical settings are DIFFERENT experiments; without them
+    the second would be skipped as already done.
+    """
     if not path.exists():
         return set()
     done = set()
     with path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             try:
-                done.add((float(row["dropout"]), float(row["lr"]),
+                # window_seconds is PART of the key: a 5 s and a 10 s run at the
+                # same (dropout, lr, fold, seed) are different experiments, and
+                # without it the second would be skipped as "already done".
+                # Rows predating the column resolve to None and so never collide
+                # with a windowed run.
+                w = row.get("window_seconds", "")
+                w = float(w) if w not in ("", None) else None
+                done.add((float(row["dropout"]), float(row["lr"]), w,
+                          row.get("loss", "") or None,
                           int(row["fold"]), int(row["seed"])))
             except (KeyError, ValueError):
                 continue        # a torn final line from an interrupted run
     return done
 
 
-def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed: int,
-            epochs: int, patience: int, min_delta: float, workdir: pathlib.Path,
-            extra: List[str]) -> Optional[Dict[str, float]]:
-    """One training run. Returns its curve summary, or None if it failed.
+def run_tag(dropout: float, lr: float, val_pids: List[str], seed: int,
+            window_seconds: Optional[float] = None, loss: Optional[str] = None) -> str:
+    """Filename tag for a run's artifacts.
 
-    Runs train_XLSTM as a SUBPROCESS rather than importing it: each run needs a
-    fresh process-global torch RNG state and a clean CUDA allocator, and a crash
-    in run 97 of 180 should cost that run, not the sweep.
+    ``window_seconds`` is part of it because a 5 s and a 10 s run at the same
+    (dropout, lr, fold, seed) are DIFFERENT experiments — same tag would have
+    them overwrite each other's metric curves. Pass None to reproduce the
+    pre-window tag, which is what ``--resummarize`` needs to find older runs.
     """
-    tag = f"d{dropout}_lr{lr}_f{'-'.join(val_pids)}_s{seed}"
-    ckpt = workdir / f"ckpt_{tag}.pt"          # written, then discarded — stage 2 retrains
-    mcsv = workdir / f"metrics_{tag}.csv"
-    cmd = [sys.executable, "-m", "ProVoice.models.train_XLSTM",
-           "--in", in_jsonl, "--out", str(ckpt), "--loss", "corn",
-           "--val-pids", ",".join(val_pids), "--metrics-csv", str(mcsv),
-           "--dropout", str(dropout), "--lr", str(lr), "--seed", str(seed),
-           "--epochs", str(epochs), "--patience", str(patience),
-           "--min-delta", str(min_delta)] + extra
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        print(f"  [FAIL] {tag} (exit {proc.returncode})")
-        print("  " + "\n  ".join(proc.stderr.strip().splitlines()[-8:]))
-        return None
-    if not mcsv.exists():
-        print(f"  [FAIL] {tag}: no metrics CSV written")
-        return None
+    t = f"d{dropout}_lr{lr}_f{'-'.join(val_pids)}_s{seed}"
+    if window_seconds is not None:
+        t += f"_w{window_seconds:g}"
+    if loss:
+        t += f"_{loss}"
+    return t
 
-    rows = list(csv.DictReader(mcsv.open("r", encoding="utf-8", newline="")))
+
+def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, float]]:
+    """Derive every per-run number from one run's per-epoch metric curve.
+
+    The ONE place the curve is turned into E* candidates and reported metrics, so
+    a live sweep and a ``--resummarize`` pass over old curves cannot disagree
+    about what the numbers mean. Everything here is a function of the curve
+    alone — which is exactly why the overnight compute is salvageable: today's
+    changes altered how E* is EXTRACTED, not what was trained.
+
+    Returns None if the curve is unusable.
+    """
     if not rows:
-        print(f"  [FAIL] {tag}: empty metrics CSV")
         return None
     mae = np.array([float(r["set_mae"]) for r in rows])
     sm = smooth(mae, SMOOTH_WINDOW)
-    j = int(np.argmin(sm))
+    # Honour the same epoch floor the trainer applies to its own checkpointing.
+    # Without this the sweep would re-derive E* from the full curve and hand back
+    # the epoch-0 the trainer just refused to select — and E*=0 makes the LODO
+    # runner train for zero epochs.
+    lo = min(int(min_select_epoch), len(sm) - 1) if len(sm) else 0
+    j = lo + int(np.argmin(sm[lo:]))
     # ONE-SE RULE. The argmin of a smoothed curve sits wherever a flat basin
     # happens to dip lowest, which on a noisy curve is late as often as not —
     # and E* is applied WITHOUT early stopping in the LODO run, where nothing
@@ -162,19 +327,163 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
     resid = mae - sm
     sigma = float(resid.std(ddof=1)) if len(resid) > 1 else 0.0
     se_sm = sigma / np.sqrt(min(SMOOTH_WINDOW, len(mae)))
-    within = np.flatnonzero(sm <= sm[j] + se_sm)
-    j1 = int(within[0]) if within.size else j
-    ckpt.unlink(missing_ok=True)               # only the curve is needed downstream
-    return {
+    within = np.flatnonzero(sm[lo:] <= sm[j] + se_sm)
+    j1 = lo + int(within[0]) if within.size else j
+
+    def at(col: str, default=float("nan")):
+        """Value at the SELECTED epoch. Tolerates metrics CSVs from older runs
+        that predate a column rather than failing the whole sweep."""
+        v = rows[j].get(col, "")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    out = {
         "best_set_mae": float(mae.min()),
         "smoothed_best_set_mae": float(sm[j]),
         "best_epoch_smoothed": int(rows[j]["epoch"]),
         "best_epoch_1se": int(rows[j1]["epoch"]),
+        # Everything below is read from rows[j] — the smoothed-argmin epoch.
+        # NOT the final epoch, and NOT the 1-SE epoch that E* uses.
+        "metrics_epoch": int(rows[j]["epoch"]),
         "epochs_run": len(rows),
         "set_acc_at_best": float(rows[j]["set_acc"]),
         "qwk_at_best": float(rows[j]["qwk"]),
         "val_n": int(rows[j]["val_n"]),
+        "mae_argmax": at("mae_argmax"), "acc_argmax": at("acc_argmax"),
+        "mae_median": at("mae_median"), "acc_median": at("acc_median"),
     }
+    for c in range(5):
+        out[f"pred_loa{c}"] = at(f"pred_loa{c}", 0.0)
+    return out
+
+
+def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed: int,
+            epochs: int, patience: int, min_delta: float, min_select_epoch: int,
+            window_seconds: float, loss: str, workdir: pathlib.Path,
+            extra: List[str]) -> Optional[Dict[str, float]]:
+    """One training run. Returns its curve summary, or None if it failed.
+
+    Runs train_XLSTM as a SUBPROCESS rather than importing it: each run needs a
+    fresh process-global torch RNG state and a clean CUDA allocator, and a crash
+    in run 97 of 180 should cost that run, not the sweep.
+    """
+    tag = run_tag(dropout, lr, val_pids, seed, window_seconds, loss)
+    ckpt = workdir / f"ckpt_{tag}.pt"          # written, then discarded — stage 2 retrains
+    mcsv = workdir / f"metrics_{tag}.csv"      # KEPT: --resummarize re-reads these
+    cmd = [sys.executable, "-m", "ProVoice.models.train_XLSTM",
+           "--in", in_jsonl, "--out", str(ckpt), "--loss", loss,
+           "--val-pids", ",".join(val_pids), "--metrics-csv", str(mcsv),
+           "--dropout", str(dropout), "--lr", str(lr), "--seed", str(seed),
+           "--epochs", str(epochs), "--patience", str(patience),
+           "--min-delta", str(min_delta),
+           "--min-select-epoch", str(min_select_epoch),
+           "--window-seconds", str(window_seconds)] + extra
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"  [FAIL] {tag} (exit {proc.returncode})")
+        print("  " + "\n  ".join(proc.stderr.strip().splitlines()[-8:]))
+        return None
+    if not mcsv.exists():
+        print(f"  [FAIL] {tag}: no metrics CSV written")
+        return None
+    stats = curve_stats(list(csv.DictReader(mcsv.open("r", encoding="utf-8", newline=""))),
+                        min_select_epoch)
+    if stats is None:
+        print(f"  [FAIL] {tag}: empty metrics CSV")
+        return None
+    ckpt.unlink(missing_ok=True)               # only the curve is needed downstream
+    return stats
+
+
+def resummarize(results_csv: pathlib.Path, workdir: pathlib.Path,
+                labels: Dict[str, List[List[int]]], min_select_epoch: int,
+                window_seconds: float, loss: str) -> None:
+    """Recompute every derived column from the RETAINED per-epoch curves.
+
+    Why this exists: everything that changed about E* — the --min-select-epoch
+    floor, the 1-SE rule, the fold-derived baselines — changes how E* is read
+    OFF a curve, not what was trained. The curves are still in ``runs/``, so a
+    sweep that already burned hours does not have to be repeated to gain them.
+
+    What it CANNOT recover: ``pred_loa*`` and the per-decoder metrics for runs
+    whose trainer predated those columns. Those need the model at its selected
+    epoch, and the checkpoints are deleted. They stay blank rather than being
+    filled with plausible-looking zeros.
+
+    Rows whose curve file is missing are left exactly as they were.
+
+    Rows predating the ``window_seconds`` / ``loss`` columns are stamped with the
+    CLI values, which is an ASSUMPTION about what those runs used — the same one
+    already applied to the window. It has to be made for both: those two fields
+    are part of the resume key, so a row left blank in either would never match a
+    subsequent run and the whole sweep would retrain despite having just been
+    salvaged. If the assumption is wrong for a file, re-run it rather than
+    resummarizing it.
+    """
+    if not results_csv.exists():
+        raise SystemExit(f"--resummarize needs an existing {results_csv}")
+    with results_csv.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise SystemExit(f"{results_csv} has no rows")
+
+    n_ok = n_missing = 0
+    for r in rows:
+        dropout, lr = float(r["dropout"]), float(r["lr"])
+        seed = int(r["seed"])
+        vp = [p for p in r.get("val_pids", "").split("|") if p]
+        w = r.get("window_seconds", "")
+        try:
+            w = float(w)
+        except (TypeError, ValueError):
+            w = window_seconds          # pre-window rows: assume the CLI value
+        # Try the current tag, then the pre-window one, so curves written before
+        # window tracking are still found.
+        mcsv = None
+        # `row_loss`, NOT `loss`: `loss` is the CLI fallback parameter, and
+        # rebinding it here shadowed it for the rest of the function — which
+        # silently defeated the stamping below and left every resummarized row
+        # unresumable.
+        row_loss = r.get("loss", "") or None
+        for cand in (run_tag(dropout, lr, vp, seed, w, row_loss),
+                     run_tag(dropout, lr, vp, seed, w, loss),
+                     run_tag(dropout, lr, vp, seed, w),
+                     run_tag(dropout, lr, vp, seed)):
+            p = workdir / f"metrics_{cand}.csv"
+            if p.exists():
+                mcsv = p
+                break
+        if mcsv is None:
+            n_missing += 1
+            continue
+        stats = curve_stats(list(csv.DictReader(mcsv.open("r", encoding="utf-8", newline=""))),
+                            min_select_epoch)
+        if stats is None:
+            n_missing += 1
+            continue
+        r.update({k: v for k, v in stats.items()})
+        # Both key fields, not just the window: see the docstring. Existing
+        # values win, so a row that already knows its provenance keeps it.
+        r["window_seconds"] = w
+        r["loss"] = row_loss or loss
+        r.update(fold_baseline(labels, vp))
+        n_ok += 1
+
+    fields = list(RESULTS_COLUMNS)
+    for extra in (c for c in rows[0] if c not in fields):
+        fields.append(extra)
+    tmp = results_csv.with_suffix(".csv.tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w_ = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w_.writeheader()
+        for r in rows:
+            w_.writerow({k: r.get(k, "") for k in fields})
+    tmp.replace(results_csv)
+    print(f"[resummarize] recomputed {n_ok} row(s) from retained curves in {workdir}"
+          + (f"; {n_missing} row(s) had no curve file and were left unchanged"
+             if n_missing else ""))
 
 
 def main() -> None:
@@ -186,6 +495,31 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--min-delta", dest="min_delta", type=float, default=0.0)
+    ap.add_argument("--loss", choices=["corn", "ce"], default="corn",
+                    help="Head/loss for every run in this sweep. Recorded as a column and "
+                         "part of both the resume key and the artifact filenames, so a "
+                         "corn and a ce sweep can share an --outdir without colliding. "
+                         "'ce' is the ablation: only 'corn' supports the Laplace UQ layer, "
+                         "so it cannot be the deployed arm.")
+    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=10.0,
+                    help="Model input window, passed to the trainer AND recorded as a "
+                         "column and as part of the resume key. Sweeping 5/10/20 into the "
+                         "SAME --outdir is therefore safe: runs cannot overwrite each "
+                         "other's curves and cannot be mistaken for one another on resume. "
+                         "Changes context_length (50/100/200), so checkpoints from "
+                         "different windows are not interchangeable downstream.")
+    ap.add_argument("--resummarize", action="store_true",
+                    help="Do not train. Re-read the retained per-epoch curves in "
+                         "<outdir>/runs/ and recompute every derived column with the "
+                         "CURRENT rules (--min-select-epoch floor, 1-SE E*, fold "
+                         "baselines), then re-write the summary. Salvages a sweep that ran "
+                         "under older selection logic: what changed is how E* is read off "
+                         "a curve, not what was trained. pred_loa* and the per-decoder "
+                         "columns stay blank for runs whose trainer predated them.")
+    ap.add_argument("--min-select-epoch", dest="min_select_epoch", type=int, default=3,
+                    help="Earliest epoch eligible to be selected, passed to the trainer "
+                         "AND applied when this script re-derives E* from the curve. "
+                         "Keep >= --warmup-epochs; 0 disables. See the trainer flag.")
     ap.add_argument("--dropouts", default=",".join(str(d) for d in DROPOUTS))
     ap.add_argument("--lrs", default=",".join(str(l) for l in LRS))
     ap.add_argument("--seeds", default=",".join(str(s) for s in SEEDS))
@@ -206,6 +540,18 @@ def main() -> None:
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     workdir = outdir / "runs"; workdir.mkdir(exist_ok=True)
     results_csv = outdir / "sweep_results.csv"
+
+    # Per-fold constant-prediction floors. Cheap (one pass, de-duplicated to
+    # ~1,446 label vectors) and needed both to annotate new rows and to backfill
+    # old ones, so it is loaded before anything else touches the CSV.
+    labels = load_segment_labels(pathlib.Path(args.in_jsonl))
+    if args.resummarize:
+        resummarize(results_csv, workdir, labels, args.min_select_epoch,
+                    args.window_seconds, args.loss)
+        summarize(results_csv, outdir)
+        return
+    backfill_baselines(results_csv, labels)
+
     done = read_done(results_csv)
     if done:
         print(f"[resume] {len(done)} run(s) already in {results_csv}; they will be skipped")
@@ -229,25 +575,48 @@ def main() -> None:
         for lr in lrs:
             for i in fold_idx:
                 val_pids = list(VALIDATION_FOLDS[i])
+                base = fold_baseline(labels, val_pids)
                 for seed in seeds:
                     n += 1
-                    key = (dropout, lr, i, seed)
+                    key = (dropout, lr, args.window_seconds, args.loss, i, seed)
                     if key in done:
                         continue
                     print(f"[{n}/{total}] dropout={dropout} lr={lr:g} "
                           f"fold={i}{val_pids} seed={seed}", flush=True)
                     r = run_one(args.in_jsonl, dropout, lr, val_pids, seed,
                                 args.epochs, args.patience, args.min_delta,
-                                workdir, args.trainer_args)
+                                args.min_select_epoch, args.window_seconds,
+                                args.loss, workdir, args.trainer_args)
                     if r is None:
                         continue
-                    writer.writerow([dropout, lr, i, "|".join(val_pids), seed] +
-                                    [r[c] for c in RESULTS_COLUMNS[5:]])
+                    r.update(base)
+                    # The identity prefix and RESULTS_COLUMNS must stay in step;
+                    # N_ID is derived from the column list rather than written as
+                    # a literal, which is what let a sixth identity column slip
+                    # past a hard-coded [5:].
+                    writer.writerow([dropout, lr, args.window_seconds, args.loss, i,
+                                     "|".join(val_pids), seed] +
+                                    [r[c] for c in RESULTS_COLUMNS[N_ID:]])
                     fh.flush()
+                    d = r["smoothed_best_set_mae"] - base["const_set_mae"]
                     print(f"      set-MAE raw={r['best_set_mae']:.3f} "
                           f"smoothed={r['smoothed_best_set_mae']:.3f} "
                           f"@epoch {r['best_epoch_smoothed']} "
-                          f"({r['epochs_run']} epochs run)")
+                          f"(1se {r['best_epoch_1se']}, {r['epochs_run']} epochs run) "
+                          f"| const {base['const_set_mae']:.3f} -> {d:+.3f}"
+                          f"{'' if d < 0 else '  WORSE THAN CONSTANT'}")
+                    # Three histograms, normalized to shares so unequal totals
+                    # (train has ~5x the segments of val) do not hide the shape.
+                    def pct(v):
+                        t = sum(v) or 1
+                        return "[" + " ".join(f"{100*x/t:4.1f}" for x in v) + "]"
+                    pv = [int(r[f"pred_loa{c}"]) for c in range(5)]
+                    lv = [base[f"lbl_loa{c}"] for c in range(5)]
+                    tv = [base[f"trn_loa{c}"] for c in range(5)]
+                    print(f"      @epoch {r['metrics_epoch']}  %LoA0..4  "
+                          f"pred {pct(pv)}  val {pct(lv)}  train {pct(tv)}")
+                    print(f"      argmax MAE={r['mae_argmax']:.3f} "
+                          f"median MAE={r['mae_median']:.3f}")
     fh.close()
     summarize(results_csv, outdir)
 
@@ -260,12 +629,20 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
         return
     by_cfg: Dict[Tuple[float, float], List[dict]] = {}
     for r in rows:
-        by_cfg.setdefault((float(r["dropout"]), float(r["lr"])), []).append(r)
+        try:
+            w = float(r.get("window_seconds", "") or "nan")
+        except ValueError:
+            w = float("nan")
+        by_cfg.setdefault((float(r["dropout"]), float(r["lr"]), w,
+                           r.get("loss", "") or "?"), []).append(r)
 
     print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'sd':>6} {'se':>6} "
-          f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11}   (smoothed val set-MAE)")
+          f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11} {'const':>8} {'vs const':>8}"
+          f"   (smoothed val set-MAE)")
     table = []
-    for (dropout, lr), rs in sorted(by_cfg.items()):
+    for (dropout, lr, win, lss), rs in sorted(
+            by_cfg.items(), key=lambda kv: (str(kv[0][3]), kv[0][0], kv[0][1],
+                                            -1e9 if kv[0][2] != kv[0][2] else kv[0][2])):
         v = np.array([float(r["smoothed_best_set_mae"]) for r in rs])
         e_arg = np.array([float(r["best_epoch_smoothed"]) for r in rs])
         # Older CSVs (written before the 1-SE rule) lack the column; fall back to
@@ -279,14 +656,22 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
             e_1se = e_arg
         se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
         q1, q3 = np.percentile(e_1se, [25, 75])
-        table.append({"dropout": dropout, "lr": lr, "n": len(v),
+        table.append({"dropout": dropout, "lr": lr, "window_seconds": win,
+                      "loss": lss, "n": len(v),
                       "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0,
                       "se": se, "e_star": int(np.median(e_1se)),
                       "e_argmin": int(np.median(e_arg)),
                       "e_iqr": (int(q1), int(q3))})
-        print(f"{dropout:8.2f} {lr:7.0e} {len(v):4d} {v.mean():7.3f} "
+        # Mean of the per-fold constant floors the runs of this config were
+        # measured against, so "mean" and "const" are on the same footing.
+        cb = [float(r["const_set_mae"]) for r in rs
+              if r.get("const_set_mae") not in (None, "")]
+        table[-1]["const"] = float(np.mean(cb)) if cb else float("nan")
+        table[-1]["delta"] = table[-1]["mean"] - table[-1]["const"]
+        print(f"{lss:>5} {dropout:8.2f} {lr:7.0e} {win:6.4g} {len(v):4d} {v.mean():7.3f} "
               f"{table[-1]['sd']:6.3f} {se:6.3f} {table[-1]['e_star']:8d} "
-              f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}")
+              f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}"
+              f" {table[-1]['const']:8.3f} {table[-1]['delta']:+8.3f}")
 
     best = min(table, key=lambda t: t["mean"])
     # Tie-break toward MORE regularization: within one standard error of the
@@ -300,7 +685,9 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
               f"({best['mean']:.3f} +/- {best['se']:.3f}); taking the most regularized")
 
     sel = {
-        "dropout": pick["dropout"], "lr": pick["lr"], "epochs": pick["e_star"],
+        "dropout": pick["dropout"], "lr": pick["lr"],
+        "window_seconds": pick.get("window_seconds"), "loss": pick.get("loss"),
+        "epochs": pick["e_star"],
         "loss": "corn",
         "epochs_rule": "median over runs of the earliest epoch within 1 SE of the smoothed minimum",
         "epochs_argmin_median": pick["e_argmin"],
@@ -323,8 +710,20 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
                  "every driver (rotating folds) -- disclosed trade, identical for both "
                  "arms."),
     }
+    sel["constant_floor_set_mae"] = pick.get("const", float("nan"))
+    sel["vs_constant_floor"] = pick.get("delta", float("nan"))
+    sel["beats_constant"] = bool(pick.get("delta", 0.0) < 0)
     out = outdir / "selected_population.json"
     out.write_text(json.dumps(sel, indent=2), encoding="utf-8")
+    if not sel["beats_constant"]:
+        print(f"\n[WARNING] the winning config does NOT beat a constant prediction "
+              f"({pick['mean']:.3f} vs {pick.get('const', float('nan')):.3f}). On this "
+              f"cohort that is a property of the task, not necessarily of the run: an "
+              f"oracle per-FUNCTION constant scores 1.259 against a global constant's "
+              f"1.321, while an oracle per-DRIVER constant reaches 1.090 — LoA preference "
+              f"is ~4x more about who is driving than about what is being asked. Expect "
+              f"the population model to sit near the constant floor, and read the "
+              f"personalization arms, not this number, as the result.")
     print(f"\n[selected] dropout={pick['dropout']} lr={pick['lr']:g} E*={pick['e_star']} "
           f"(1-SE rule; argmin would give {pick['e_argmin']}, IQR {pick['e_iqr']})")
     print(f"           mean smoothed val set-MAE {pick['mean']:.3f}")

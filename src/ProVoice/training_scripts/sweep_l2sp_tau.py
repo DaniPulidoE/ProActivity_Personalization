@@ -91,17 +91,32 @@ def sweep_driver(model, arch, df: pd.DataFrame, taus: List[float], val_frac: flo
     n_seg = len(gids)
     if n_seg < 3:
         return []
+    # The BACKBONE runs on `device` — that is the expensive part and the only
+    # thing worth a GPU here. `embed_segments` then returns the embeddings on the
+    # CPU (it ends in `.cpu()`), so from this point on everything is CPU-side.
     Z = embed_segments(model, Xs, vs, arch["context_length"], device)
     V = torch.from_numpy(np.stack(vs, axis=0))
+
+    # The head must follow the embeddings, or every adapt/evaluate below fails
+    # with a device mismatch the moment `device` is not "cpu". This bit was
+    # invisible until the first GPU run: on a CPU-only box `device` IS "cpu",
+    # so the head and the embeddings agreed by accident.
+    #
+    # CPU is also the right place for the adaptation itself, not a concession:
+    # it is 2000 steps on a (K x 64) tensor with a ~260-parameter head, entirely
+    # kernel-launch-bound — measured at ~1.05 s whether K is 5 or 99, so CUDA
+    # would add launch overhead and remove nothing.
+    pop_head = model.head.to(Z.device)
+
     n_val = max(1, round(val_frac * n_seg))
     Zpool, Vpool = Z[: n_seg - n_val], V[: n_seg - n_val]
     Zval, Vval = Z[n_seg - n_val:], V[n_seg - n_val:]
 
-    base = evaluate(model.head, Zval, Vval, head_type)   # K=0 floor, same tail
+    base = evaluate(pop_head, Zval, Vval, head_type)   # K=0 floor, same tail
     out = []
     for tau in taus:
         for k in pick_sweep_points(len(Vpool), max_points):
-            head, info = adapt_head(model.head, Zpool[:k], Vpool[:k], tau=tau,
+            head, info = adapt_head(pop_head, Zpool[:k], Vpool[:k], tau=tau,
                                     head_type=head_type, steps=steps, lr=lr)
             m = evaluate(head, Zval, Vval, head_type)
             out.append({"tau": tau, "k": k, "l2sp": info["l2sp"],

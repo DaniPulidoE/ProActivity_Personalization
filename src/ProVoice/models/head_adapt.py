@@ -164,6 +164,17 @@ def adapt_head_tensors(
         raise ValueError(
             f"adapt_head expects (K, d) embeddings and (K, n_classes) levels with "
             f"matching K, got {tuple(Z.shape)} and {tuple(V.shape)}")
+    # Devices must already agree. Not moved silently: which device is "right"
+    # depends on the caller (the sweep embeds on the GPU then adapts on the CPU,
+    # because adaptation is kernel-launch-bound and gains nothing from CUDA),
+    # so quietly relocating tensors here would hide a caller's real mistake.
+    # Raised early with the offending devices named, because the alternative is
+    # an opaque matmul error several frames deeper.
+    if w0.device != Z.device or b0.device != Z.device:
+        raise ValueError(
+            f"device mismatch: embeddings on {Z.device}, head weights on "
+            f"{w0.device}/{b0.device}. Move the head to the embeddings' device "
+            f"(or vice versa) before calling — e.g. `head.to(Z.device)`.")
     n = int(Z.shape[0])
     lam = l2sp_from_tau(tau, n)
     loss_fn = loss_for_head(head_type)

@@ -25,6 +25,7 @@ from ProVoice.models.xlstm_model import (
     log_encoded_frames,
     logits_to_probs,
     logits_to_label,
+    probs_to_label,
     levels_to_distribution,
     levels_to_cumulative,
     soft_corn_loss,
@@ -393,6 +394,39 @@ def set_qwk(levels: np.ndarray, y_pred: np.ndarray, n_classes: int = 5) -> float
     return qwk(resolve_targets(levels, y_pred), np.asarray(y_pred), n_classes)
 
 
+def constant_baseline(levels: np.ndarray, n_classes: int = 5) -> Dict[str, float]:
+    """Best set-MAE and set-accuracy reachable by predicting ONE fixed LoA.
+
+    **The reference any model has to beat**, and the one this pipeline was
+    missing. Measured on the collected cohort, the best global constant (LoA 1)
+    scores set-MAE 1.321 — so a population model reporting 1.4-1.5 is losing to
+    "always say 1", which is a fact about the task and not about the run. Without
+    this line printed next to it, a validation curve whose minimum is at epoch 0
+    looks like a mystery instead of a diagnosis.
+
+    Why LoA preference is this hard to predict across drivers: knowing the
+    FUNCTION is worth 0.06 MAE (1.321 -> 1.259 with an oracle per-function
+    constant), while knowing the DRIVER is worth 0.23 (-> 1.090). Drivers 004
+    and 008 never mark LoA 3-4; 005 and 011 mark them ~65 % of the time. A
+    population model must sit between those, which is wrong for both.
+
+    The MAE-optimal and accuracy-optimal constants need NOT be the same level
+    (MAE punishes distance, accuracy does not), so each metric gets its own
+    optimum rather than one level being forced to serve both.
+    """
+    empty = {"const_loa_mae": -1, "const_set_mae": float("nan"),
+             "const_loa_acc": -1, "const_set_acc": float("nan")}
+    levels = np.asarray(levels)
+    if levels.size == 0:
+        return empty
+    n = levels.shape[0]
+    maes = [set_mae(levels, np.full(n, c, dtype=int)) for c in range(n_classes)]
+    accs = [set_accuracy(levels, np.full(n, c, dtype=int)) for c in range(n_classes)]
+    c_mae, c_acc = int(np.argmin(maes)), int(np.argmax(accs))
+    return {"const_loa_mae": c_mae, "const_set_mae": float(maes[c_mae]),
+            "const_loa_acc": c_acc, "const_set_acc": float(accs[c_acc])}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
@@ -419,6 +453,31 @@ def main():
                          "afterwards by the caller, so no signal from it can reach the "
                          "checkpoint. Requires a pre-chosen --epochs (E*); --patience is "
                          "ignored because there is nothing to be patient about.")
+    ap.add_argument("--min-select-epoch", dest="min_select_epoch", type=int, default=3,
+                    help="Earliest epoch that may be CHECKPOINTED or counted toward "
+                         "--patience. Earlier epochs still train and are still logged, so "
+                         "the full curve survives for diagnosis; they just cannot win. "
+                         "Set >= --warmup-epochs: epochs inside the warmup run at a "
+                         "reduced LR, so selecting among them selects a schedule artifact. "
+                         "The floor also blocks a silent failure — on this cohort the "
+                         "unconstrained argmin often lands on epoch 0, and E*=0 makes the "
+                         "LODO runner train for zero epochs and ship 12 random inits as "
+                         "population models. 0 disables.")
+    ap.add_argument("--decode", choices=["canonical", "argmax", "median"], default="canonical",
+                    help="Which rule turns the decoded PMF into a single LoA for the "
+                         "REPORTED and SELECTED-ON metrics. 'canonical' (default) uses each "
+                         "head's own rule — argmax for softmax, Shi et al.'s rank rule "
+                         "sum_k 1[q_k>0.5] for CORN.\n"
+                         "This matters for a CE-vs-CORN comparison. argmax is the MODE and "
+                         "is optimal for 0/1 loss (accuracy); the rank rule is the MEDIAN "
+                         "and is optimal for absolute error. Since this pipeline selects on "
+                         "set-MAE, 'canonical' gives the CORN arm the decoder matched to "
+                         "the metric and the CE arm one that is not — so a naive comparison "
+                         "measures head AND decoder together. Pass --decode argmax (or "
+                         "median) to hold the decoder fixed and isolate the head.\n"
+                         "Both rules are computed and logged every epoch regardless, so the "
+                         "full 2x2 is available without re-running; this flag only picks "
+                         "which one drives checkpoint selection and the [BEST] line.")
     ap.add_argument("--metrics-csv", dest="metrics_csv", default="",
                     help="Write one row per epoch (epoch, set_acc, macro_f1, set_mae, qwk, lr, "
                          "val_n) to this CSV. The sweep reads these curves rather than parsing "
@@ -744,15 +803,80 @@ def main():
         resample_hz=resample_hz,
     )
 
+    # The constant-prediction floor for THIS validation set. It does not depend
+    # on the model or the epoch, so it is computed once and printed before
+    # training rather than recomputed per epoch — but it is written into every
+    # metrics row so a downstream reader never has to re-derive it.
+    base = {"const_loa_mae": -1, "const_set_mae": float("nan"),
+            "const_loa_acc": -1, "const_set_acc": float("nan")}
+    # The TRAINING drivers' label marginal — the distribution the model is
+    # rewarded for reproducing. Printed next to the validation marginal because
+    # the gap between them is the whole story on this cohort: a model whose
+    # predictions track `train` while `val` wants something else has learned its
+    # training drivers correctly and discovered they do not generalize, which is
+    # a different failure from collapsing onto one level.
+    train_hist = (np.stack([lvl for _, lvl in train_ds.groups], axis=0).sum(axis=0).astype(int)
+                  if len(train_ds) else np.zeros(5, dtype=int))
+    if test_dl is not None and len(test_ds):
+        val_levels = np.stack([lvl for _, lvl in test_ds.groups], axis=0)
+        base = constant_baseline(val_levels, 5)
+        print(f"[labels] marks[LoA0..4]  train={train_hist.tolist()}  "
+              f"val={val_levels.sum(axis=0).astype(int).tolist()}")
+        print(f"[baseline] best CONSTANT prediction on this val set: "
+              f"set-MAE={base['const_set_mae']:.3f} @LoA{base['const_loa_mae']} | "
+              f"set-acc={base['const_set_acc']:.3f} @LoA{base['const_loa_acc']} "
+              f"(val_n={len(val_levels)}) — a model above that MAE is losing to "
+              f"'always predict one level'")
+
     metrics_fh = None
     metrics_writer = None
     if args.metrics_csv:
         mp = pathlib.Path(args.metrics_csv); mp.parent.mkdir(parents=True, exist_ok=True)
         metrics_fh = mp.open("w", newline="", encoding="utf-8")
         metrics_writer = csv.writer(metrics_fh)
-        metrics_writer.writerow(["epoch", "set_acc", "macro_f1", "set_mae", "qwk", "lr", "val_n"])
+        metrics_writer.writerow(["epoch", "set_acc", "macro_f1", "set_mae", "qwk", "lr", "val_n",
+                                 "const_set_mae", "const_loa_mae",
+                                 "const_set_acc", "const_loa_acc",
+                                 # Both decoders every epoch: the CE-vs-CORN
+                                 # comparison is only interpretable if the
+                                 # decoder can be held fixed post hoc.
+                                 "mae_argmax", "acc_argmax", "mae_median", "acc_median",
+                                 "pred_loa0", "pred_loa1", "pred_loa2", "pred_loa3", "pred_loa4",
+                                 # Constant per run; repeated per row so a reader
+                                 # of one row can answer "did training help?"
+                                 "init_set_mae", "init_set_acc", "selectable"])
+
+    @torch.no_grad()
+    def evaluate_val():
+        """Set-aware metrics on the validation set under BOTH decoders."""
+        model.eval(); y_arg = []; y_med = []; y_lvl = []
+        for xb, lb, vb in test_dl:
+            xb, lb = xb.to(device), lb.to(device)
+            probs = logits_to_probs(model(xb, lengths=lb), head_type)
+            y_arg.append(probs_to_label(probs, 'softmax').cpu().numpy())
+            y_med.append(probs_to_label(probs, 'corn').cpu().numpy())
+            y_lvl.append(vb.numpy())
+        Ya, Ym, Yl_ = np.concatenate(y_arg), np.concatenate(y_med), np.concatenate(y_lvl)
+        return Ya, Ym, Yl_
+
+    # UNTRAINED REFERENCE. Evaluated before a single gradient step, so it is the
+    # honest answer to "does training this model achieve anything at all?" —
+    # stronger than the epoch-0 number, which already includes a full pass over
+    # the data (at warmup LR, so at a fraction of the intended step size).
+    # A run whose best epoch does not clearly beat this line has not learned;
+    # one that does not beat the constant floor has learned something that does
+    # not transfer to held-out drivers. They are different diagnoses.
+    init = {}
+    if test_dl is not None:
+        Ya0, Ym0, Yl0 = evaluate_val()
+        c0 = Ya0 if head_type == 'softmax' else Ym0
+        init = {"mae": set_mae(Yl0, c0), "acc": set_accuracy(Yl0, c0)}
+        print(f"[init] UNTRAINED model: set-MAE={init['mae']:.3f} set-acc={init['acc']:.3f} "
+              f"(vs constant floor {base['const_set_mae']:.3f}) — training must beat THIS "
+              f"line to have learned anything")
 
     bad_epochs = 0   # consecutive epochs without an improvement (see --patience)
+    saved_any = False
     for ep in range(args.epochs):
         model.train()
         for xb, lb, vb in train_dl:
@@ -775,28 +899,52 @@ def main():
             print(f"[epoch {ep:02d}] (no validation set; lr={opt.param_groups[0]['lr']:.2e})")
             continue
 
-        model.eval(); y_pred = []; y_lvl = []
-        with torch.no_grad():
-            for xb, lb, vb in test_dl:
-                xb, lb = xb.to(device), lb.to(device)
-                logits = model(xb, lengths=lb)
-                # Each head decoded by its canonical rule: argmax for softmax,
-                # Shi et al.'s rank rule sum_k 1[q_k > 0.5] for CORN.
-                pred = logits_to_label(logits, head_type)
-                y_pred.append(pred.cpu().numpy())
-                y_lvl.append(vb.numpy())
-        Yp = np.concatenate(y_pred, 0)
-        Yl = np.concatenate(y_lvl, 0)
+        # The PMF is head-specific (softmax vs the CORN chain rule), but the RULE
+        # that collapses it to one LoA is a separate choice, so both are
+        # computed: argmax (mode) vs sum_k 1[q_k>0.5] (median).
+        Yarg, Ymed, Yl = evaluate_val()
+        canonical = Yarg if head_type == 'softmax' else Ymed
+        Yp = {"canonical": canonical, "argmax": Yarg, "median": Ymed}[args.decode]
         # All four metrics are set-aware: they credit any level the driver
         # marked acceptable, and reduce EXACTLY to their single-label forms on
         # rows that mark one level.
         sacc = set_accuracy(Yl, Yp); mf1 = set_macro_f1(Yl, Yp, 5)
         err = set_mae(Yl, Yp); kappa = set_qwk(Yl, Yp, 5)
         cur_lr = opt.param_groups[0]["lr"]
+        # "vs const" is the number to watch: negative means the model is worse
+        # than predicting a single fixed LoA on this fold.
+        d_mae = err - base["const_set_mae"]
+        d_acc = sacc - base["const_set_acc"]
         print(f"[epoch {ep:02d}] set-acc={sacc:.3f} macro-F1={mf1:.3f} "
-              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)}, lr={cur_lr:.2e})")
+              f"set-MAE={err:.3f} QWK={kappa:.3f} (val_n={len(Yp)}, lr={cur_lr:.2e}) "
+              f"| vs const: MAE {d_mae:+.3f} acc {d_acc:+.3f}"
+              f"{'' if d_mae < 0 else '  <-- WORSE THAN A CONSTANT'}")
+        # PREDICTION HISTOGRAM: how the epoch's predictions spread over the five
+        # LoAs, against the label marginal on the same segments. A model whose
+        # counts pile onto one or two levels is reproducing the marginal, and its
+        # set-MAE is the constant baseline wearing a different hat — which the
+        # aggregate metrics alone cannot distinguish from genuine learning.
+        pred_hist = np.bincount(Yp.astype(int), minlength=5)[:5]
+        lbl_hist = np.asarray(Yl).sum(axis=0).astype(int)[:5]
+        # Both decoders, so the CE-vs-CORN comparison never needs a re-run.
+        mae_arg, mae_med = set_mae(Yl, Yarg), set_mae(Yl, Ymed)
+        acc_arg, acc_med = set_accuracy(Yl, Yarg), set_accuracy(Yl, Ymed)
+        def _pct(v):
+            t = int(np.sum(v)) or 1
+            return "[" + " ".join(f"{100 * x / t:4.1f}" for x in v) + "]"
+        print(f"           %LoA0..4  pred {_pct(pred_hist)}  val {_pct(lbl_hist)}  "
+              f"train {_pct(train_hist)}   (counts pred={pred_hist.tolist()})")
+        print(f"           argmax MAE={mae_arg:.3f} acc={acc_arg:.3f}"
+              f"  |  median MAE={mae_med:.3f} acc={acc_med:.3f}")
         if metrics_writer is not None:
-            metrics_writer.writerow([ep, sacc, mf1, err, kappa, cur_lr, len(Yp)])
+            metrics_writer.writerow([ep, sacc, mf1, err, kappa, cur_lr, len(Yp),
+                                     base["const_set_mae"], base["const_loa_mae"],
+                                     base["const_set_acc"], base["const_loa_acc"],
+                                     mae_arg, acc_arg, mae_med, acc_med,
+                                     *pred_hist.tolist(),
+                                     init.get("mae", float("nan")),
+                                     init.get("acc", float("nan")),
+                                     int(ep >= args.min_select_epoch)])
             metrics_fh.flush()   # the sweep reads these while the run is in flight
 
         # Select on set-MAE: LoA is ordinal, so off-by-1 << off-by-4, and
@@ -807,9 +955,26 @@ def main():
         #
         # ONE definition of "improved", used for both the save and the patience
         # counter, so the two cannot disagree about whether an epoch helped.
-        if err < best - args.min_delta:
+        # EPOCH FLOOR. Epochs below --min-select-epoch are trained, evaluated and
+        # logged, but cannot be selected or checkpointed. Two reasons:
+        #   * The first --warmup-epochs run at a reduced LR, so choosing among
+        #     them is choosing an artifact of the schedule, not a better model.
+        #   * On a cohort where held-out-driver performance degrades with
+        #     training, the unconstrained argmin lands on epoch 0 — and E*=0
+        #     makes run_lodo_population execute `for ep in range(0)`, i.e. no
+        #     training at all, saving 12 randomly-initialized checkpoints as the
+        #     population models. That failure is silent.
+        # The floor makes the comparison one between TRAINED models. If the best
+        # such model still loses to [init] or to the constant floor, that is the
+        # finding — and it is now visible rather than hidden behind an epoch-0
+        # selection.
+        if ep < args.min_select_epoch:
+            print(f"           (epoch < --min-select-epoch {args.min_select_epoch}: "
+                  f"logged, not selectable)")
+        elif err < best - args.min_delta:
             best = err
             bad_epochs = 0
+            saved_any = True
             save_checkpoint(model, str(outp), arch=arch)
             print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
         else:
@@ -836,8 +1001,21 @@ def main():
     # — the winner's curse of selecting on the same set you report. Quote it as
     # the selection criterion it is, not as the population model's expected
     # performance on an unseen driver; the LODO folds are what estimates that.
-    print(f"[BEST] set-MAE={best:.3f} (selection minimum — optimistically biased, "
-          f"see note in train_XLSTM.py)")
+    if not saved_any:
+        # --epochs never reached --min-select-epoch, so nothing was ever
+        # eligible. Saving the final epoch beats leaving no checkpoint at all
+        # (the caller expects a file), but the run cannot be treated as selected.
+        save_checkpoint(model, str(outp), arch=arch)
+        print(f"[warn] no epoch was selectable: --epochs {args.epochs} never reached "
+              f"--min-select-epoch {args.min_select_epoch}. Saved the FINAL epoch "
+              f"unselected — do not treat this checkpoint as chosen.")
+
+    print(f"[BEST] set-MAE={best:.3f} (selection minimum over epochs >= "
+          f"{args.min_select_epoch} — optimistically biased, see note in train_XLSTM.py)")
+    if init:
+        print(f"[BEST] vs untrained init {init['mae']:.3f} -> {best - init['mae']:+.3f}"
+              f"   vs constant floor {base['const_set_mae']:.3f} -> "
+              f"{best - base['const_set_mae']:+.3f}")
 
 
 if __name__ == "__main__":
