@@ -249,6 +249,35 @@ def smooth(y: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
+def report_device() -> None:
+    """Print the device the CHILD runs will use, once, before any of them start.
+
+    run_one uses capture_output=True, so the trainer's own ``[device]`` line is
+    swallowed unless that run fails. Without this the sweep gives no indication
+    of CPU vs GPU at all -- and a silent CPU fallback looks exactly like a slow
+    GPU. Imported lazily so --resummarize does not pay torch's ~2 s import.
+    """
+    try:
+        import torch
+    except Exception as e:                      # pragma: no cover
+        print(f"[device] could not import torch: {e}")
+        return
+    if torch.cuda.is_available():
+        print(f"[device] cuda — {torch.cuda.get_device_name(0)} (torch {torch.__version__})\n"
+              f"[device] NOTE Windows Task Manager shows the '3D' engine by default and "
+              f"CUDA work will NOT appear there. Switch a graph to 'Compute_0'/'Cuda', or "
+              f"use `nvidia-smi`, before concluding the GPU is idle.")
+    elif torch.version.cuda is None:
+        print(f"[device] cpu — torch {torch.__version__} is a CPU-ONLY build. Every run in "
+              f"this sweep will use the CPU.\n"
+              f"[device] Fix: uv run --no-sync python scripts/setup_cuda_torch.py, then "
+              f"launch with `uv run --no-sync` (a plain `uv run` re-syncs and reinstates "
+              f"the CPU wheel).")
+    else:
+        print(f"[device] cpu — torch {torch.__version__} has CUDA {torch.version.cuda} "
+              f"compiled in but sees no device; check the driver / nvidia-smi.")
+
+
 def read_done(path: pathlib.Path) -> set:
     """Already-completed run keys, for resuming.
 
@@ -638,6 +667,7 @@ def main() -> None:
     if done:
         print(f"[resume] {len(done)} run(s) already in {results_csv}; they will be skipped")
 
+    report_device()
     total = len(dropouts) * len(lrs) * len(fold_idx) * len(seeds)
     print(f"[plan] {len(dropouts)} dropout x {len(lrs)} lr x {len(fold_idx)} fold x "
           f"{len(seeds)} seed = {total} runs (<= {args.epochs} epochs each)")

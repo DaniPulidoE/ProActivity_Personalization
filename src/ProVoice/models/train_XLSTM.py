@@ -921,6 +921,19 @@ def main():
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Say which device, ALWAYS. A CPU-only wheel falls back silently, and the
+    # symptom (a slow run) is indistinguishable from a slow GPU -- which cost a
+    # multi-hour sweep before this line existed. When CUDA is absent, name the
+    # reason: `torch.version.cuda is None` means the +cpu wheel is installed,
+    # which is what a plain `uv run` re-sync reinstates.
+    if device == "cuda":
+        print(f"[device] cuda — {torch.cuda.get_device_name(0)} "
+              f"(torch {torch.__version__})", flush=True)
+    else:
+        why = ("CPU-ONLY torch build; re-run scripts/setup_cuda_torch.py and launch "
+               "with `uv run --no-sync`" if torch.version.cuda is None
+               else "CUDA build present but no device visible (driver?)")
+        print(f"[device] cpu — {why} (torch {torch.__version__})", flush=True)
 
     train_ds, test_ds = (datasets_from_cache(args, resample_hz) if args.cache
                          else datasets_from_jsonl(args, resample_hz))
