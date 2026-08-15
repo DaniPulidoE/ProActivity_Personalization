@@ -144,7 +144,28 @@ def main() -> None:
         "from ultralytics import YOLO; print('ultralytics OK')"
     )
     run(["uv", "run", "--no-sync", "python", "-c", code])
-    print("[setup] done. Launch GPU work with `uv run --no-sync ...`.")
+    print(
+        "\n[setup] done.\n"
+        "[setup] THIS INSTALL IS UNDONE BY ANY PLAIN `uv run`. That command re-syncs\n"
+        "        against the lockfile, which pins torch to the CPU index, so it\n"
+        "        silently reinstalls +cpu over what was just installed. The failure is\n"
+        "        invisible -- training simply runs on the CPU.\n"
+        "\n"
+        "        Make it structural instead of remembering a flag (uv reads --no-sync\n"
+        "        from the environment):\n"
+        "\n"
+        "            PowerShell, once, persists for this user:\n"
+        "            [Environment]::SetEnvironmentVariable('UV_NO_SYNC','1','User')\n"
+        "\n"
+        "            bash, this session only:\n"
+        "            export UV_NO_SYNC=1\n"
+        "\n"
+        "        Trade-off: `uv run` then NEVER syncs, so after changing dependencies\n"
+        "        you must run `uv sync` yourself -- and that re-reverts torch, so\n"
+        "        re-run this script afterwards. On a training box that is the safer\n"
+        "        default.\n"
+        "\n"
+        "[setup] Verify at any time with:  uv run --no-sync python scripts/bench_gpu.py")
 
 
 if __name__ == "__main__":
