@@ -32,6 +32,9 @@ from ProVoice.models.xlstm_model import (
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.decision_engine import truncate_frames_by_seconds
+from ProVoice.models.head_adapt import (
+    DEFAULT_ADAPT_LR, DEFAULT_ADAPT_STEPS, DEFAULT_TAU, adapt_head_tensors,
+)
 
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -176,6 +179,10 @@ def load_label_map(path: str | None) -> Dict[str, List[int]]: # NOT USED !!!
 # --------------------------------------------------------------------------- #
 SEGMENT_CACHE_VERSION = 1
 
+# Minimum query segments a (driver, K) cell needs before --adapt-eval scores it.
+# A two-segment tail is noise; skipping is better than averaging noise in.
+_ADAPT_MIN_QUERY = 20
+
 
 def cache_name(window_seconds: float, resample_hz: float) -> str:
     """Canonical filename for a cache. Lives here, next to the format, so the
@@ -300,6 +307,9 @@ class SeqDataset(Dataset):
         # "always predict this driver's own favourite level" is available for
         # free and a model has to beat THAT, not the global constant.
         self.pids: List[str] = []
+        # Parallel to `groups` as well. --adapt-eval needs the driver's TRUE
+        # session prefix, and segment_id is what orders it (see chrono_index).
+        self.segment_ids: List[str] = []
         skipped = []
         for gid, g in df.groupby('segment_id'):
             g = g.reset_index(drop=True)
@@ -324,6 +334,7 @@ class SeqDataset(Dataset):
             X = encode_and_resample(rows, resample_hz, window_seconds)
             self.groups.append((X, lvl))
             self.pids.append(str(g[SPLIT_VARIABLE].iloc[0]) if SPLIT_VARIABLE in g.columns else "")
+            self.segment_ids.append(str(gid))
             if log_fh is not None:
                 log_encoded_frames(log_fh, split, str(gid), X, levels=lvl)
         if skipped:
@@ -347,6 +358,7 @@ class SeqDataset(Dataset):
         obj.context_length = context_length
         obj.groups = []
         obj.pids = []
+        obj.segment_ids = []
         x_flat, off, lv = cache["x_flat"], cache["offsets"], cache["levels"]
         for i, (sid, pid) in enumerate(zip(cache["segment_id"], cache["participantid"])):
             if pids is not None and str(pid) not in pids:
@@ -355,6 +367,7 @@ class SeqDataset(Dataset):
                 continue
             obj.groups.append((x_flat[off[i]:off[i + 1]], lv[i]))
             obj.pids.append(str(pid))
+            obj.segment_ids.append(str(sid))
         return obj
 
     def __len__(self): return len(self.groups)
@@ -839,6 +852,11 @@ def datasets_from_jsonl(args, resample_hz) -> Tuple[Any, Any]:
 
     tr_df = sel(tr_pids, tr_segs)
     te_df = df.iloc[0:0] if args.no_val else sel(te_pids, te_segs)
+    # FIRST-APPEARANCE order = chronological within a driver (verified against
+    # user_loa_labels.csv session start times). NOT a sort of segment_id: ids are
+    # `<session_uuid>|win<n>p<k>`, so sorting orders a driver's two sessions by
+    # UUID. --adapt-eval reads this to build the true session prefix.
+    chrono_index = {str(g): i for i, g in enumerate(seg_first['segment_id'])}
 
     log_fh = open(args.log_path, "w", encoding="utf-8") if args.log_path else None
     if log_fh:
@@ -858,6 +876,9 @@ def datasets_from_jsonl(args, resample_hz) -> Tuple[Any, Any]:
     finally:
         if log_fh:
             log_fh.close()
+    for ds in (train_ds, test_ds):
+        if isinstance(ds, SeqDataset):
+            ds.chrono_index = chrono_index
     return train_ds, test_ds
 
 
@@ -890,6 +911,13 @@ def datasets_from_cache(args, resample_hz) -> Tuple[Any, Any]:
     test_ds = ([] if args.no_val else
                SeqDataset.from_cache(cache, args.context_length,
                                      pids=te_pids, segment_ids=te_segs))
+    # See datasets_from_jsonl: seg_order is first-appearance order, which is
+    # chronological within a driver. cache["segment_id"] is the SORTED groupby
+    # order the encoder wrote and must not be used for this.
+    chrono_index = {str(sid): i for i, sid in enumerate(cache["seg_order"])}
+    for ds in (train_ds, test_ds):
+        if isinstance(ds, SeqDataset):
+            ds.chrono_index = chrono_index
     print(f"[cache] {pathlib.Path(args.cache).name}: {len(train_ds)} train + "
           f"{len(test_ds)} val segments")
     return train_ds, test_ds
@@ -964,6 +992,57 @@ def main():
                          "unconstrained argmin often lands on epoch 0, and E*=0 makes the "
                          "LODO runner train for zero epochs and ship 12 random inits as "
                          "population models. 0 disables.")
+    ap.add_argument("--adapt-eval", dest="adapt_eval", action="store_true",
+                    help="Additionally score each epoch AFTER per-driver adaptation: for "
+                         "every validation driver, adapt the head on their first K labels "
+                         "(true session prefix) with the deployed head_adapt call, then "
+                         "measure set-MAE/set-acc on everything after. Averaged over --adapt-k "
+                         "within a driver, then across drivers. Off by default. COST, measured: ~18.5 s "
+                         "per epoch at the defaults (3 K values x 2 val drivers = 6 cells, "
+                         "2000 AdamW steps each), against ~6.7 s/epoch for the training "
+                         "itself -- a ~3.8x per-epoch slowdown. It is Python/kernel-launch "
+                         "bound at ~1.5 ms/step, not FLOP bound, so a GPU does not help; "
+                         "cut it with fewer --adapt-k values if needed. WHY IT EXISTS: the "
+                         "population model is never served "
+                         "unadapted, so unadapted held-out-driver set-MAE is a proxy for a "
+                         "quantity the design has already declared is not the objective. "
+                         "xlstm_maml.evaluate_adaptation and sweep_l2sp_tau both already "
+                         "select on the post-adaptation number; this makes stage 1 agree with "
+                         "them. Requires a validation set whose drivers are ABSENT from "
+                         "training (the normal --val-pids fold), or the adaptation starts from "
+                         "a backbone that has already seen the driver.")
+    ap.add_argument("--adapt-k", dest="adapt_k", default="5,10,20,30,40,50,60",
+                    help="Comma-separated support sizes for --adapt-eval. The SELECTION "
+                         "quantity is the mean over these K within each driver, then the mean "
+                         "across drivers (drivers contribute unequal segment counts, so a "
+                         "flat mean over cells would weight the long sessions). Fix the grid "
+                         "in advance - the metric is a curve and the aggregation must not be "
+                         "chosen after seeing it. Mirrors sweep_l2sp_tau's k-cap reasoning: "
+                         "values beyond a deployable labelling budget must not choose a "
+                         "config. EVERY K is ALSO written out individually as "
+                         "adapt_set_mae_k<K>/adapt_set_acc_k<K>, so the shape of the "
+                         "quality-vs-K curve survives into the CSV and a config that wins on "
+                         "the mean while losing at small K is visible rather than averaged "
+                         "away. COST is linear in the number of K values: ~3.1 s per "
+                         "(driver, K) cell, so 7 K x 2 val drivers is ~43 s/epoch.")
+    ap.add_argument("--adapt-tau", dest="adapt_tau", type=float, default=DEFAULT_TAU,
+                    help="L2-SP prior precision for --adapt-eval. PROVISIONAL by "
+                         "construction: the committed tau is chosen at stage 3 "
+                         "(sweep_l2sp_tau) from checkpoints that depend on this stage's "
+                         "output. Fix it here, disclose the value, and re-check at stage 3 "
+                         "that the winning config is not tau-sensitive.")
+    ap.add_argument("--adapt-steps", dest="adapt_steps", type=int, default=DEFAULT_ADAPT_STEPS)
+    ap.add_argument("--adapt-lr", dest="adapt_lr", type=float, default=DEFAULT_ADAPT_LR)
+    ap.add_argument("--select-on", dest="select_on",
+                    choices=["set_mae", "adapt_set_mae"], default="set_mae",
+                    help="Which validation number drives checkpoint selection, --patience "
+                         "and the [BEST] line. 'set_mae' (default, unchanged) is the "
+                         "UNADAPTED held-out-driver score. 'adapt_set_mae' is the "
+                         "post-adaptation score and requires --adapt-eval; it is the "
+                         "criterion that matches what the population model is FOR, and it "
+                         "changes E* as well as the config ranking - the epoch that "
+                         "minimizes source error is not generally the one that adapts best, "
+                         "and stage 2 trains for E* with no validation set to catch it.")
     ap.add_argument("--decode", choices=["canonical", "argmax", "median"], default="canonical",
                     help="Which rule turns the decoded PMF into a single LoA for the "
                          "REPORTED and SELECTED-ON metrics. 'canonical' (default) uses each "
@@ -1118,6 +1197,16 @@ def main():
                else "CUDA build present but no device visible (driver?)")
         print(f"[device] cpu — {why} (torch {torch.__version__})", flush=True)
 
+    adapt_ks = sorted({int(k) for k in str(args.adapt_k).split(",") if k.strip()})
+    if args.select_on == "adapt_set_mae" and not args.adapt_eval:
+        raise SystemExit("--select-on adapt_set_mae requires --adapt-eval.")
+    if args.adapt_eval and args.no_val:
+        raise SystemExit("--adapt-eval needs a validation set; it is meaningless with --no-val.")
+    if args.adapt_eval and args.split_mode == "within-driver":
+        print("[adapt-eval][warn] --split-mode within-driver puts every driver in the "
+              "TRAINING set, so adaptation starts from a backbone that has already seen "
+              "the driver. The number is an upper bound, not a deployment estimate.")
+
     train_ds, test_ds = (datasets_from_cache(args, resample_hz) if args.cache
                          else datasets_from_jsonl(args, resample_hz))
     if len(train_ds) == 0 or (len(test_ds) == 0 and not args.no_val):
@@ -1261,6 +1350,11 @@ def main():
                   f"this one means the model learned WHO is driving, not WHEN they want "
                   f"autonomy.")
 
+    # Per-K columns are DERIVED from --adapt-k, so the header and the row cannot
+    # drift apart when the grid changes. Order is fixed by sorted adapt_ks.
+    _adapt_k_columns = ([f"adapt_set_mae_k{k}" for k in adapt_ks]
+                        + [f"adapt_set_acc_k{k}" for k in adapt_ks])
+
     metrics_fh = None
     metrics_writer = None
     if args.metrics_csv:
@@ -1283,7 +1377,15 @@ def main():
                                  "pred_loa0", "pred_loa1", "pred_loa2", "pred_loa3", "pred_loa4",
                                  # Constant per run; repeated per row so a reader
                                  # of one row can answer "did training help?"
-                                 "init_set_mae", "init_set_acc", "selectable"])
+                                 "init_set_mae", "init_set_acc", "selectable",
+                                 # APPENDED, so readers of older CSVs keep working.
+                                 # NaN unless --adapt-eval.
+                                 "adapt_set_mae", "adapt_set_acc",
+                                 "adapt_n_drivers", "adapt_n_cells",
+                                 # Untrained backbone + adapted head. Constant
+                                 # per run, repeated per row like init_set_mae.
+                                 "init_adapt_set_mae", "init_adapt_set_acc"]
+                                + _adapt_k_columns)
 
     @torch.no_grad()
     def evaluate_val():
@@ -1297,6 +1399,102 @@ def main():
             y_lvl.append(vb.numpy())
         Ya, Ym, Yl_ = np.concatenate(y_arg), np.concatenate(y_med), np.concatenate(y_lvl)
         return Ya, Ym, Yl_
+
+    @torch.no_grad()
+    def _embed_val() -> torch.Tensor:
+        """Pooled (N, d) embeddings for the validation set, in DATASET order.
+
+        Same readout as ``model.forward`` and ``fine_tune_XLSTM.embed_all`` - the
+        hidden state at the last REAL frame. Order is preserved because test_dl
+        is built with ``shuffle=False``; anything that changes needs the pids and
+        segment_ids realigned with it.
+        """
+        model.eval()
+        zs = []
+        for xb, lb, _vb in test_dl:
+            xb = xb.to(device).to(torch.float32)
+            h = model.backbone(model.in_proj(xb))
+            idx = (lb.to(h.device).long() - 1).clamp(min=0)
+            zs.append(h[torch.arange(h.size(0), device=h.device), idx].detach().cpu())
+        return torch.cat(zs) if zs else torch.zeros((0, 1))
+
+    def evaluate_adaptation_val() -> Dict[str, float]:
+        """Post-adaptation validation: adapt per driver on their prefix, score the tail.
+
+        The measurement the population model actually exists to do well on. It
+        deliberately mirrors ``xlstm_maml.evaluate_adaptation`` and
+        ``sweep_l2sp_tau``: the DEPLOYED ``head_adapt`` call, the driver's TRUE
+        session prefix as support (never a random subset - that leaks
+        within-session autocorrelation), and everything after it as the query.
+
+        Aggregation is fixed here rather than left to the caller: mean over K
+        WITHIN a driver first, then across drivers. Drivers contribute unequal
+        segment counts, so a flat mean over all (driver, K) cells would weight
+        the long sessions.
+
+        A (driver, K) cell is skipped when the driver has fewer than K +
+        ``_ADAPT_MIN_QUERY`` segments - a two-segment query is noise, not an
+        evaluation - and ``adapt_n_cells`` records how many survived so a run
+        that silently evaluated almost nothing is visible in the CSV.
+        """
+        empty = {"adapt_set_mae": float("nan"), "adapt_set_acc": float("nan"),
+                 "adapt_n_drivers": 0, "adapt_n_cells": 0}
+        for _k in adapt_ks:
+            empty[f"adapt_set_mae_k{_k}"] = float("nan")
+            empty[f"adapt_set_acc_k{_k}"] = float("nan")
+        if test_dl is None or not len(test_ds):
+            return empty
+        chrono = getattr(test_ds, "chrono_index", None) or {}
+        Z = _embed_val()
+        V = torch.stack([torch.as_tensor(lvl) for _, lvl in test_ds.groups]).float()
+        pids = np.asarray(test_ds.pids)
+        sids = list(test_ds.segment_ids)
+
+        w0, b0 = model.head.weight.detach().cpu(), model.head.bias.detach().cpu()
+        per_driver_mae, per_driver_acc, n_cells = [], [], 0
+        # by_k[K] collects one score per DRIVER at that K, so the per-K column is
+        # a mean over drivers — the same footing as the aggregate, just without
+        # the mean over K. Aggregating cells instead would weight drivers by how
+        # many K values they happened to be long enough for.
+        by_k_mae: Dict[int, List[float]] = {k: [] for k in adapt_ks}
+        by_k_acc: Dict[int, List[float]] = {k: [] for k in adapt_ks}
+        for pid in np.unique(pids):
+            where = np.flatnonzero(pids == pid)
+            # Chronological, so segs[:K] is the session prefix a deployed system
+            # would actually have. Unknown ids sort last rather than raising.
+            order = sorted(where, key=lambda i: chrono.get(sids[i], len(chrono) + i))
+            maes, accs = [], []
+            for K in adapt_ks:
+                if len(order) < K + _ADAPT_MIN_QUERY:
+                    continue
+                sup, qry = order[:K], order[K:]
+                w, b, _info = adapt_head_tensors(
+                    Z[sup], V[sup], w0, b0, tau=args.adapt_tau, head_type=head_type,
+                    steps=args.adapt_steps, lr=args.adapt_lr)
+                with torch.no_grad():
+                    probs = logits_to_probs(torch.nn.functional.linear(Z[qry], w, b), head_type)
+                    pred = probs_to_label(probs, head_type).cpu().numpy()
+                lv = V[qry].numpy()
+                m_k, a_k = set_mae(lv, pred), set_accuracy(lv, pred)
+                maes.append(m_k)
+                accs.append(a_k)
+                by_k_mae[K].append(m_k)
+                by_k_acc[K].append(a_k)
+                n_cells += 1
+            if maes:
+                per_driver_mae.append(float(np.mean(maes)))
+                per_driver_acc.append(float(np.mean(accs)))
+        if not per_driver_mae:
+            return empty
+        out = {"adapt_set_mae": float(np.mean(per_driver_mae)),
+               "adapt_set_acc": float(np.mean(per_driver_acc)),
+               "adapt_n_drivers": len(per_driver_mae), "adapt_n_cells": n_cells}
+        for k in adapt_ks:
+            out[f"adapt_set_mae_k{k}"] = (float(np.mean(by_k_mae[k])) if by_k_mae[k]
+                                          else float("nan"))
+            out[f"adapt_set_acc_k{k}"] = (float(np.mean(by_k_acc[k])) if by_k_acc[k]
+                                          else float("nan"))
+        return out
 
     # UNTRAINED REFERENCE. Evaluated before a single gradient step, so it is the
     # honest answer to "does training this model achieve anything at all?" —
@@ -1313,6 +1511,22 @@ def main():
         print(f"[init] UNTRAINED model: set-MAE={init['mae']:.3f} set-acc={init['acc']:.3f} "
               f"(vs constant floor {base['const_set_mae']:.3f}) — training must beat THIS "
               f"line to have learned anything")
+        # ADAPTED init. The untrained backbone is a random-feature reservoir, and
+        # a reservoir plus an adapted head is a genuinely strong baseline — so
+        # "does training the backbone help ADAPTATION?" is a different question
+        # from "does training help unadapted accuracy?", and only this line
+        # answers it. If the trained model's adapted score does not beat this,
+        # the backbone contributes nothing that per-driver adaptation can use,
+        # whatever its unadapted curve does. This is the random-backbone control
+        # from docs/embedding_informativeness.md, obtained here for one extra
+        # evaluation instead of a separate experiment.
+        if args.adapt_eval:
+            init_ad = evaluate_adaptation_val()
+            init["adapt_mae"] = init_ad["adapt_set_mae"]
+            init["adapt_acc"] = init_ad["adapt_set_acc"]
+            print(f"[init] UNTRAINED + ADAPTED: set-MAE={init['adapt_mae']:.3f} "
+                  f"set-acc={init['adapt_acc']:.3f} — the random-feature-reservoir "
+                  f"baseline; the trained model's ADAPTED score must beat THIS one")
 
     bad_epochs = 0   # consecutive epochs without an improvement (see --patience)
     saved_any = False
@@ -1350,6 +1564,12 @@ def main():
         sacc = set_accuracy(Yl, Yp); mf1 = set_macro_f1(Yl, Yp, 5)
         err = set_mae(Yl, Yp); kappa = set_qwk(Yl, Yp, 5)
         cur_lr = opt.param_groups[0]["lr"]
+        ad = (evaluate_adaptation_val() if args.adapt_eval else
+              {"adapt_set_mae": float("nan"), "adapt_set_acc": float("nan"),
+               "adapt_n_drivers": 0, "adapt_n_cells": 0})
+        # THE selection quantity. Both are always logged; this only picks which
+        # one drives the save, --patience and the [BEST] line.
+        score = ad["adapt_set_mae"] if args.select_on == "adapt_set_mae" else err
         # "vs const" is the number to watch: negative means the model is worse
         # than predicting a single fixed LoA on this fold.
         d_mae = err - base["const_set_mae"]
@@ -1375,6 +1595,12 @@ def main():
               f"train {_pct(train_hist)}   (counts pred={pred_hist.tolist()})")
         print(f"           argmax MAE={mae_arg:.3f} acc={acc_arg:.3f}"
               f"  |  median MAE={mae_med:.3f} acc={acc_med:.3f}")
+        if args.adapt_eval:
+            print(f"           ADAPTED (K={','.join(str(k) for k in adapt_ks)}, "
+                  f"tau={args.adapt_tau:g}): set-MAE={ad['adapt_set_mae']:.3f} "
+                  f"set-acc={ad['adapt_set_acc']:.3f} "
+                  f"({ad['adapt_n_drivers']} driver(s), {ad['adapt_n_cells']} cell(s))"
+                  f"{'   <-- SELECTED ON' if args.select_on == 'adapt_set_mae' else ''}")
         if metrics_writer is not None:
             metrics_writer.writerow([ep, sacc, mf1, err, kappa, cur_lr, len(Yp),
                                      base["const_set_mae"], base["const_loa_mae"],
@@ -1385,7 +1611,12 @@ def main():
                                      *pred_hist.tolist(),
                                      init.get("mae", float("nan")),
                                      init.get("acc", float("nan")),
-                                     int(ep >= args.min_select_epoch)])
+                                     int(ep >= args.min_select_epoch),
+                                     ad["adapt_set_mae"], ad["adapt_set_acc"],
+                                     ad["adapt_n_drivers"], ad["adapt_n_cells"],
+                                     init.get("adapt_mae", float("nan")),
+                                     init.get("adapt_acc", float("nan"))]
+                                    + [ad.get(c, float("nan")) for c in _adapt_k_columns])
             metrics_fh.flush()   # the sweep reads these while the run is in flight
 
         # Select on set-MAE: LoA is ordinal, so off-by-1 << off-by-4, and
@@ -1412,16 +1643,16 @@ def main():
         if ep < args.min_select_epoch:
             print(f"           (epoch < --min-select-epoch {args.min_select_epoch}: "
                   f"logged, not selectable)")
-        elif err < best - args.min_delta:
-            best = err
+        elif np.isfinite(score) and score < best - args.min_delta:
+            best = score
             bad_epochs = 0
             saved_any = True
             save_checkpoint(model, str(outp), arch=arch)
-            print(f"[OK] saved -> {outp} (set-MAE={err:.3f})")
+            print(f"[OK] saved -> {outp} ({args.select_on}={score:.3f})")
         else:
             bad_epochs += 1
             if args.patience and bad_epochs >= args.patience:
-                print(f"[early-stop] no set-MAE improvement > {args.min_delta:g} for "
+                print(f"[early-stop] no {args.select_on} improvement > {args.min_delta:g} for "
                       f"{bad_epochs} epochs; stopping at epoch {ep} of {args.epochs}. "
                       f"The best epoch is already on disk.")
                 break

@@ -62,11 +62,13 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ProVoice.models.train_XLSTM import constant_baseline, iter_jsonl
+from ProVoice.models.train_XLSTM import constant_baseline, iter_jsonl, set_mae
 from ProVoice.training_scripts.folds import VALIDATION_FOLDS, train_pids_for_validation_fold
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -82,6 +84,16 @@ DROPOUTS = (0.10, 0.15, 0.20)
 LRS = (1e-3, 2e-3)
 SEEDS = (0, 1, 2, 3, 4)
 SMOOTH_WINDOW = 5          # epochs, centred — see "HOW E* IS EXTRACTED"
+# ONE definition of the adaptation support grid. The CLI default and summarize()'s
+# fallback both read it: they disagreed once (CLI 5..60 vs a hard-coded 10/30/60
+# fallback), which silently scored runs against a per-driver floor computed on a
+# different grid than the runs themselves used.
+DEFAULT_ADAPT_KS: Tuple[int, ...] = (5, 10, 20, 30, 40, 50, 60)
+
+# In-flight runs, for the watchdog. run_one owns the entries; the watchdog only
+# reads. A plain dict under a lock — there are at most --jobs entries.
+_INFLIGHT: Dict[str, float] = {}
+_INFLIGHT_LOCK = threading.Lock()
 
 RESULTS_COLUMNS = [
     "dropout", "lr", "window_seconds", "loss", "fold", "val_pids", "seed",
@@ -114,7 +126,35 @@ RESULTS_COLUMNS = [
     # Listed ONLY here: naming lbl_loa* separately above as well produced a CSV
     # with five duplicated headers.
     *BASELINE_COLUMNS,
+    # POST-ADAPTATION columns, APPENDED so existing CSVs stay readable. All NaN
+    # unless the trainer ran with --adapt-eval. `*_adapt` mirror the unadapted
+    # trio exactly, so `--rank-on adapt_set_mae` swaps one column set for the
+    # other and changes nothing else about how a run is summarized.
+    "adapt_at_best",              # adapted score AT the unadapted-selected epoch
+    "best_adapt_mae",             # raw minimum of the adapted curve
+    "smoothed_best_adapt_mae",    # ranking quantity under --rank-on adapt_set_mae
+    "best_epoch_smoothed_adapt",
+    "best_epoch_1se_adapt",       # E* under --rank-on adapt_set_mae
+    "adapt_acc_at_best_adapt",
+    "adapt_n_drivers",
+    # Untrained backbone + adapted head: the random-feature-reservoir baseline.
+    # "Does training the backbone help ADAPTATION?" is a different question from
+    # "does training help unadapted accuracy?", and only this answers it.
+    "init_adapt_set_mae", "init_adapt_set_acc",
 ]
+
+
+def results_columns(adapt_ks: Optional[List[int]] = None) -> List[str]:
+    """``RESULTS_COLUMNS`` plus one pair of columns per K in the adapt grid.
+
+    Derived rather than hard-coded so the header and the row are built from the
+    same list: the grid is a CLI argument, and a fixed column list would either
+    silently drop a K or write a column no run produced.
+    """
+    cols = list(RESULTS_COLUMNS)
+    for k in (adapt_ks or []):
+        cols += [f"adapt_mae_k{k}", f"adapt_acc_k{k}"]
+    return cols
 assert len(set(RESULTS_COLUMNS)) == len(RESULTS_COLUMNS), (
     "duplicate column(s) in RESULTS_COLUMNS: "
     f"{sorted({c for c in RESULTS_COLUMNS if RESULTS_COLUMNS.count(c) > 1})}")
@@ -181,6 +221,42 @@ def fold_baseline(labels: Dict[str, List[List[int]]], val_pids: List[str]) -> Di
         out[f"lbl_loa{c}"] = int(vc[c])
         out[f"trn_loa{c}"] = int(tc[c])
     return out
+
+
+def adapt_fold_baseline(labels: Dict[str, List[List[int]]], val_pids: List[str],
+                        adapt_ks: List[int], min_query: int = 20) -> float:
+    """The floor for the POST-ADAPTATION metric: a per-driver constant fitted on
+    the same support the model adapts on.
+
+    The global constant (``fold_baseline``) is the right reference only while the
+    validation drivers are unseen AND unadapted. The moment the model is handed
+    the driver's first K labels, "always predict this driver's favourite level"
+    becomes available from those same K labels, needs no features, and is what an
+    adapted model has to beat. Scoring an adapted number against the global
+    constant compares two different games.
+
+    Protocol is matched to ``train_XLSTM.evaluate_adaptation_val`` exactly: same K
+    grid, same prefix support / suffix query, same ``min_query``, same aggregation
+    (mean over K within a driver, then across drivers). Pure label arithmetic, so
+    it costs nothing and needs no model.
+    """
+    per_driver = []
+    for pid in val_pids:
+        marks = labels.get(str(pid), [])
+        if not marks:
+            continue
+        lv = np.asarray(marks, dtype=float)
+        maes = []
+        for K in adapt_ks:
+            if len(lv) < K + min_query:
+                continue
+            sup, qry = lv[:K], lv[K:]
+            c = int(np.argmin([set_mae(sup, np.full(len(sup), k, dtype=int))
+                               for k in range(5)]))
+            maes.append(set_mae(qry, np.full(len(qry), c, dtype=int)))
+        if maes:
+            per_driver.append(float(np.mean(maes)))
+    return float(np.mean(per_driver)) if per_driver else float("nan")
 
 
 def backfill_baselines(results_csv: pathlib.Path, labels: Dict[str, List[List[int]]]) -> bool:
@@ -324,6 +400,34 @@ def run_tag(dropout: float, lr: float, val_pids: List[str], seed: int,
     return t
 
 
+def _f(v) -> float:
+    """float(v) with '' / None / 'nan' all collapsing to NaN, never an exception."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def reduce_curve(y: np.ndarray, min_select_epoch: int) -> Tuple[int, int, np.ndarray]:
+    """Smooth a curve, then return (argmin epoch index, 1-SE epoch index, smoothed).
+
+    Extracted so the UNADAPTED and the POST-ADAPTATION curves are reduced by
+    exactly the same rule. Selecting the two on different rules would make the
+    ``--rank-on`` switch change more than the quantity being ranked.
+
+    See ``curve_stats`` for why the epoch floor and the 1-SE rule exist.
+    """
+    sm = smooth(y, SMOOTH_WINDOW)
+    lo = min(int(min_select_epoch), len(sm) - 1) if len(sm) else 0
+    j = lo + int(np.argmin(sm[lo:]))
+    resid = y - sm
+    sigma = float(resid.std(ddof=1)) if len(resid) > 1 else 0.0
+    se_sm = sigma / np.sqrt(min(SMOOTH_WINDOW, len(y)))
+    within = np.flatnonzero(sm[lo:] <= sm[j] + se_sm)
+    j1 = lo + int(within[0]) if within.size else j
+    return j, j1, sm
+
+
 def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, float]]:
     """Derive every per-run number from one run's per-epoch metric curve.
 
@@ -387,14 +491,85 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
     }
     for c in range(5):
         out[f"pred_loa{c}"] = at(f"pred_loa{c}", 0.0)
+
+    # POST-ADAPTATION curve, when the trainer was run with --adapt-eval. Reduced
+    # by the SAME rule as the unadapted one (reduce_curve), so `--rank-on` picks
+    # between two comparable quantities rather than two different procedures.
+    #
+    # `adapt_at_best` is the adapted score at the epoch the UNADAPTED curve
+    # selects; `smoothed_best_adapt_mae` is the adapted score at the epoch the
+    # ADAPTED curve selects. The gap between them is the whole argument for
+    # switching criteria - if it is ~0 the change is cosmetic, and if it is large
+    # then E* chosen on the unadapted curve is landing in the wrong place.
+    out["init_adapt_set_mae"] = _f(rows[-1].get("init_adapt_set_mae"))
+    out["init_adapt_set_acc"] = _f(rows[-1].get("init_adapt_set_acc"))
+    adapt = np.array([float(r.get("adapt_set_mae", "nan") or "nan") for r in rows])
+    out["adapt_at_best"] = float(adapt[j]) if np.isfinite(adapt[j]) else float("nan")
+    if np.isfinite(adapt).sum() >= 2:
+        finite = np.isfinite(adapt)
+        # Non-finite epochs (a driver too short for any K) would poison the
+        # smoother, so reduce over the finite prefix and map the index back.
+        idx = np.flatnonzero(finite)
+        ja, j1a, sma = reduce_curve(adapt[idx], min_select_epoch)
+        out["smoothed_best_adapt_mae"] = float(sma[ja])
+        out["best_adapt_mae"] = float(np.nanmin(adapt))
+        out["best_epoch_smoothed_adapt"] = int(rows[idx[ja]]["epoch"])
+        out["best_epoch_1se_adapt"] = int(rows[idx[j1a]]["epoch"])
+        out["adapt_acc_at_best_adapt"] = float(
+            rows[idx[ja]].get("adapt_set_acc", "nan") or "nan")
+        out["adapt_n_drivers"] = float(rows[idx[ja]].get("adapt_n_drivers", 0) or 0)
+        # Per-K values are read AT THE ADAPT-SELECTED EPOCH, not at their own
+        # per-K minima: the run ships one epoch, so the K curve has to be the
+        # cross-section of that epoch. Taking each K's own best would describe a
+        # model that never existed.
+        best_row = rows[idx[ja]]
+        for col, val in best_row.items():
+            if col.startswith("adapt_set_mae_k"):
+                out[f"adapt_mae_k{col.rsplit('_k', 1)[1]}"] = _f(val)
+            elif col.startswith("adapt_set_acc_k"):
+                out[f"adapt_acc_k{col.rsplit('_k', 1)[1]}"] = _f(val)
+    else:
+        for k in ("smoothed_best_adapt_mae", "best_adapt_mae",
+                  "adapt_acc_at_best_adapt"):
+            out[k] = float("nan")
+        out["best_epoch_smoothed_adapt"] = -1
+        out["best_epoch_1se_adapt"] = -1
+        out["adapt_n_drivers"] = 0.0
     return out
+
+
+def watchdog(stop: threading.Event, interval: float, stall_after: float) -> None:
+    """Print what is still running, periodically, until ``stop`` is set.
+
+    Without this a sweep is silent between completions. ``run_one`` captures the
+    child's output, so a run that hangs produces NO output at all -- and at
+    --jobs 4 a single stuck worker quietly removes a quarter of the throughput
+    with nothing in the log to show for it. That is not hypothetical now that
+    --adapt-eval makes a legitimate run take ~20 minutes: "slow" and "wedged"
+    look identical from outside.
+
+    Reports elapsed time per in-flight run and marks anything past
+    ``stall_after`` as STALLED. Daemon thread, so it can never hold up exit.
+    """
+    while not stop.wait(interval):
+        with _INFLIGHT_LOCK:
+            snapshot = sorted(_INFLIGHT.items(), key=lambda kv: kv[1])
+        if not snapshot:
+            continue
+        now = time.time()
+        parts = []
+        for tag, t0 in snapshot:
+            el = now - t0
+            parts.append(f"{tag} {el / 60:.1f}m" + (" STALLED?" if el > stall_after else ""))
+        print(f"[heartbeat] {len(snapshot)} run(s) in flight: " + " | ".join(parts),
+              flush=True)
 
 
 def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed: int,
             epochs: int, patience: int, min_delta: float, min_select_epoch: int,
             window_seconds: float, loss: str, workdir: pathlib.Path,
             extra: List[str], cache: str = "",
-            threads: int = 0) -> Optional[Dict[str, float]]:
+            threads: int = 0, timeout: float = 0.0) -> Optional[Dict[str, float]]:
     """One training run. Returns its curve summary, or None if it failed.
 
     Runs train_XLSTM as a SUBPROCESS rather than importing it: each run needs a
@@ -452,7 +627,22 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
         for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                     "NUMEXPR_NUM_THREADS"):
             env[var] = str(threads)
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    # Registered for the watchdog BEFORE the child starts and removed in `finally`,
+    # so a crash cannot leave a phantom entry reported as stalled forever.
+    with _INFLIGHT_LOCK:
+        _INFLIGHT[tag] = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                              timeout=(timeout if timeout and timeout > 0 else None))
+    except subprocess.TimeoutExpired:
+        # subprocess.run has already killed the child by the time this is raised.
+        print(f"  [TIMEOUT] {tag} exceeded --run-timeout ({timeout:.0f}s) and was killed. "
+              f"Its row is NOT recorded, so re-running the same command retries it.",
+              flush=True)
+        return None
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.pop(tag, None)
     if proc.returncode != 0:
         print(f"  [FAIL] {tag} (exit {proc.returncode})")
         print("  " + "\n  ".join(proc.stderr.strip().splitlines()[-8:]))
@@ -469,9 +659,10 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
     return stats
 
 
-def resummarize(results_csv: pathlib.Path, workdir: pathlib.Path,
+def resummarize(results_csv: pathlib.Path, workdir: pathlib.Path,  # noqa: D401
                 labels: Dict[str, List[List[int]]], min_select_epoch: int,
-                window_seconds: float, loss: str) -> None:
+                window_seconds: float, loss: str,
+                adapt_ks: Optional[List[int]] = None) -> None:
     """Recompute every derived column from the RETAINED per-epoch curves.
 
     Why this exists: everything that changed about E* — the --min-select-epoch
@@ -543,7 +734,7 @@ def resummarize(results_csv: pathlib.Path, workdir: pathlib.Path,
         r.update(fold_baseline(labels, vp))
         n_ok += 1
 
-    fields = list(RESULTS_COLUMNS)
+    fields = list(results_columns(adapt_ks))
     for extra in (c for c in rows[0] if c not in fields):
         fields.append(extra)
     tmp = results_csv.with_suffix(".csv.tmp")
@@ -598,6 +789,37 @@ def main() -> None:
     ap.add_argument("--folds", default="",
                     help="Comma-separated fold indices to run (default: all 6). For "
                          "splitting the sweep across machines.")
+    ap.add_argument("--adapt-eval", dest="adapt_eval", action="store_true",
+                    help="Score every epoch AFTER per-driver adaptation as well, and make "
+                         "that the ranking quantity (implies --rank-on adapt_set_mae unless "
+                         "overridden). WHY: the population model is never served unadapted, "
+                         "so the default criterion optimizes a proxy the design has already "
+                         "declared is not the objective - and on this cohort it is "
+                         "NOT RESOLVABLE anyway (config spread 0.023 <= 2 SE 0.026 for "
+                         "corn_w10), so the tie-break is doing the selecting. "
+                         "xlstm_maml.evaluate_adaptation and sweep_l2sp_tau already select "
+                         "post-adaptation; this makes stage 1 agree with them. Both numbers "
+                         "are always written, so a run can be re-ranked either way with "
+                         "--resummarize --rank-on <column>.")
+    ap.add_argument("--adapt-k", dest="adapt_k",
+                    default=",".join(str(k) for k in DEFAULT_ADAPT_KS),
+                    help="Support sizes for --adapt-eval, averaged WITHIN driver then across "
+                         "drivers to give the ranking quantity. Pre-commit this grid: the "
+                         "metric is a curve and the aggregation must not be chosen after "
+                         "seeing the result. Each K is ALSO carried into sweep_results.csv "
+                         "individually (adapt_mae_k<K>/adapt_acc_k<K>, taken at the "
+                         "adapt-selected epoch), so the quality-vs-K SHAPE survives and a "
+                         "config that wins on the mean while losing at small K is visible. "
+                         "Cost is linear in the grid size: ~3.1 s per (driver, K) cell.")
+    ap.add_argument("--adapt-tau", dest="adapt_tau", type=float, default=2.0,
+                    help="PROVISIONAL L2-SP prior precision for --adapt-eval. The committed "
+                         "tau comes from stage 3, which depends on this stage's output - so "
+                         "fix it here, disclose it, and verify at stage 3 that the winning "
+                         "config is not tau-sensitive.")
+    ap.add_argument("--rank-on", dest="rank_on",
+                    choices=["set_mae", "adapt_set_mae"], default=None,
+                    help="Which column summarize() ranks configurations and derives E* from. "
+                         "Defaults to adapt_set_mae when --adapt-eval is set, else set_mae.")
     ap.add_argument("--trainer-arg", dest="trainer_args", action="append", default=[],
                     help="Extra flag passed through to train_XLSTM, repeatable, e.g. "
                          "--trainer-arg=--grad-clip --trainer-arg=0.5")
@@ -619,6 +841,20 @@ def main() -> None:
                     help="Torch intra-op threads per run (0 = auto: cpu_count // jobs, "
                          "floored at 1). Set as an environment variable on the child, since "
                          "torch sizes its pool at import.")
+    ap.add_argument("--heartbeat-seconds", dest="heartbeat_seconds", type=float, default=300.0,
+                    help="How often to print the in-flight runs and their elapsed time "
+                         "(0 = never). run_one captures the child's output, so without this "
+                         "a sweep is silent between completions and a hung run looks exactly "
+                         "like a slow one.")
+    ap.add_argument("--stall-warn-seconds", dest="stall_warn_seconds", type=float, default=2400.0,
+                    help="Elapsed time after which the heartbeat marks a run STALLED? "
+                         "Advisory only - nothing is killed. Default 40 min, comfortably "
+                         "above a legitimate --adapt-eval run (~20 min at 7 K values).")
+    ap.add_argument("--run-timeout", dest="run_timeout", type=float, default=0.0,
+                    help="Kill a training subprocess after this many seconds (0 = never). "
+                         "The killed run is not recorded, so re-running the sweep retries "
+                         "just that cell. Off by default: a timeout tuned for one machine "
+                         "silently truncates a slower one.")
     ap.add_argument("--cache", default="",
                     help="Pre-encoded segment cache (.npz), passed through to the trainer. "
                          "Build with scripts/build_segment_cache.py. Saves ~24 s per run "
@@ -627,6 +863,20 @@ def main() -> None:
                          "tens of MB. Must match --window-seconds; the trainer errors on a "
                          "stale or mismatched cache rather than silently re-parsing.")
     args = ap.parse_args()
+
+    # --adapt-eval is surfaced as a first-class flag rather than left to
+    # --trainer-arg, because the ranking column has to move with it. Composed
+    # here so the two cannot drift apart.
+    trainer_args = list(args.trainer_args)
+    if args.adapt_eval:
+        trainer_args += ["--adapt-eval", "--adapt-k", str(args.adapt_k),
+                         "--adapt-tau", str(args.adapt_tau)]
+    rank_on = args.rank_on or ("adapt_set_mae" if args.adapt_eval else "set_mae")
+    adapt_ks = sorted({int(k) for k in str(args.adapt_k).split(",") if k.strip()})
+    if rank_on == "adapt_set_mae" and not args.adapt_eval:
+        print("[warn] --rank-on adapt_set_mae without --adapt-eval: this only works on a "
+              "results CSV whose runs were trained with --adapt-eval; use --resummarize "
+              "to re-rank an existing one.")
     args.jobs = max(1, args.jobs)
     # At --jobs 1 leave torch's own default ALONE. os.cpu_count() reports LOGICAL
     # cores (16 here) while torch defaults to PHYSICAL (12), and 16 threads measured
@@ -658,8 +908,11 @@ def main() -> None:
     labels = load_segment_labels(pathlib.Path(args.in_jsonl))
     if args.resummarize:
         resummarize(results_csv, workdir, labels, args.min_select_epoch,
-                    args.window_seconds, args.loss)
-        summarize(results_csv, outdir)
+                    args.window_seconds, args.loss,
+                    adapt_ks if args.adapt_eval else None)
+        summarize(results_csv, outdir, rank_on, args.in_jsonl, adapt_ks,
+                  select_window=args.window_seconds, select_loss=args.loss,
+                  adapt_tau=args.adapt_tau if args.adapt_eval else None)
         return
     backfill_baselines(results_csv, labels)
 
@@ -675,11 +928,15 @@ def main() -> None:
         print(f"  fold {i}: val={list(VALIDATION_FOLDS[i])} "
               f"train={train_pids_for_validation_fold(VALIDATION_FOLDS[i])}")
 
+    # Header and every row are built from ONE list, derived from --adapt-k, so a
+    # change to the grid cannot leave them describing different things.
+    out_columns = results_columns(adapt_ks if args.adapt_eval else None)
+
     new = not results_csv.exists()
     fh = results_csv.open("a", encoding="utf-8", newline="")
     writer = csv.writer(fh)
     if new:
-        writer.writerow(RESULTS_COLUMNS)
+        writer.writerow(out_columns)
         fh.flush()
 
     # Flatten to a work list first, so --jobs can dispatch across configs rather
@@ -728,12 +985,19 @@ def main() -> None:
         return t, run_one(args.in_jsonl, dropout, lr, val_pids, seed,
                           args.epochs, args.patience, args.min_delta,
                           args.min_select_epoch, args.window_seconds,
-                          args.loss, workdir, args.trainer_args,
-                          cache=args.cache, threads=threads)
+                          args.loss, workdir, trainer_args,
+                          cache=args.cache, threads=threads,
+                          timeout=args.run_timeout)
 
     # Only THIS thread touches the writer, so the CSV needs no lock: the pool
     # workers just block on their subprocess and hand back the parsed curve.
     n_done = n_failed = 0
+    stop_hb = threading.Event()
+    hb = None
+    if args.heartbeat_seconds and args.heartbeat_seconds > 0:
+        hb = threading.Thread(target=watchdog, daemon=True,
+                              args=(stop_hb, args.heartbeat_seconds, args.stall_warn_seconds))
+        hb.start()
     ex = cf.ThreadPoolExecutor(max_workers=args.jobs)
     futs = {ex.submit(work, t): t for t in tasks}
     try:
@@ -763,7 +1027,7 @@ def main() -> None:
             # past a hard-coded [5:].
             writer.writerow([dropout, lr, args.window_seconds, args.loss, i,
                              "|".join(val_pids), seed] +
-                            [r[c] for c in RESULTS_COLUMNS[N_ID:]])
+                            [r.get(c, "") for c in out_columns[N_ID:]])
             fh.flush()
             print(f"[{n_done}/{len(tasks)}] dropout={dropout} lr={lr:g} "
                   f"fold={i}{val_pids} seed={seed}\n" + report(t, r), flush=True)
@@ -776,20 +1040,108 @@ def main() -> None:
               f"waiting for the {args.jobs} in flight to finish...", flush=True)
     finally:
         ex.shutdown(wait=True)
+        stop_hb.set()       # the watchdog is a daemon, but stop it deterministically
         fh.close()          # never left open: rows are flushed per-run, but the
                             # handle must not leak if the loop exits abnormally
     if n_failed:
         print(f"[warn] {n_failed} run(s) failed and were not recorded; re-run the same "
               f"command to retry just those (completed runs are skipped).")
-    summarize(results_csv, outdir)
+    summarize(results_csv, outdir, rank_on, args.in_jsonl, adapt_ks,
+              select_window=args.window_seconds, select_loss=args.loss,
+              adapt_tau=args.adapt_tau if args.adapt_eval else None)
 
 
-def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
-    """Rank configurations, pick the winner and E*, write selected_population.json."""
+def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
+              rank_on: str = "set_mae", label_path: str = "",
+              adapt_ks: Optional[List[int]] = None,
+              select_window: Optional[float] = None,
+              select_loss: Optional[str] = None,
+              adapt_tau: Optional[float] = None) -> None:
+    """Rank configurations, pick the winner and E*, write selected_population.json.
+
+    ``rank_on`` selects WHICH validation quantity decides both the winning
+    configuration and E*:
+
+    * ``set_mae`` (default, historical) - the UNADAPTED held-out-driver score.
+    * ``adapt_set_mae`` - the score after the deployed per-driver adaptation,
+      available only for runs trained with ``--adapt-eval``.
+
+    The second is the criterion that matches what the population model is FOR:
+    it is never served unadapted, and both ``xlstm_maml.evaluate_adaptation``
+    and ``sweep_l2sp_tau`` already select on their own post-adaptation numbers.
+    Switching changes E* as well as the ranking, which is the point - the epoch
+    that minimizes source error need not be the one that adapts best, and stage 2
+    consumes E* with no validation set of its own to catch a bad value.
+
+    Both column sets are always written, so a completed sweep can be re-ranked
+    either way without retraining.
+
+    ``label_path``/``adapt_ks`` are needed only for ``adapt_set_mae``, to rebuild
+    the matched per-driver floor (``adapt_fold_baseline``).
+
+    ``select_window``/``select_loss`` RESTRICT which configurations may win. A
+    results file is allowed to hold several (window_seconds, loss) groups — the
+    ``--window-seconds`` and ``--loss`` flags advertise that a corn and a ce sweep,
+    or a 5 s and a 20 s sweep, can share one ``--outdir`` without their artifacts
+    colliding. They do not collide, but they are DIFFERENT EXPERIMENTS, and ranking
+    them against each other picks the easier group rather than the better
+    configuration. Without these arguments a mixed file therefore refuses to
+    produce ``selected_population.json`` instead of silently crowning a winner
+    from the wrong group. The full table is always printed either way.
+    """
+    # DEFAULT_ADAPT_KS, never a second literal: the floor must be computed on the
+    # same grid the runs adapted on.
+    adapt_ks = list(adapt_ks) if adapt_ks else list(DEFAULT_ADAPT_KS)
     rows = list(csv.DictReader(results_csv.open("r", encoding="utf-8", newline="")))
     if not rows:
         print("[summary] no completed runs yet")
         return
+    # The three columns that move together with the ranking quantity. Derived
+    # once here so a caller cannot rank on one column and read E* off another.
+    if rank_on == "adapt_set_mae":
+        rank_col, argmin_col, one_se_col = ("smoothed_best_adapt_mae",
+                                            "best_epoch_smoothed_adapt",
+                                            "best_epoch_1se_adapt")
+    else:
+        rank_col, argmin_col, one_se_col = ("smoothed_best_set_mae",
+                                            "best_epoch_smoothed", "best_epoch_1se")
+    # ALL THREE columns are validated, not just the ranking one. They move
+    # together by design, and filtering on rank_col alone left `float(r[argmin_col])`
+    # below to raise on a row that had the score but not the epoch — after the whole
+    # sweep had finished, which is the worst possible moment to lose the summary.
+    def _complete(r: dict) -> bool:
+        return all(str(r.get(c, "")).strip() not in ("", "nan", "None")
+                   for c in (rank_col, argmin_col, one_se_col))
+
+    usable = [r for r in rows if _complete(r)]
+    if not usable:
+        print(f"[summary] no runs carry a complete {rank_col}/{argmin_col}/{one_se_col} "
+              f"triple. Runs must be trained with --adapt-eval before "
+              f"--rank-on adapt_set_mae can be used.")
+        return
+    if len(usable) < len(rows):
+        print(f"[summary] {len(rows) - len(usable)} run(s) are missing one of "
+              f"{rank_col}/{argmin_col}/{one_se_col} and are excluded.")
+    rows = usable
+    print(f"[summary] ranking on {rank_col}")
+
+    # Floors for the adapted ranking, keyed by fold. Recomputed from the label
+    # file rather than read from the CSV: the per-driver constant depends on the
+    # K grid, which is a property of the summarize call, not of the run.
+    adapt_floors: Dict[str, float] = {}
+    if rank_on == "adapt_set_mae" and label_path:
+        try:
+            lab = load_segment_labels(pathlib.Path(label_path))
+            for r in rows:
+                vp = r.get("val_pids", "")
+                if vp and vp not in adapt_floors:
+                    adapt_floors[vp] = adapt_fold_baseline(
+                        lab, [x for x in vp.split("|") if x], adapt_ks)
+        except Exception as exc:            # a missing label file must not kill the summary
+            print(f"[summary][warn] could not compute the per-driver adaptation floor "
+                  f"({exc}); falling back to the GLOBAL constant, which is the wrong "
+                  f"reference for an adapted score - read 'vs const' with that in mind.")
+
     by_cfg: Dict[Tuple[float, float], List[dict]] = {}
     for r in rows:
         try:
@@ -801,18 +1153,18 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
 
     print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'sd':>6} {'se':>6} "
           f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11} {'const':>8} {'vs const':>8}"
-          f"   (smoothed val set-MAE)")
+          f"   (smoothed val {'ADAPTED ' if rank_on == 'adapt_set_mae' else ''}set-MAE)")
     table = []
     for (dropout, lr, win, lss), rs in sorted(
             by_cfg.items(), key=lambda kv: (str(kv[0][3]), kv[0][0], kv[0][1],
                                             -1e9 if kv[0][2] != kv[0][2] else kv[0][2])):
-        v = np.array([float(r["smoothed_best_set_mae"]) for r in rs])
-        e_arg = np.array([float(r["best_epoch_smoothed"]) for r in rs])
+        v = np.array([float(r[rank_col]) for r in rs])
+        e_arg = np.array([float(r[argmin_col]) for r in rs])
         # Older CSVs (written before the 1-SE rule) lack the column; fall back to
         # the argmin so a partially-completed sweep still summarizes rather than
         # crashing — but say so, because the two are not interchangeable.
-        if all("best_epoch_1se" in r and r["best_epoch_1se"] != "" for r in rs):
-            e_1se = np.array([float(r["best_epoch_1se"]) for r in rs])
+        if all(one_se_col in r and r[one_se_col] != "" for r in rs):
+            e_1se = np.array([float(r[one_se_col]) for r in rs])
         else:
             print("[warn] some rows predate the 1-SE rule; falling back to argmin epochs "
                   "for this config. Delete sweep_results.csv and re-run for a clean E*.")
@@ -827,8 +1179,14 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
                       "e_iqr": (int(q1), int(q3))})
         # Mean of the per-fold constant floors the runs of this config were
         # measured against, so "mean" and "const" are on the same footing.
-        cb = [float(r["const_set_mae"]) for r in rs
-              if r.get("const_set_mae") not in (None, "")]
+        if rank_on == "adapt_set_mae" and adapt_floors:
+            # Matched floor: per-driver constant on the same support the model
+            # adapted on. Never the global constant - see adapt_fold_baseline.
+            cb = [adapt_floors[r.get("val_pids", "")] for r in rs
+                  if r.get("val_pids", "") in adapt_floors]
+        else:
+            cb = [float(r["const_set_mae"]) for r in rs
+                  if r.get("const_set_mae") not in (None, "")]
         table[-1]["const"] = float(np.mean(cb)) if cb else float("nan")
         table[-1]["delta"] = table[-1]["mean"] - table[-1]["const"]
         print(f"{lss:>5} {dropout:8.2f} {lr:7.0e} {win:6.4g} {len(v):4d} {v.mean():7.3f} "
@@ -836,30 +1194,73 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
               f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}"
               f" {table[-1]['const']:8.3f} {table[-1]['delta']:+8.3f}")
 
-    best = min(table, key=lambda t: t["mean"])
+    # Candidates for the WINNER — a subset of the printed table. Everything above
+    # is shown for context; only one (window, loss) group may be selected from.
+    groups = sorted({(t["window_seconds"], t["loss"]) for t in table},
+                    key=lambda g: (str(g[1]), -1e9 if g[0] != g[0] else g[0]))
+    if select_window is not None or select_loss is not None:
+        cand = [t for t in table
+                if (select_window is None
+                    or t["window_seconds"] == select_window
+                    or (t["window_seconds"] != t["window_seconds"]))   # NaN = pre-column row
+                and (select_loss is None or t["loss"] in (select_loss, "?"))]
+        if not cand:
+            print(f"\n[summary] no configuration matches window={select_window} "
+                  f"loss={select_loss}; groups present: {groups}. Nothing selected.")
+            return
+        if len(groups) > 1:
+            print(f"\n[summary] {len(groups)} (window, loss) group(s) present {groups}; "
+                  f"selecting within window={select_window} loss={select_loss} only.")
+    elif len(groups) > 1:
+        # Refusing beats guessing: this file mixes experiments, and whichever one
+        # happens to be easier would win on a metric that is not comparable across
+        # them. Re-run summarize with the group named, or split the --outdir.
+        print(f"\n[summary] REFUSING to select: {results_csv.name} holds "
+              f"{len(groups)} (window_seconds, loss) group(s) {groups}, which are "
+              f"different experiments and are not comparable on one metric. The table "
+              f"above is still valid per group. Pass select_window/select_loss (the CLI "
+              f"does this from --window-seconds/--loss) or give each group its own "
+              f"--outdir. No selected_population.json written.")
+        return
+    else:
+        cand = table
+
+    best = min(cand, key=lambda t: t["mean"])
     # Tie-break toward MORE regularization: within one standard error of the
     # winner, prefer the larger dropout (and then the smaller lr). Fixed in
     # advance so it is not a post-hoc choice, and it errs toward the model that
     # generalizes rather than the one that won a noisy comparison.
-    within = [t for t in table if t["mean"] <= best["mean"] + (best["se"] if best["se"] == best["se"] else 0.0)]
+    within = [t for t in cand if t["mean"] <= best["mean"] + (best["se"] if best["se"] == best["se"] else 0.0)]
     pick = max(within, key=lambda t: (t["dropout"], -t["lr"]))
     if pick is not best:
         print(f"\n[tie-break] {len(within)} config(s) within 1 SE of the minimum "
               f"({best['mean']:.3f} +/- {best['se']:.3f}); taking the most regularized")
 
+    # WHAT THIS RUN WAS SELECTED ON. These strings are read downstream —
+    # run_lodo_population greps `epochs_rule` for "1 SE" and warns if it is absent —
+    # so they are built from `rank_on` rather than hard-coded. They used to describe
+    # the unadapted criterion unconditionally, which made an --adapt-eval sweep
+    # write a record of a selection it had not performed.
+    metric_name = ("post-adaptation validation set-MAE" if rank_on == "adapt_set_mae"
+                   else "validation set-MAE")
     sel = {
         "dropout": pick["dropout"], "lr": pick["lr"],
+        # NOT hard-coded: a duplicate "loss": "corn" key below this line used to
+        # overwrite it, so every --loss ce sweep recorded itself as corn.
         "window_seconds": pick.get("window_seconds"), "loss": pick.get("loss"),
         "epochs": pick["e_star"],
-        "loss": "corn",
-        "epochs_rule": "median over runs of the earliest epoch within 1 SE of the smoothed minimum",
+        "rank_on": rank_on,
+        "epochs_rule": (f"median over runs of the earliest epoch within 1 SE of the "
+                        f"smoothed minimum of the {metric_name}"),
         "epochs_argmin_median": pick["e_argmin"],
         "epochs_1se_iqr": list(pick["e_iqr"]),
         # The LODO run trains on 11 drivers, this sweep on 10 -- ~10% more
         # segments, so ~10% more optimizer STEPS at the same epoch count. Recorded
         # so the transfer is visible rather than assumed.
         "n_train_drivers_at_selection": 10,
-        "selected_on": "mean smoothed validation set-MAE over 6 rotating folds x seeds",
+        "selected_on": (f"mean smoothed {metric_name} over "
+                        f"{len({r.get('val_pids', '') for r in rows})} rotating fold(s) "
+                        f"x {pick['n']} run(s) per configuration"),
         "mean_smoothed_val_set_mae": pick["mean"],
         "between_run_sd": pick["sd"], "se": pick["se"], "n_runs": pick["n"],
         "note": ("E* is the median across runs of the EARLIEST epoch within 1 SE of the "
@@ -873,13 +1274,30 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path) -> None:
                  "every driver (rotating folds) -- disclosed trade, identical for both "
                  "arms."),
     }
+    # WHICH floor `constant_floor_set_mae` holds. The key name is kept for
+    # compatibility with anything already reading it, but the value is a different
+    # quantity under the two criteria and the record has to say which.
+    sel["floor_kind"] = ("per-driver constant fitted on the K-label adaptation support"
+                         if rank_on == "adapt_set_mae" and adapt_floors
+                         else "global constant prediction on the validation drivers")
     sel["constant_floor_set_mae"] = pick.get("const", float("nan"))
     sel["vs_constant_floor"] = pick.get("delta", float("nan"))
     sel["beats_constant"] = bool(pick.get("delta", 0.0) < 0)
+    if rank_on == "adapt_set_mae":
+        # The adaptation settings are part of what was selected: a different K grid
+        # or tau is a different criterion, and E* is not transferable across them.
+        sel["adapt_k"] = list(adapt_ks)
+        sel["adapt_tau"] = adapt_tau
     out = outdir / "selected_population.json"
     out.write_text(json.dumps(sel, indent=2), encoding="utf-8")
+    # WHICH floor the warning is about. Under --rank-on adapt_set_mae the model
+    # has already been handed the driver's first K labels, so the reference is
+    # the per-driver constant those same labels buy for free — never the global
+    # constant, which is a different game (see adapt_fold_baseline).
+    floor_name = ("per-driver constant on the adaptation support"
+                  if rank_on == "adapt_set_mae" and adapt_floors else "constant prediction")
     if not sel["beats_constant"]:
-        print(f"\n[WARNING] the winning config does NOT beat a constant prediction "
+        print(f"\n[WARNING] the winning config does NOT beat a {floor_name} "
               f"({pick['mean']:.3f} vs {pick.get('const', float('nan')):.3f}). On this "
               f"cohort that is a property of the task, not necessarily of the run: an "
               f"oracle per-FUNCTION constant scores 1.259 against a global constant's "
