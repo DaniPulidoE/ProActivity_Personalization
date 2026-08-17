@@ -234,20 +234,39 @@ def curve_for_driver(g: pd.DataFrame, pid: str, ks: Sequence[int], variant: str,
     return rows
 
 
-def summarize(rows: List[dict], ks: Sequence[int]) -> None:
-    df = pd.DataFrame(rows)
-    print(f"\n{'variant':<22}" + "".join(f"{'K=' + str(k):>9}" for k in ks) + f"{'mean':>9}")
+def _metric_table(df: pd.DataFrame, col: str, ks: Sequence[int],
+                  title: str, lower_is_better: bool) -> None:
+    """One variant x K table for ``col``.
+
+    Both metrics are printed because they disagree in a way that matters here.
+    set-MAE is the design's selection metric — LoA is ordinal, so off-by-1 is not
+    off-by-4 — while set-accuracy is the fraction of predictions the driver
+    actually marked acceptable, which is the quantity the live study's
+    satisfaction rating is closest to. A lookup that is 0.5 levels out on average
+    but lands inside the accepted set half the time reads very differently under
+    the two.
+    """
+    print(f"\n{title}   ({'lower' if lower_is_better else 'HIGHER'} is better)")
+    print(f"{'variant':<22}" + "".join(f"{'K=' + str(k):>9}" for k in ks) + f"{'mean':>9}")
     for variant in VARIANTS:
         sub = df[df["variant"] == variant]
-        if sub.empty:
+        if sub.empty or col not in sub:
             continue
-        cells = [sub[sub["k"] == k]["set_mae"].mean() for k in ks]
-        # Mean over K WITHIN driver first, then across drivers — drivers
-        # contribute unequal segment counts, so a flat mean over all cells would
-        # weight the long sessions.
-        per_driver = sub.groupby("pid")["set_mae"].mean()
+        # At a fixed K there is exactly one row per driver, so the per-K cell is
+        # already a per-driver mean. The `mean` column averages over K WITHIN
+        # each driver first and only then across drivers — drivers contribute
+        # unequal segment counts, so a flat mean over cells would weight the
+        # long sessions.
+        cells = [sub[sub["k"] == k][col].mean() for k in ks]
+        per_driver = sub.groupby("pid")[col].mean()
         print(f"{variant:<22}" + "".join(f"{c:>9.3f}" for c in cells)
               + f"{per_driver.mean():>9.3f}")
+
+
+def summarize(rows: List[dict], ks: Sequence[int]) -> None:
+    df = pd.DataFrame(rows)
+    _metric_table(df, "set_mae", ks, "set-MAE", lower_is_better=True)
+    _metric_table(df, "set_acc", ks, "set-ACCURACY", lower_is_better=False)
     fb = df[df["variant"] == "driver_function"]["n_fallback"].sum()
     tot = df[df["variant"] == "driver_function"]["n_val"].sum()
     print(f"\nunseen-function rate for driver_function: {fb}/{tot} "
