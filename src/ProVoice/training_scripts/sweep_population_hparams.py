@@ -871,6 +871,16 @@ def main() -> None:
     if args.adapt_eval:
         trainer_args += ["--adapt-eval", "--adapt-k", str(args.adapt_k),
                          "--adapt-tau", str(args.adapt_tau)]
+        # --adapt-eval IMPLIES --select-on adapt_set_mae. Without it the trainer's
+        # --patience and checkpointing key off the UNADAPTED curve while this
+        # script ranks and derives E* from the ADAPTED one: a run whose unadapted
+        # curve plateaus while its adapted curve is still improving gets stopped
+        # early, truncating the very curve the sweep reads. At ~43 s/epoch of
+        # adaptation that also throws away the expensive part of the run.
+        # Escape hatch: pass --trainer-arg=--select-on --trainer-arg=<col>
+        # explicitly and that wins, since argparse takes the LAST occurrence.
+        if not any(a.startswith("--select-on") for a in args.trainer_args):
+            trainer_args += ["--select-on", "adapt_set_mae"]
     rank_on = args.rank_on or ("adapt_set_mae" if args.adapt_eval else "set_mae")
     adapt_ks = sorted({int(k) for k in str(args.adapt_k).split(",") if k.strip()})
     if rank_on == "adapt_set_mae" and not args.adapt_eval:

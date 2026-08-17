@@ -146,6 +146,7 @@ def adapt_head_tensors(
     head_type: str = "corn",
     steps: int = DEFAULT_ADAPT_STEPS,
     lr: float = DEFAULT_ADAPT_LR,
+    adapt_params: str = "all",
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """Tensor-level adaptation: ``(w, b)`` in, adapted ``(w, b, info)`` out.
 
@@ -159,7 +160,27 @@ def adapt_head_tensors(
     adaptation, run at serving and at meta-VALIDATION, not a differentiable
     inner loop. ANIL's meta-training inner loop is ``xlstm_maml.inner_adapt``,
     which must keep its trajectory in the graph and therefore cannot be this.
+
+    ``adapt_params`` restricts WHICH head parameters move. ``'all'`` (the
+    default, and the only value any serving path uses) adapts the 256 weights
+    and 4 biases. ``'bias'`` freezes the weight at the anchor and adapts the 4
+    biases alone -- the diagnostic of ``docs/embedding_informativeness.md`` §4:
+    a bias-only head can slide the CORN thresholds along the ordinal scale
+    ("this driver prefers more/less autonomy") but cannot reorder segments, so
+    it is the per-driver constant expressed in the head. If it matches the full
+    head, personalization on this representation reduces to learning a level
+    offset and both study arms are tied by construction.
+
+    The variant lives HERE rather than in the analysis script on purpose: §4
+    requires ``tau``, ``steps`` and ``lr`` to be identical across the two, or
+    the comparison measures optimizer budget instead of expressiveness. Sharing
+    one optimizer is what makes that true by construction. With
+    ``adapt_params='all'`` the code path is unchanged from before this flag
+    existed -- the weight is still an AdamW parameter with the same init.
     """
+    if adapt_params not in ("all", "bias"):
+        raise ValueError(
+            f"adapt_params must be 'all' or 'bias', got {adapt_params!r}")
     if Z.ndim != 2 or V.ndim != 2 or Z.shape[0] != V.shape[0]:
         raise ValueError(
             f"adapt_head expects (K, d) embeddings and (K, n_classes) levels with "
@@ -180,12 +201,18 @@ def adapt_head_tensors(
     loss_fn = loss_for_head(head_type)
 
     anchor_w, anchor_b = w0.detach().clone(), b0.detach().clone()
-    w = anchor_w.clone().requires_grad_(True)
+    # Under 'bias' the weight stays EXACTLY at the anchor: it is excluded from
+    # the parameter list, so no optimizer state is created for it and its L2-SP
+    # term is the constant 0 rather than a decaying one. The objective is then
+    # the same function restricted to the bias subspace, at the same tau.
+    train_w = adapt_params == "all"
+    w = anchor_w.clone().requires_grad_(train_w)
     b = anchor_b.clone().requires_grad_(True)
+    params = [w, b] if train_w else [b]
     # weight_decay=0 is load-bearing: the L2-SP term below is the regularizer,
     # and an additional decay toward the ORIGIN would pull the head away from
     # the population anchor rather than toward it.
-    opt = torch.optim.AdamW([w, b], lr=lr, weight_decay=0.0)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
 
     def objective() -> torch.Tensor:
         pen = ((w - anchor_w) ** 2).sum() + ((b - anchor_b) ** 2).sum()
@@ -202,7 +229,7 @@ def adapt_head_tensors(
     final = objective()
     opt.zero_grad()
     final.backward()
-    grad_norm = float(torch.sqrt((w.grad ** 2).sum() + (b.grad ** 2).sum()))
+    grad_norm = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params)))
     opt.zero_grad()
 
     info = {
@@ -212,6 +239,8 @@ def adapt_head_tensors(
         "steps": int(steps),
         "lr": float(lr),
         "head_type": head_type,
+        "adapt_params": adapt_params,
+        "n_adapted": int(sum(p.numel() for p in params)),
         "final_loss": float(final.detach()),
         "grad_norm": grad_norm,
     }
@@ -227,6 +256,7 @@ def adapt_head(
     head_type: str = "corn",
     steps: int = DEFAULT_ADAPT_STEPS,
     lr: float = DEFAULT_ADAPT_LR,
+    adapt_params: str = "all",
 ) -> Tuple[nn.Linear, Dict[str, Any]]:
     """Adapt a copy of ``pop_head`` to one driver's support set. Deterministic.
 
@@ -241,6 +271,9 @@ def adapt_head(
         steps:     full-batch gradient steps. Fixed, K-independent, no selection.
         lr:        AdamW learning rate; weight_decay is 0 because L2-SP IS the
                    decay, anchored at theta_pop rather than at the origin.
+        adapt_params: 'all' (every serving path) or 'bias' (the 4 biases only,
+                   for the expressiveness diagnostic of
+                   docs/embedding_informativeness.md §4).
 
     Returns ``(head, info)``. ``info`` carries the realised ``l2sp`` (needed by
     the Laplace fit), the final objective value, and ``grad_norm`` — the norm of
@@ -253,7 +286,8 @@ def adapt_head(
         raise ValueError("adapt_head expects a Linear head WITH a bias term.")
     w, b, info = adapt_head_tensors(
         Z, V, pop_head.weight, pop_head.bias,
-        tau=tau, head_type=head_type, steps=steps, lr=lr)
+        tau=tau, head_type=head_type, steps=steps, lr=lr,
+        adapt_params=adapt_params)
     head = copy.deepcopy(pop_head)
     with torch.no_grad():
         head.weight.copy_(w)
