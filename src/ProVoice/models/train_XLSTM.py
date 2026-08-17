@@ -1,6 +1,6 @@
 # Usage: python -m ProVoice.train_XLSTM --in data/with_segments.jsonl --label-map data/labels.csv --out trained_models/state_xlstm.pt
 import argparse, csv, hashlib, json, pathlib, random
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -294,6 +294,12 @@ class SeqDataset(Dataset):
         assert 'segment_id' in df.columns and df['segment_id'].astype(bool).any(), "segment_id is required"
         self.context_length = context_length
         self.groups: List[Tuple[np.ndarray, np.ndarray]] = []
+        # Parallel to `groups`, one participantid per segment. Needed by the
+        # PER-DRIVER constant floor, which is the binding baseline under
+        # --split-mode within-driver: there every driver is in both halves, so
+        # "always predict this driver's own favourite level" is available for
+        # free and a model has to beat THAT, not the global constant.
+        self.pids: List[str] = []
         skipped = []
         for gid, g in df.groupby('segment_id'):
             g = g.reset_index(drop=True)
@@ -317,6 +323,7 @@ class SeqDataset(Dataset):
             # achieve. None/0 = encode the raw frames (pre-resampling behaviour).
             X = encode_and_resample(rows, resample_hz, window_seconds)
             self.groups.append((X, lvl))
+            self.pids.append(str(g[SPLIT_VARIABLE].iloc[0]) if SPLIT_VARIABLE in g.columns else "")
             if log_fh is not None:
                 log_encoded_frames(log_fh, split, str(gid), X, levels=lvl)
         if skipped:
@@ -339,6 +346,7 @@ class SeqDataset(Dataset):
         obj = cls.__new__(cls)
         obj.context_length = context_length
         obj.groups = []
+        obj.pids = []
         x_flat, off, lv = cache["x_flat"], cache["offsets"], cache["levels"]
         for i, (sid, pid) in enumerate(zip(cache["segment_id"], cache["participantid"])):
             if pids is not None and str(pid) not in pids:
@@ -346,25 +354,112 @@ class SeqDataset(Dataset):
             if segment_ids is not None and str(sid) not in segment_ids:
                 continue
             obj.groups.append((x_flat[off[i]:off[i + 1]], lv[i]))
+            obj.pids.append(str(pid))
         return obj
 
     def __len__(self): return len(self.groups)
     def __getitem__(self, i): return self.groups[i]
 
 
+def within_driver_temporal_split(seg_order: Sequence[str], seg_pids: Sequence[str],
+                                 val_frac: float) -> Tuple[set, set]:
+    """Per driver: earliest ``1-val_frac`` of their segments train, latest tail val.
+
+    THIS IS A SUBJECT-DEPENDENT SPLIT and answers a different question from the
+    participant split. Every driver appears in BOTH halves, so a model may
+    legitimately exploit driver identity — which on this cohort is worth far more
+    MAE than the task itself (``constant_baseline``: knowing the driver buys
+    0.23, knowing the function 0.06) and is ~68 % recoverable from the state
+    features alone. Do NOT select the deployed configuration on it: the
+    population model is only ever served to drivers absent from its training set,
+    and ``sweep_population_hparams`` is the estimator for that.
+
+    What it IS for: telling apart "the features carry no LoA signal" from "the
+    signal is real but driver-specific and does not transfer". The cross-driver
+    sweep cannot separate those — both produce a model that loses to a constant —
+    and the answer decides whether the personalization arms are worth running.
+
+    Ordering is FIRST-APPEARANCE order in the source file, not a sort of
+    ``segment_id``: ids are ``<session_uuid>|win<idx>p<prompt>``, so sorting them
+    orders a driver's two sessions by UUID rather than by time. File order is
+    chronological within each driver (verified against the session start times in
+    ``user_loa_labels.csv``), which is what makes the tail a genuine FUTURE tail.
+
+    No ``seed`` argument, deliberately: the split is a deterministic function of
+    the data, so seeds vary only initialization, dropout and batch order. Every
+    seed of every configuration sees the identical split.
+    """
+    if len(seg_order) != len(seg_pids):
+        raise ValueError(f"seg_order ({len(seg_order)}) and seg_pids ({len(seg_pids)}) "
+                         "must be parallel; the caller built them from different sources.")
+    if not 0.0 < val_frac < 1.0:
+        raise ValueError(f"--val-frac must be in (0, 1), got {val_frac}")
+    by_pid: Dict[str, List[str]] = {}
+    for sid, pid in zip(seg_order, seg_pids):
+        by_pid.setdefault(str(pid), []).append(str(sid))
+
+    tr_segs, te_segs = set(), set()
+    thin = []
+    for pid, segs in by_pid.items():
+        n = len(segs)
+        # Both halves must be non-empty or the driver silently leaves one side of
+        # the split, which is exactly the kind of per-driver imbalance that makes
+        # a pooled metric mean something other than it appears to.
+        n_val = min(max(1, int(round(val_frac * n))), n - 1) if n >= 2 else 0
+        if n_val == 0:
+            thin.append((pid, n))
+            tr_segs.update(segs)
+            continue
+        tr_segs.update(segs[:n - n_val])
+        te_segs.update(segs[n - n_val:])
+    if thin:
+        print(f"[split][warn] driver(s) with <2 segments got no validation tail: {thin}")
+    print(f"[split] WITHIN-DRIVER temporal: {len(by_pid)} driver(s), "
+          f"first {1 - val_frac:.0%} of each driver's segments train "
+          f"({len(tr_segs)}), last {val_frac:.0%} val ({len(te_segs)}). "
+          f"SUBJECT-DEPENDENT — diagnostic only, not a deployment estimate.")
+    return tr_segs, te_segs
+
+
 def choose_split(pid_order: List[str], seg_order: List[str], no_val: bool,
-                 val_pids_arg: str, seed: int) -> Tuple[Optional[set], Optional[set],
-                                                        Optional[set], Optional[set]]:
+                 val_pids_arg: str, seed: int,
+                 split_mode: str = "participant", val_frac: float = 0.2,
+                 seg_pids: Optional[Sequence[str]] = None,
+                 ) -> Tuple[Optional[set], Optional[set],
+                            Optional[set], Optional[set]]:
     """Decide the train/val split. Returns (tr_pids, te_pids, tr_segs, te_segs).
 
-    Exactly one pair is non-None: participant-level normally, segment-level only
-    in the single-participant fallback. Shared by the JSONL and cache paths so a
-    cached run and an uncached one at the same --seed cannot land on different
-    splits — which is why the cache stores FIRST-APPEARANCE order rather than the
-    sorted groupby order it would otherwise be natural to write.
+    Exactly one pair is non-None: participant-level normally, segment-level in
+    the single-participant fallback and under ``--split-mode within-driver``.
+    Shared by the JSONL and cache paths so a cached run and an uncached one at
+    the same --seed cannot land on different splits — which is why the cache
+    stores FIRST-APPEARANCE order rather than the sorted groupby order it would
+    otherwise be natural to write. That same ordering is what
+    ``within_driver_temporal_split`` relies on to build a temporal tail.
+
+    ``split_mode`` defaults to the participant behaviour this function has always
+    had, so every existing caller and command line is unaffected.
     """
     if not pid_order:
         raise ValueError(f"Split variable '{SPLIT_VARIABLE}' is missing from all rows.")
+    if split_mode not in ("participant", "within-driver"):
+        raise ValueError(f"unknown --split-mode {split_mode!r}")
+    if split_mode == "within-driver":
+        # --val-pids means "hold out THESE drivers", which within-driver
+        # contradicts by construction. Failing is better than silently honouring
+        # one and ignoring the other.
+        if val_pids_arg:
+            raise ValueError("--val-pids is a cross-driver hold-out and cannot be combined "
+                             "with --split-mode within-driver.")
+        if no_val:
+            print(f"[split] --no-val: training on ALL {len(pid_order)} participant(s), "
+                  f"no validation set, no epoch selection")
+            return set(str(p) for p in pid_order), set(), None, None
+        if seg_pids is None:
+            raise ValueError("--split-mode within-driver needs per-segment participant ids; "
+                             "the caller did not supply seg_pids.")
+        tr_segs, te_segs = within_driver_temporal_split(seg_order, seg_pids, val_frac)
+        return None, None, tr_segs, te_segs
     if no_val:
         print(f"[split] --no-val: training on ALL {len(pid_order)} participant(s), "
               f"no validation set, no epoch selection")
@@ -623,6 +718,59 @@ def constant_baseline(levels: np.ndarray, n_classes: int = 5) -> Dict[str, float
             "const_loa_acc": c_acc, "const_set_acc": float(accs[c_acc])}
 
 
+def per_driver_constant_baseline(train_levels: np.ndarray, train_pids: Sequence[str],
+                                 val_levels: np.ndarray, val_pids: Sequence[str],
+                                 n_classes: int = 5) -> Dict[str, float]:
+    """The floor under a SUBJECT-DEPENDENT split: "always predict this driver's
+    own favourite level", where the favourite is fitted on that driver's TRAIN
+    prefix and scored on their val tail.
+
+    ``constant_baseline`` — one level for the whole cohort — is the right floor
+    when the validation drivers are unseen, because their favourite level is not
+    knowable. Under ``--split-mode within-driver`` it is far too weak: the driver
+    IS in the training set, so a per-driver constant is available for free, needs
+    no features at all, and already buys ~0.23 MAE on this cohort. A model that
+    beats the global constant but not this one has learned WHO is driving and
+    nothing about WHEN they want autonomy — which is precisely the confusion the
+    within-driver split exists to expose, so it must be reported next to it.
+
+    Fitted on train and applied to val, NOT fitted on val: the latter is an
+    oracle no deployable rule could match. It is returned too, as
+    ``pdconst_oracle_set_mae``, because the gap between the two is how much of a
+    driver's preference is stable across their own session — a quantity the
+    personalization arms are ultimately betting on.
+    """
+    empty = {"pdconst_set_mae": float("nan"), "pdconst_set_acc": float("nan"),
+             "pdconst_oracle_set_mae": float("nan"), "pdconst_n_drivers": 0}
+    val_levels = np.asarray(val_levels)
+    train_levels = np.asarray(train_levels)
+    if val_levels.size == 0 or train_levels.size == 0:
+        return empty
+    train_pids = np.asarray([str(p) for p in train_pids])
+    val_pids = np.asarray([str(p) for p in val_pids])
+    if len(train_pids) != len(train_levels) or len(val_pids) != len(val_levels):
+        raise ValueError("levels and pids must be parallel")
+
+    def best_const(lv: np.ndarray) -> int:
+        n = lv.shape[0]
+        return int(np.argmin([set_mae(lv, np.full(n, c, dtype=int)) for c in range(n_classes)]))
+
+    # Fallback for a driver with no train rows: the global train constant, which
+    # is what a deployed system would have for a driver it has never adapted to.
+    global_c = best_const(train_levels)
+    pred = np.empty(len(val_levels), dtype=int)
+    pred_oracle = np.empty(len(val_levels), dtype=int)
+    for pid in np.unique(val_pids):
+        m_val = val_pids == pid
+        m_trn = train_pids == pid
+        pred[m_val] = best_const(train_levels[m_trn]) if m_trn.any() else global_c
+        pred_oracle[m_val] = best_const(val_levels[m_val])
+    return {"pdconst_set_mae": float(set_mae(val_levels, pred)),
+            "pdconst_set_acc": float(set_accuracy(val_levels, pred)),
+            "pdconst_oracle_set_mae": float(set_mae(val_levels, pred_oracle)),
+            "pdconst_n_drivers": int(len(np.unique(val_pids)))}
+
+
 def prepare_frame(df: pd.DataFrame, label_map: str | None) -> pd.DataFrame:
     """Apply the label map and coerce every model-input column to its own dtype.
 
@@ -674,10 +822,15 @@ def datasets_from_jsonl(args, resample_hz) -> Tuple[Any, Any]:
 
     # First-appearance order, which is what choose_split shuffles. The cache
     # stores the same order so the two paths split identically at a given --seed.
+    # segment_id and participantid come from ONE de-duplication so they stay
+    # parallel — within_driver_temporal_split reads them as a pair and asserts it.
+    seg_first = df.drop_duplicates('segment_id')
     tr_pids, te_pids, tr_segs, te_segs = choose_split(
         [str(p) for p in df[SPLIT_VARIABLE].drop_duplicates()],
-        [str(g) for g in df['segment_id'].drop_duplicates()],
-        args.no_val, args.val_pids, args.seed)
+        [str(g) for g in seg_first['segment_id']],
+        args.no_val, args.val_pids, args.seed,
+        split_mode=args.split_mode, val_frac=args.val_frac,
+        seg_pids=[str(p) for p in seg_first[SPLIT_VARIABLE]])
 
     def sel(pids, segs):
         if pids is not None:
@@ -723,8 +876,15 @@ def datasets_from_cache(args, resample_hz) -> Tuple[Any, Any]:
     if args.log_path:
         print("[log][warn] --log is ignored with --cache: the per-frame feature log is "
               "written during encoding, which the cache skips. Re-run without --cache.")
+    # seg_order is FIRST-APPEARANCE order; cache["segment_id"] is the sorted
+    # groupby order the encoder wrote. They are not the same list, so the pid
+    # lookup goes through a dict rather than positional zip.
+    pid_by_seg = {str(sid): str(pid) for sid, pid
+                  in zip(cache["segment_id"], cache["participantid"])}
     tr_pids, te_pids, tr_segs, te_segs = choose_split(
-        cache["pid_order"], cache["seg_order"], args.no_val, args.val_pids, args.seed)
+        cache["pid_order"], cache["seg_order"], args.no_val, args.val_pids, args.seed,
+        split_mode=args.split_mode, val_frac=args.val_frac,
+        seg_pids=[pid_by_seg.get(str(sid), "") for sid in cache["seg_order"]])
     train_ds = SeqDataset.from_cache(cache, args.context_length,
                                      pids=tr_pids, segment_ids=tr_segs)
     test_ds = ([] if args.no_val else
@@ -763,6 +923,29 @@ def main():
                          "6 folds must be reused across every config and seed or the "
                          "comparison is confounded by which drivers each config was "
                          "validated on. Ignored when --no-val is set.")
+    ap.add_argument("--split-mode", dest="split_mode",
+                    choices=["participant", "within-driver"], default="participant",
+                    help="WHICH GENERALIZATION QUESTION the validation set asks. "
+                         "'participant' (default, unchanged): held-out DRIVERS — the "
+                         "deployment condition, since the population model is only ever "
+                         "served to drivers absent from its training set. This is what "
+                         "sweep_population_hparams uses and what the configuration, window "
+                         "and loss must be SELECTED on. "
+                         "'within-driver': every driver appears in both halves, split "
+                         "temporally at --val-frac (earliest segments train, latest tail "
+                         "val). SUBJECT-DEPENDENT and deliberately leaky — driver identity "
+                         "is ~68 % recoverable from the state features and is worth ~4x "
+                         "more MAE than the task, so a model here may score well by "
+                         "learning who is driving. Its purpose is DIAGNOSTIC: it separates "
+                         "'the features carry no LoA signal' from 'the signal is real but "
+                         "does not transfer across drivers', which the cross-driver sweep "
+                         "cannot do because both look identical there. Never select a "
+                         "shipped configuration on it.")
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+                    help="Validation tail fraction per driver under --split-mode "
+                         "within-driver. Ignored in 'participant' mode, where the "
+                         "validation set is a set of DRIVERS, not a fraction of each "
+                         "driver's timeline.")
     ap.add_argument("--no-val", dest="no_val", action="store_true",
                     help="Train on EVERY participant in the input with no validation set, no "
                          "per-epoch evaluation and no best-epoch selection; the final-epoch "
@@ -1042,6 +1225,11 @@ def main():
     # metrics row so a downstream reader never has to re-derive it.
     base = {"const_loa_mae": -1, "const_set_mae": float("nan"),
             "const_loa_acc": -1, "const_set_acc": float("nan")}
+    # Only meaningful when the val drivers are also train drivers, i.e. under
+    # --split-mode within-driver. Left as NaN in participant mode, where a
+    # per-driver constant is not knowable for an unseen driver.
+    pdbase = {"pdconst_set_mae": float("nan"), "pdconst_set_acc": float("nan"),
+              "pdconst_oracle_set_mae": float("nan"), "pdconst_n_drivers": 0}
     # The TRAINING drivers' label marginal — the distribution the model is
     # rewarded for reproducing. Printed next to the validation marginal because
     # the gap between them is the whole story on this cohort: a model whose
@@ -1060,6 +1248,18 @@ def main():
               f"set-acc={base['const_set_acc']:.3f} @LoA{base['const_loa_acc']} "
               f"(val_n={len(val_levels)}) — a model above that MAE is losing to "
               f"'always predict one level'")
+        if args.split_mode == "within-driver":
+            train_levels = np.stack([lvl for _, lvl in train_ds.groups], axis=0)
+            pdbase = per_driver_constant_baseline(
+                train_levels, train_ds.pids, val_levels, test_ds.pids, 5)
+            print(f"[baseline] best PER-DRIVER constant (fitted on each driver's train "
+                  f"prefix, scored on their val tail): set-MAE={pdbase['pdconst_set_mae']:.3f} | "
+                  f"set-acc={pdbase['pdconst_set_acc']:.3f} "
+                  f"({pdbase['pdconst_n_drivers']} drivers; oracle-on-val "
+                  f"{pdbase['pdconst_oracle_set_mae']:.3f}) — THIS is the floor that binds "
+                  f"under --split-mode within-driver. Beating the global constant but not "
+                  f"this one means the model learned WHO is driving, not WHEN they want "
+                  f"autonomy.")
 
     metrics_fh = None
     metrics_writer = None
@@ -1070,6 +1270,12 @@ def main():
         metrics_writer.writerow(["epoch", "set_acc", "macro_f1", "set_mae", "qwk", "lr", "val_n",
                                  "const_set_mae", "const_loa_mae",
                                  "const_set_acc", "const_loa_acc",
+                                 # NaN unless --split-mode within-driver; see
+                                 # per_driver_constant_baseline for why this is
+                                 # the binding floor there and the global
+                                 # constant is not.
+                                 "pdconst_set_mae", "pdconst_set_acc",
+                                 "pdconst_oracle_set_mae", "pdconst_n_drivers",
                                  # Both decoders every epoch: the CE-vs-CORN
                                  # comparison is only interpretable if the
                                  # decoder can be held fixed post hoc.
@@ -1173,6 +1379,8 @@ def main():
             metrics_writer.writerow([ep, sacc, mf1, err, kappa, cur_lr, len(Yp),
                                      base["const_set_mae"], base["const_loa_mae"],
                                      base["const_set_acc"], base["const_loa_acc"],
+                                     pdbase["pdconst_set_mae"], pdbase["pdconst_set_acc"],
+                                     pdbase["pdconst_oracle_set_mae"], pdbase["pdconst_n_drivers"],
                                      mae_arg, acc_arg, mae_med, acc_med,
                                      *pred_hist.tolist(),
                                      init.get("mae", float("nan")),
