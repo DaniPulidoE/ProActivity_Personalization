@@ -182,6 +182,12 @@ SEGMENT_CACHE_VERSION = 1
 # Minimum query segments a (driver, K) cell needs before --adapt-eval scores it.
 # A two-segment tail is noise; skipping is better than averaging noise in.
 _ADAPT_MIN_QUERY = 20
+# Fixed evaluation tail for --adapt-eval, REPORTED ALONGSIDE the suffix metric and
+# never used for selection. The suffix query segs[K:] moves with K, so a curve over
+# K confounds "more support" with "different test set"; the last N segments hold the
+# query still so K is the only thing varying. 30 keeps all 12 drivers usable to
+# K=64 (shortest has 94 segments). 0 disables.
+_ADAPT_EVAL_TAIL = 30
 
 
 def cache_name(window_seconds: float, resample_hz: float) -> str:
@@ -1382,6 +1388,11 @@ def main():
                                  # NaN unless --adapt-eval.
                                  "adapt_set_mae", "adapt_set_acc",
                                  "adapt_n_drivers", "adapt_n_cells",
+                                 # FIXED-TAIL query, reported only. Levels are NOT
+                                 # comparable with the suffix columns -- different
+                                 # test set. Shapes across K are.
+                                 "adapt_set_mae_tail", "adapt_set_acc_tail",
+                                 "adapt_n_drivers_tail",
                                  # Untrained backbone + adapted head. Constant
                                  # per run, repeated per row like init_set_mae.
                                  "init_adapt_set_mae", "init_adapt_set_acc"]
@@ -1438,7 +1449,9 @@ def main():
         that silently evaluated almost nothing is visible in the CSV.
         """
         empty = {"adapt_set_mae": float("nan"), "adapt_set_acc": float("nan"),
-                 "adapt_n_drivers": 0, "adapt_n_cells": 0}
+                 "adapt_n_drivers": 0, "adapt_n_cells": 0,
+                 "adapt_set_mae_tail": float("nan"), "adapt_set_acc_tail": float("nan"),
+                 "adapt_n_drivers_tail": 0}
         for _k in adapt_ks:
             empty[f"adapt_set_mae_k{_k}"] = float("nan")
             empty[f"adapt_set_acc_k{_k}"] = float("nan")
@@ -1452,6 +1465,10 @@ def main():
 
         w0, b0 = model.head.weight.detach().cpu(), model.head.bias.detach().cpu()
         per_driver_mae, per_driver_acc, n_cells = [], [], 0
+        # Fixed-tail scores, from the SAME adapted heads. Reported only — the
+        # selection quantity stays the suffix metric so --select-on keeps meaning
+        # what it meant, and so this cannot silently change what ships.
+        per_driver_mae_tail, per_driver_acc_tail = [], []
         # by_k[K] collects one score per DRIVER at that K, so the per-K column is
         # a mean over drivers — the same footing as the aggregate, just without
         # the mean over K. Aggregating cells instead would weight drivers by how
@@ -1464,10 +1481,17 @@ def main():
             # would actually have. Unknown ids sort last rather than raising.
             order = sorted(where, key=lambda i: chrono.get(sids[i], len(chrono) + i))
             maes, accs = [], []
+            maes_t, accs_t = [], []
             for K in adapt_ks:
                 if len(order) < K + _ADAPT_MIN_QUERY:
                     continue
                 sup, qry = order[:K], order[K:]
+                # Disjoint from the support or it would be scored on its own
+                # training data; a driver too short at this K just misses the
+                # tail metric and still contributes to the suffix one.
+                tail = (order[-_ADAPT_EVAL_TAIL:]
+                        if _ADAPT_EVAL_TAIL > 0 and K + _ADAPT_EVAL_TAIL <= len(order)
+                        else None)
                 w, b, _info = adapt_head_tensors(
                     Z[sup], V[sup], w0, b0, tau=args.adapt_tau, head_type=head_type,
                     steps=args.adapt_steps, lr=args.adapt_lr)
@@ -1481,14 +1505,30 @@ def main():
                 by_k_mae[K].append(m_k)
                 by_k_acc[K].append(a_k)
                 n_cells += 1
+                if tail is not None:
+                    with torch.no_grad():
+                        pt = logits_to_probs(torch.nn.functional.linear(Z[tail], w, b),
+                                             head_type)
+                        predt = probs_to_label(pt, head_type).cpu().numpy()
+                    lvt = V[tail].numpy()
+                    maes_t.append(set_mae(lvt, predt))
+                    accs_t.append(set_accuracy(lvt, predt))
             if maes:
                 per_driver_mae.append(float(np.mean(maes)))
                 per_driver_acc.append(float(np.mean(accs)))
+            if maes_t:
+                per_driver_mae_tail.append(float(np.mean(maes_t)))
+                per_driver_acc_tail.append(float(np.mean(accs_t)))
         if not per_driver_mae:
             return empty
         out = {"adapt_set_mae": float(np.mean(per_driver_mae)),
                "adapt_set_acc": float(np.mean(per_driver_acc)),
-               "adapt_n_drivers": len(per_driver_mae), "adapt_n_cells": n_cells}
+               "adapt_n_drivers": len(per_driver_mae), "adapt_n_cells": n_cells,
+               "adapt_set_mae_tail": (float(np.mean(per_driver_mae_tail))
+                                      if per_driver_mae_tail else float("nan")),
+               "adapt_set_acc_tail": (float(np.mean(per_driver_acc_tail))
+                                      if per_driver_acc_tail else float("nan")),
+               "adapt_n_drivers_tail": len(per_driver_mae_tail)}
         for k in adapt_ks:
             out[f"adapt_set_mae_k{k}"] = (float(np.mean(by_k_mae[k])) if by_k_mae[k]
                                           else float("nan"))
@@ -1599,6 +1639,7 @@ def main():
             print(f"           ADAPTED (K={','.join(str(k) for k in adapt_ks)}, "
                   f"tau={args.adapt_tau:g}): set-MAE={ad['adapt_set_mae']:.3f} "
                   f"set-acc={ad['adapt_set_acc']:.3f} "
+                  f"| tail={ad['adapt_set_mae_tail']:.3f} "
                   f"({ad['adapt_n_drivers']} driver(s), {ad['adapt_n_cells']} cell(s))"
                   f"{'   <-- SELECTED ON' if args.select_on == 'adapt_set_mae' else ''}")
         if metrics_writer is not None:
@@ -1614,6 +1655,8 @@ def main():
                                      int(ep >= args.min_select_epoch),
                                      ad["adapt_set_mae"], ad["adapt_set_acc"],
                                      ad["adapt_n_drivers"], ad["adapt_n_cells"],
+                                     ad["adapt_set_mae_tail"], ad["adapt_set_acc_tail"],
+                                     ad["adapt_n_drivers_tail"],
                                      init.get("adapt_mae", float("nan")),
                                      init.get("adapt_acc", float("nan"))]
                                     + [ad.get(c, float("nan")) for c in _adapt_k_columns])

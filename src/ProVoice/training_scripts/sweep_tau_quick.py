@@ -81,14 +81,43 @@ DEFAULT_TAUS: Tuple[float, ...] = (0.1, 0.2, 0.5, 1.0, 1.5, 2.0)
 # labelling, matching sweep_l2sp_tau's k-cap).
 DEFAULT_KS: Tuple[int, ...] = (5, 10, 30, 60)
 MIN_QUERY = 20            # matches train_XLSTM._ADAPT_MIN_QUERY
+# Fixed evaluation tail. 30 because the shortest driver has 94 segments, so
+# K + 30 <= 94 keeps every one of the 12 drivers usable out to K=64; at T=40 the
+# shortest driver cannot reach K=60 at all.
+DEFAULT_EVAL_TAIL = 30
 
+# TWO evaluation protocols, scored from the SAME adapted head. The adaptation is
+# the expensive part (~2000 AdamW steps); a second scoring pass is one matmul, so
+# reporting both costs nothing and removes the need to choose.
+#
+#   suffix  (`*_set_mae`)      query = segs[K:], i.e. everything after the support.
+#                              DEPLOYMENT-REALISTIC: a served system that had
+#                              reached segment K would hold exactly these labels.
+#                              But the query CHANGES with K, so the curve confounds
+#                              "more support" with "different test set".
+#   tail    (`*_tail`)         query = the last --eval-tail segments, fixed.
+#                              K is then the only thing varying, which is what a
+#                              LEARNING CURVE means — read research question (b)
+#                              (how many labels until convergence) off this one.
+#                              Costs realism: at small K the support is far in the
+#                              past relative to the query, which no deployment
+#                              would be.
+#
+# Levels are NOT comparable between the two — they are different test sets (on
+# driver 001, floor 1.667 on the fixed tail vs 1.395-2.107 on the suffix). Shapes
+# are. Never quote one against the other.
 RESULTS_COLUMNS = [
     "fold", "val_pids", "adapt_params", "tau", "K",
+    # --- immediate-suffix protocol ---
     "adapt_set_mae", "adapt_set_acc",
     "unadapted_set_mae",          # the same checkpoint, head un-touched
     "pdconst_set_mae",            # per-driver constant on the same K support
     "vs_pdconst", "vs_unadapted",
-    "n_drivers", "grad_norm_max",
+    # --- fixed-tail protocol (NaN when K + eval_tail exceeds a driver's length) ---
+    "adapt_set_mae_tail", "adapt_set_acc_tail",
+    "unadapted_set_mae_tail", "pdconst_set_mae_tail",
+    "vs_pdconst_tail", "vs_unadapted_tail",
+    "n_drivers", "n_drivers_tail", "eval_tail", "grad_norm_max",
 ]
 
 
@@ -189,7 +218,8 @@ def const_floor(V: torch.Tensor, sup: List[int], qry: List[int]) -> float:
 
 def sweep_fold(fold: Tuple[str, ...], fold_i: int, model, cache: Dict, arch: Dict,
                taus: List[float], ks: List[int], adapt_params_list: List[str],
-               steps: int, adapt_lr: float, device: str) -> List[dict]:
+               steps: int, adapt_lr: float, device: str,
+               eval_tail: int = DEFAULT_EVAL_TAIL) -> List[dict]:
     head_type = arch.get("head_type", "corn")
     Z, V, pids, sids, chrono = embed_fold(model, cache, fold, arch["context_length"], device)
     order = per_driver_order(pids, sids, chrono)
@@ -203,40 +233,99 @@ def sweep_fold(fold: Tuple[str, ...], fold_i: int, model, cache: Dict, arch: Dic
         for tau in taus:
             for K in ks:
                 maes, accs, unad, floors, gnorms = [], [], [], [], []
+                t_maes, t_accs, t_unad, t_floors = [], [], [], []
                 for pid, idx in order.items():
-                    if len(idx) < K + MIN_QUERY:
+                    n = len(idx)
+                    if n < K + MIN_QUERY:
                         continue
                     sup, qry = idx[:K], idx[K:]
+                    # The fixed tail must be DISJOINT from the support, or the
+                    # model is scored on segments it adapted on. A driver too
+                    # short for that at this K contributes to the suffix numbers
+                    # and is simply absent from the tail ones (hence the separate
+                    # n_drivers_tail count).
+                    tail = (idx[-eval_tail:]
+                            if eval_tail > 0 and K + eval_tail <= n else None)
                     w, b, info = adapt_head_tensors(
                         Z[sup], V[sup], w0, b0, tau=tau, head_type=head_type,
                         steps=steps, lr=adapt_lr, adapt_params=ap)
+                    # ONE adaptation, scored twice. Both protocols therefore
+                    # describe the same head, so any difference between them is
+                    # the query set and nothing else.
                     m, a = score(Z[qry], V[qry], w, b, head_type)
                     maes.append(m); accs.append(a)
                     unad.append(score(Z[qry], V[qry], w0, b0, head_type)[0])
                     floors.append(const_floor(V, sup, qry))
                     gnorms.append(float(info.get("grad_norm", float("nan"))))
+                    if tail is not None:
+                        tm, ta = score(Z[tail], V[tail], w, b, head_type)
+                        t_maes.append(tm); t_accs.append(ta)
+                        t_unad.append(score(Z[tail], V[tail], w0, b0, head_type)[0])
+                        t_floors.append(const_floor(V, sup, tail))
                 if not maes:
                     continue
+                nan = float("nan")
                 r = {"fold": fold_i, "val_pids": "|".join(fold), "adapt_params": ap,
-                     "tau": tau, "K": K,
+                     "tau": tau, "K": K, "eval_tail": eval_tail,
                      "adapt_set_mae": float(np.mean(maes)),
                      "adapt_set_acc": float(np.mean(accs)),
                      "unadapted_set_mae": float(np.mean(unad)),
                      "pdconst_set_mae": float(np.mean(floors)),
-                     "n_drivers": len(maes),
-                     "grad_norm_max": float(np.nanmax(gnorms)) if gnorms else float("nan")}
+                     "adapt_set_mae_tail": float(np.mean(t_maes)) if t_maes else nan,
+                     "adapt_set_acc_tail": float(np.mean(t_accs)) if t_accs else nan,
+                     "unadapted_set_mae_tail": float(np.mean(t_unad)) if t_unad else nan,
+                     "pdconst_set_mae_tail": float(np.mean(t_floors)) if t_floors else nan,
+                     "n_drivers": len(maes), "n_drivers_tail": len(t_maes),
+                     "grad_norm_max": float(np.nanmax(gnorms)) if gnorms else nan}
                 r["vs_pdconst"] = r["adapt_set_mae"] - r["pdconst_set_mae"]
                 r["vs_unadapted"] = r["adapt_set_mae"] - r["unadapted_set_mae"]
+                r["vs_pdconst_tail"] = r["adapt_set_mae_tail"] - r["pdconst_set_mae_tail"]
+                r["vs_unadapted_tail"] = r["adapt_set_mae_tail"] - r["unadapted_set_mae_tail"]
                 rows.append(r)
+                tail_txt = ("     tail MAE=%.3f vs pdconst %+.3f"
+                            % (r["adapt_set_mae_tail"], r["vs_pdconst_tail"])
+                            if t_maes else "     tail: n/a (K+tail > driver length)")
                 print(f"    {ap:>4} tau={tau:<6g} K={K:<3} "
                       f"MAE={r['adapt_set_mae']:.3f}  "
                       f"vs pdconst {r['vs_pdconst']:+.3f}  "
-                      f"vs unadapted {r['vs_unadapted']:+.3f}", flush=True)
+                      f"vs unadapted {r['vs_unadapted']:+.3f}"
+                      f"{tail_txt}", flush=True)
     return rows
 
 
+def _tau_table(sub: List[dict], col: str, title: str) -> Optional[Tuple[float, float]]:
+    """One tau x K table of ``col``; returns (best tau, its mean) or None."""
+    taus = sorted({r["tau"] for r in sub})
+    ks = sorted({r["K"] for r in sub})
+    if not any(np.isfinite(r.get(col, float("nan"))) for r in sub):
+        print(f"\n{title}\n  (not available)")
+        return None
+    print(f"\n{title}")
+    print("      " + "".join(f"{'K=' + str(k):>10}" for k in ks) + f"{'mean':>10}")
+    best = None
+    for tau in taus:
+        cells = []
+        for k in ks:
+            v = [r[col] for r in sub
+                 if r["tau"] == tau and r["K"] == k and np.isfinite(r.get(col, np.nan))]
+            cells.append(float(np.mean(v)) if v else float("nan"))
+        m = float(np.nanmean(cells)) if any(np.isfinite(c) for c in cells) else float("nan")
+        if np.isfinite(m) and (best is None or m < best[1]):
+            best = (tau, m)
+        print(f"tau={tau:<6g}" + "".join(f"{c:>10.3f}" for c in cells) + f"{m:>10.3f}")
+    return best
+
+
 def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
-    """tau x K table of the margin against the per-driver floor, then a verdict."""
+    """tau x K tables under BOTH evaluation protocols, then a verdict.
+
+    tau is RANKED on the suffix protocol, because the value chosen here is fed to
+    ``sweep_population_hparams --adapt-tau``, which scores on the suffix. The
+    fixed-tail table is printed beside it because it is the one whose SHAPE across
+    K is interpretable, and a disagreement between the two about the best tau is
+    itself worth seeing — it means the suffix ranking is being driven by which
+    segments happen to fall in the query.
+    """
     if not rows:
         print("[summary] nothing to summarize")
         return
@@ -244,21 +333,21 @@ def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
         sub = [r for r in rows if r["adapt_params"] == ap]
         if not sub:
             continue
-        taus = sorted({r["tau"] for r in sub})
-        ks = sorted({r["K"] for r in sub})
-        print(f"\n=== adapt_params={ap} : adapted set-MAE MINUS the per-driver floor ===")
-        print("      " + "".join(f"{'K=' + str(k):>10}" for k in ks) + f"{'mean':>10}")
-        best = None
-        for tau in taus:
-            cells = []
-            for k in ks:
-                v = [r["vs_pdconst"] for r in sub if r["tau"] == tau and r["K"] == k]
-                cells.append(float(np.mean(v)) if v else float("nan"))
-            m = float(np.nanmean(cells))
-            flag = ""
-            if best is None or m < best[1]:
-                best, flag = (tau, m), ""
-            print(f"tau={tau:<6g}" + "".join(f"{c:>10.3f}" for c in cells) + f"{m:>10.3f}{flag}")
+        best = _tau_table(
+            sub, "vs_pdconst",
+            f"=== adapt_params={ap} | SUFFIX query (deployment-realistic; ranks tau) ===\n"
+            f"    adapted set-MAE MINUS the per-driver floor")
+        best_tail = _tau_table(
+            sub, "vs_pdconst_tail",
+            f"=== adapt_params={ap} | FIXED TAIL query (K is the only thing varying) ===\n"
+            f"    adapted set-MAE MINUS the per-driver floor — read the K SHAPE here")
+        if best and best_tail and best[0] != best_tail[0]:
+            print(f"\n  [note] the two protocols disagree on tau "
+                  f"(suffix {best[0]:g}, tail {best_tail[0]:g}). The suffix ranking moves "
+                  f"with query composition, so prefer the tail when they conflict and the "
+                  f"margins are close.")
+        if best is None:
+            continue
         # Reported against BOTH references, because they answer different
         # questions: beating the floor means the model contributes more than a
         # per-driver constant; beating the unadapted head means adaptation did
@@ -267,7 +356,8 @@ def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
         print(f"\n  best tau = {best[0]:g}  (mean margin vs per-driver floor "
               f"{best[1]:+.3f}; vs unadapted head "
               f"{float(np.mean([r['vs_unadapted'] for r in b_rows])):+.3f})")
-        edge = best[0] in (min(taus), max(taus))
+        all_taus = sorted({r["tau"] for r in sub})
+        edge = best[0] in (min(all_taus), max(all_taus))
         if edge:
             print(f"  [warn] the winner is at the EDGE of the grid - extend it past "
                   f"{best[0]:g} before trusting this value.")
@@ -316,6 +406,16 @@ def main() -> None:
                          "difference - if they match, personalization on this "
                          "representation is a per-driver level offset and the arm "
                          "comparison is tied by construction.")
+    ap.add_argument("--eval-tail", dest="eval_tail", type=int, default=DEFAULT_EVAL_TAIL,
+                    help="Also score every adapted head on each driver's LAST N segments, "
+                         "a query set that does not move with K (0 = suffix only). The "
+                         "suffix protocol changes the test set at every K, so its curve "
+                         "confounds 'more support' with 'easier query'; the fixed tail "
+                         "varies K alone and is the one to read a convergence point off. "
+                         "Both come from the SAME adaptation, so the extra cost is one "
+                         "matmul. 30 keeps all 12 drivers usable out to K=64 (the shortest "
+                         "has 94 segments); 40 already puts K=60 out of reach for them. "
+                         "The tail is always disjoint from the support.")
     ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS)
     ap.add_argument("--adapt-lr", dest="adapt_lr", type=float, default=DEFAULT_ADAPT_LR)
     # Backbone training (only when a fold's checkpoint is absent).
@@ -359,7 +459,8 @@ def main() -> None:
             args.cache, cache_meta(args.in_jsonl, None,
                                    arch.get("window_seconds"), arch.get("resample_hz")))
         all_rows += sweep_fold(fold, i, model, cache, arch, taus, ks,
-                               adapt_params_list, args.steps, args.adapt_lr, device)
+                               adapt_params_list, args.steps, args.adapt_lr, device,
+                               eval_tail=args.eval_tail)
 
     if not all_rows:
         raise SystemExit("no cells completed")

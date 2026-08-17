@@ -141,6 +141,10 @@ RESULTS_COLUMNS = [
     # "Does training the backbone help ADAPTATION?" is a different question from
     # "does training help unadapted accuracy?", and only this answers it.
     "init_adapt_set_mae", "init_adapt_set_acc",
+    # FIXED-TAIL query at the adapt-selected epoch. Reported only; the ranking
+    # stays on the suffix metric. Levels are not comparable with the suffix
+    # columns (different test set) but the shape across K is the interpretable one.
+    "adapt_mae_tail", "adapt_acc_tail",
 ]
 
 
@@ -518,6 +522,8 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
         out["adapt_acc_at_best_adapt"] = float(
             rows[idx[ja]].get("adapt_set_acc", "nan") or "nan")
         out["adapt_n_drivers"] = float(rows[idx[ja]].get("adapt_n_drivers", 0) or 0)
+        out["adapt_mae_tail"] = _f(rows[idx[ja]].get("adapt_set_mae_tail"))
+        out["adapt_acc_tail"] = _f(rows[idx[ja]].get("adapt_set_acc_tail"))
         # Per-K values are read AT THE ADAPT-SELECTED EPOCH, not at their own
         # per-K minima: the run ships one epoch, so the K curve has to be the
         # cross-section of that epoch. Taking each K's own best would describe a
@@ -530,7 +536,7 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
                 out[f"adapt_acc_k{col.rsplit('_k', 1)[1]}"] = _f(val)
     else:
         for k in ("smoothed_best_adapt_mae", "best_adapt_mae",
-                  "adapt_acc_at_best_adapt"):
+                  "adapt_acc_at_best_adapt", "adapt_mae_tail", "adapt_acc_tail"):
             out[k] = float("nan")
         out["best_epoch_smoothed_adapt"] = -1
         out["best_epoch_1se_adapt"] = -1

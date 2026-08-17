@@ -152,6 +152,18 @@ def main() -> None:
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60)
     ap.add_argument("--max-points", dest="max_points", type=int, default=20)
     ap.add_argument("--force", action="store_true", help="Recompute curves even if present.")
+    ap.add_argument("--extra-arm", dest="extra_arms", action="append", default=[],
+                    metavar="PATH:NAME",
+                    help="Additional arm to report, as <csv>:<name>, repeatable. The CSV "
+                         "needs only `pid, k, set_mae, set_acc` — the same columns the "
+                         "learned arms emit — so a model-free reference drops in without "
+                         "special handling. Built for ProVoice.training_scripts."
+                         "baseline_lookup, whose per-(driver, function) constant beats the "
+                         "trained model on this cohort from K=5 onward; a baseline that "
+                         "strong belongs in the headline table, not a footnote. Extra arms "
+                         "are summarised and paired against L2-SP, but never define the "
+                         "common-driver set (see below) — a reference with different "
+                         "coverage must not silently shrink the arms' comparison.")
     args = ap.parse_args()
 
     tau = args.tau
@@ -194,21 +206,69 @@ def main() -> None:
     l2c = l2[l2["pid"].isin(common)]
     anc = an[an["pid"].isin(common)] if an is not None else None
 
+    # Extra arms are loaded AFTER `common` is fixed by the learned arms, and are
+    # restricted to it rather than intersected into it. A model-free reference
+    # can cover drivers the learned arms lack (it needs no checkpoint), and
+    # letting it widen or narrow the set the arms are compared on would change
+    # the primary result as a side effect of adding a baseline.
+    extras: Dict[str, pd.DataFrame] = {}
+    for spec in args.extra_arms:
+        path, _, name = spec.rpartition(":")
+        if not path or not name:
+            raise SystemExit(f"--extra-arm expects <csv>:<name>, got {spec!r}")
+        p = pathlib.Path(path)
+        if not p.exists():
+            print(f"[warn] --extra-arm {name}: {p} not found, skipping")
+            continue
+        df = load_arm(p, name)
+        miss = [c for c in ("pid", "k", "set_mae", "set_acc") if c not in df.columns]
+        if miss:
+            print(f"[warn] --extra-arm {name}: missing column(s) {miss}, skipping")
+            continue
+        if "variant" in df.columns and df["variant"].nunique() > 1:
+            # One CSV, several baselines: split them so each is its own arm rather
+            # than being averaged into a meaningless blend.
+            for v, g in df.groupby("variant"):
+                extras[f"{name}:{v}"] = g[g["pid"].isin(common)]
+        else:
+            extras[name] = df[df["pid"].isin(common)]
+        absent = sorted(set(common) - set(df["pid"]))
+        if absent:
+            print(f"[warn] --extra-arm {name}: no rows for driver(s) {absent}")
+
     floor = l2c.groupby("pid")["base_set_mae"].first().mean()
     print(f"\n{'arm':>6} {'drivers':>8} {'mean set-MAE':>13} {'se':>7} {'vs floor':>9}"
           f"   (K <= {args.k_cap}, averaged within driver first)")
-    for arm, df in (("l2sp", l2c), ("anil", anc)):
-        if df is None:
+    for arm, df in ([("l2sp", l2c), ("anil", anc)] + sorted(extras.items())):
+        if df is None or df.empty:
             continue
         pd_mean = df[df["k"] <= args.k_cap].groupby("pid")["set_mae"].mean()
         se = pd_mean.std(ddof=1) / np.sqrt(len(pd_mean)) if len(pd_mean) > 1 else float("nan")
         print(f"{arm:>6} {len(pd_mean):8d} {pd_mean.mean():13.3f} {se:7.3f} "
               f"{pd_mean.mean() - floor:+9.3f}")
     print(f"{'floor':>6} {'':>8} {floor:13.3f}    (unadapted population model, K=0)")
+    if extras:
+        print("  NOTE extra arms are references, not study arms. If one beats both "
+              "learned arms, that is the result to report, not an anomaly to "
+              "explain away.")
     l2, an = l2c, anc
 
     summary: Dict[str, object] = {"tau": tau, "k_cap": args.k_cap,
                                   "unadapted_floor_set_mae": float(floor)}
+
+    for name, df in sorted(extras.items()):
+        # Paired against L2-SP on the SAME drivers, same K cap, same statistic as
+        # the arm-vs-arm comparison — so a baseline is held to the study's own
+        # standard of evidence rather than a looser one.
+        pr = paired_table(l2c, df, args.k_cap)
+        if pr.empty:
+            continue
+        safe = name.replace(":", "_")
+        pr.to_csv(outdir / f"paired_l2sp_vs_{safe}.csv", index=False)
+        d = pr["mae_delta"]
+        print(f"\n[extra] {name} vs l2sp (paired over {len(pr)} drivers, K <= "
+              f"{args.k_cap}): mean set-MAE difference {d.mean():+.3f} "
+              f"({'the baseline is BETTER' if d.mean() < 0 else 'l2sp is better'})")
 
     if an is not None:
         pair = paired_table(l2, an, args.k_cap)
