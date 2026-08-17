@@ -316,6 +316,76 @@ def _tau_table(sub: List[dict], col: str, title: str) -> Optional[Tuple[float, f
     return best
 
 
+def _tau_paired(sub: List[dict], col: str, ref_tau: float) -> None:
+    """Every tau against ``ref_tau``, PAIRED on (fold, K).
+
+    Why pairing is not optional once more than one fold is in play: fold
+    difficulty spans a per-driver floor of ~0.54 to ~1.55, while the tau effects
+    being resolved here are ~0.01-0.06. An unpaired mean buries the second inside
+    the first. Every tau saw the identical (fold, K) cells, so differencing within
+    a cell cancels fold difficulty exactly and leaves the anchor effect — the same
+    argument sweep_population_hparams.table_paired_configs and
+    compare_arms_k_curve make for their own comparisons.
+
+    Descriptive statistic, not a hypothesis test: no multiplicity correction, and
+    the cells share drivers so they are not independent.
+    """
+    cells: Dict[Tuple[int, int], Dict[float, float]] = {}
+    for r in sub:
+        v = r.get(col, float("nan"))
+        if np.isfinite(v):
+            cells.setdefault((r["fold"], r["K"]), {})[r["tau"]] = v
+    taus = sorted({t for c in cells.values() for t in c})
+    if len(taus) < 2 or not cells:
+        return
+    print(f"\n  paired against tau={ref_tau:g}, differenced within (fold, K) "
+          f"— negative favours the row")
+    print(f"    {'tau':>8} {'n_pairs':>8} {'delta':>8} {'se':>7} {'t':>7}")
+    for tau in taus:
+        if tau == ref_tau:
+            continue
+        d = np.array([c[tau] - c[ref_tau] for c in cells.values()
+                      if tau in c and ref_tau in c])
+        if d.size < 2:
+            continue
+        se = float(d.std(ddof=1) / np.sqrt(len(d)))
+        t = d.mean() / se if se > 0 else float("nan")
+        print(f"    {tau:>8g} {len(d):>8d} {d.mean():>+8.3f} {se:>7.3f} {t:>+7.2f}")
+
+
+def _tau_stability(sub: List[dict], col: str) -> None:
+    """Which tau wins in EACH fold. A value that only wins on average is fragile.
+
+    With 2 drivers per fold the per-fold winner is noisy, so this is read for
+    CONSISTENCY, not to pick a value: a tau that wins in one fold and loses in
+    five is an artifact of that fold's pair, and the pooled ranking is then not
+    something to commit to.
+    """
+    folds = sorted({r["fold"] for r in sub})
+    if len(folds) < 2:
+        return
+    print(f"\n  per-fold winner (consistency check):")
+    winners = []
+    for f in folds:
+        per_tau: Dict[float, List[float]] = {}
+        for r in sub:
+            if r["fold"] == f and np.isfinite(r.get(col, float("nan"))):
+                per_tau.setdefault(r["tau"], []).append(r[col])
+        if not per_tau:
+            continue
+        best_t = min(per_tau, key=lambda t: float(np.mean(per_tau[t])))
+        winners.append(best_t)
+        vp = sorted({r["val_pids"] for r in sub if r["fold"] == f})
+        print(f"    fold {f} ({vp[0] if vp else '?'}): tau={best_t:g}"
+              f"  ({np.mean(per_tau[best_t]):+.3f})")
+    if winners:
+        uniq = sorted(set(winners))
+        mode = max(uniq, key=winners.count)
+        print(f"    -> {winners.count(mode)}/{len(winners)} folds agree on tau={mode:g}"
+              + ("" if len(uniq) == 1 else f"; {len(uniq)} distinct winners {uniq} "
+                                           f"— treat the pooled value as weak evidence"))
+
+
 def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
     """tau x K tables under BOTH evaluation protocols, then a verdict.
 
@@ -348,6 +418,10 @@ def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
                   f"margins are close.")
         if best is None:
             continue
+        # Pooled means rank; the paired table says whether the ranking is real,
+        # and the per-fold table says whether it is stable.
+        _tau_paired(sub, "vs_pdconst", best[0])
+        _tau_stability(sub, "vs_pdconst")
         # Reported against BOTH references, because they answer different
         # questions: beating the floor means the model contributes more than a
         # per-driver constant; beating the unadapted head means adaptation did
@@ -392,10 +466,15 @@ def main() -> None:
     ap.add_argument("--ckpt-dir", dest="ckpt_dir", default="",
                     help="Where fold backbones are cached (default <outdir>/ckpt). Kept "
                          "between runs: a different tau grid must not retrain.")
-    ap.add_argument("--folds", default="0",
-                    help="Fold indices from folds.VALIDATION_FOLDS. One is usually enough "
-                         "for a ballpark check; folds differ a lot in difficulty, so use "
-                         "two if the answer looks marginal.")
+    ap.add_argument("--folds", default="0,1,2,3,4,5",
+                    help="Fold indices from folds.VALIDATION_FOLDS. ALL SIX by default, "
+                         "which is the same rotation folds.py exists to provide: every "
+                         "driver serves as validation exactly once, so tau rests on all 12 "
+                         "rather than on whichever 2 a single fold happens to hold. The "
+                         "adaptation grid is seconds per fold; the cost is one backbone per "
+                         "fold, and those are CACHED in --ckpt-dir, so a second run at a "
+                         "different tau grid retrains nothing. Pass a single index for a "
+                         "first look.")
     ap.add_argument("--taus", default=",".join(f"{t:g}" for t in DEFAULT_TAUS))
     ap.add_argument("--ks", default=",".join(str(k) for k in DEFAULT_KS))
     ap.add_argument("--adapt-params", dest="adapt_params", default="all",
@@ -440,9 +519,14 @@ def main() -> None:
     ckpt_dir = pathlib.Path(args.ckpt_dir) if args.ckpt_dir else outdir / "ckpt"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device} | taus={taus} | K={ks} | adapt_params={adapt_params_list}")
+    n_cells = len(fold_idx) * len(adapt_params_list) * len(taus) * len(ks)
+    ckpt_dir_p = pathlib.Path(args.ckpt_dir) if args.ckpt_dir else outdir / "ckpt"
+    n_new = sum(1 for i in fold_idx
+                if not list(ckpt_dir_p.glob(f"tauquick_f{'-'.join(VALIDATION_FOLDS[i])}_*")))
     print(f"[plan] {len(fold_idx)} fold(s) x {len(adapt_params_list)} x {len(taus)} tau x "
-          f"{len(ks)} K = {len(fold_idx) * len(adapt_params_list) * len(taus) * len(ks)} "
-          f"cell(s), ~3 s each after each fold's backbone is trained")
+          f"{len(ks)} K = {n_cells} cell(s), ~3 s each per driver")
+    print(f"[plan] {n_new} backbone(s) to train ({len(fold_idx) - n_new} cached) — this "
+          f"dominates the wall clock; the tau grid itself is cheap")
 
     all_rows: List[dict] = []
     for i in fold_idx:
