@@ -19,6 +19,9 @@ from ProVoice.models.head_adapt import (
     DEFAULT_TAU,
 )
 from ProVoice.models.laplace_head import LaplacePosterior, attach_laplace_to_checkpoint
+from ProVoice.models.head_adapt import (
+    assert_zero_block_identity, augment_z, install_fcd_head,
+)
 
 from ProVoice.models.train_XLSTM import (
     set_seed,
@@ -36,7 +39,7 @@ from ProVoice.models.train_XLSTM import (
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
 
 @torch.no_grad()
-def embed_all(model, dl, device):
+def embed_all(model, dl, device, embed_fcd: bool = False):
     # function that precomputes the embeddings for all sequences in a dataloader, using the frozen in_proj and backbone of the model. Returns pooled embeddings and labels.
     """Run the frozen in_proj+backbone once; return pooled embeddings and labels."""
     zs, vs = [], []
@@ -45,7 +48,10 @@ def embed_all(model, dl, device):
         # Batches are RIGHT-padded: read the hidden state at the last REAL
         # frame (index length-1), same readout as model.forward.
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
-        zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
+        z = h[torch.arange(h.size(0), device=h.device), idx]
+        # Augmented from the SAME batch the embedding came from, so a segment's
+        # FCD can never be paired with another segment's z.
+        zs.append(augment_z(z, xb.to(device).to(torch.float32), embed_fcd).cpu())
         vs.append(vb)   # multi-hot Level_* — the training target AND the metric target
     return torch.cat(zs), torch.cat(vs)
 
@@ -92,6 +98,14 @@ def main():
                     help="Fraction of the non-validation segments (earliest first) used for "
                          "training. Sweep this (e.g. 0.2, 0.5, 1.0) to measure personalization "
                          "vs. data collection time against the fixed validation tail.")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Give the adapted head direct access to the task: it sees "
+                         "[z_64 | FCD_12] (308 parameters instead of 260). The backbone is "
+                         "untouched, so no retraining is implied; the appended block is "
+                         "initialized AND L2-SP-anchored at zero, so K=0 reproduces the "
+                         "population head exactly. The saved checkpoint carries the wider "
+                         "head, and both forward() and the decision engine detect it from "
+                         "its shape -- there is no serving flag to forget.")
     ap.add_argument("--laplace", action="store_true",
                     help="After training, fit a Laplace posterior over the adapted soft-CORN "
                          "head (exact per-unit Hessian on the training embeddings, prior "
@@ -205,8 +219,17 @@ def main():
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
 
     # precompute embeddings for all sequences in train and test datasets (more efficient - back-bone is frozen)
-    Ztr, Vtr = embed_all(model, train_dl, device)   # (n_train, 64), (n_train, 5)
-    Zte, Vte = embed_all(model, test_dl, device)
+    # Widen the head BEFORE embedding, so `adapt_head` below anchors on the
+    # zero-padded population head and the embeddings match its width. The gate
+    # proves the padding is inert before anything is fitted.
+    if args.embed_fcd:
+        xb0, lb0, _ = next(iter(test_dl))
+        assert_zero_block_identity(model, xb0.to(device), lb0.to(device))
+        install_fcd_head(model, True)
+        print(f"[embed-fcd] head widened to {model.head.in_features} inputs "
+              f"({model.head.weight.numel() + model.head.bias.numel()} parameters)")
+    Ztr, Vtr = embed_all(model, train_dl, device, args.embed_fcd)   # (n, 64) or (n, 76)
+    Zte, Vte = embed_all(model, test_dl, device, args.embed_fcd)
     Ztr, Vtr = Ztr.to(device), Vtr.to(device)
     Zte, Vte = Zte.to(device), Vte.to(device)
 

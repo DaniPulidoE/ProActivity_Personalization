@@ -103,6 +103,131 @@ DEFAULT_ADAPT_LR = 5e-3
 # study-level constant, not a per-run knob.
 DEFAULT_TAU = 2.0
 
+# ---------------------------------------------------------------------------
+# FCD-AUGMENTED HEAD INPUT  (--embed-fcd)
+#
+# WHAT: the adapted head sees [z_64 | FCD_12] instead of z_64 alone.
+#
+# WHY: the label on this cohort is close to a deterministic function of
+# (driver x task). A per-(driver, function) constant reaches set-MAE 0.260 on the
+# within-driver split where the trained model reaches 0.956, and it wins from
+# K=5 onward. The model is GIVEN the task -- FCD occupies dims 0..11 of every
+# frame -- but only as 12 constant channels dragged through 100 recurrent steps
+# and entangled with driver state by the time the head sees a pooled vector.
+# Head adaptation therefore cannot cheaply express "this driver wants more
+# autonomy for THIS task", which is the structure that dominates the data.
+#
+# Concatenating FCD at the head gives adaptation direct access. The 5 functions
+# in the study have FCD vectors of rank 5 (with bias), so a LINEAR map over them
+# can hit arbitrary per-function values: the augmented head can represent the
+# lookup baseline exactly, rather than approximating it.
+#
+# THE NEW BLOCK IS ANCHORED AT ZERO. The population head has no weights for
+# these columns, so theta_pop = [W_pop | 0]. That is not a fudge: it makes the
+# L2-SP penalty an ordinary ridge on the new block, and at K=0 the FCD weights
+# are zero, so the adapted head is IDENTICAL to the population head. Graceful
+# degradation is preserved by construction -- `assert_zero_block_identity`
+# checks it rather than trusting it.
+#
+# Nothing upstream moves: the backbone, the population checkpoint, E* and the
+# stage-1/2 results are all untouched. Only the personalization layer gains
+# capacity. The Laplace Hessian stays exact and PSD at any embedding width, and
+# tau = 2*K*lambda is unchanged.
+# ---------------------------------------------------------------------------
+FCD_DIM = 12
+
+
+def fcd_from_frames(X: torch.Tensor) -> torch.Tensor:
+    """``(B, T, D)`` frames -> ``(B, FCD_DIM)``.
+
+    Read from timestep 0 because FCD is STATIC per function: verified exactly
+    constant across every segment in the cache (max per-column std 0.0 over 100
+    frames). Taking t=0 rather than a mean is deliberate -- a mean would silently
+    paper over a future feature that is not actually constant.
+    """
+    if X.ndim != 3:
+        raise ValueError(f"expected (B, T, D) frames, got {tuple(X.shape)}")
+    if X.shape[2] < FCD_DIM:
+        raise ValueError(f"frames have {X.shape[2]} features, need >= {FCD_DIM} for FCD")
+    return X[:, 0, :FCD_DIM].to(torch.float32)
+
+
+def augment_z(Z: torch.Tensor, X: torch.Tensor, embed_fcd: bool) -> torch.Tensor:
+    """``[z | FCD]`` when ``embed_fcd``, else ``z`` unchanged.
+
+    One definition, called at every site that builds embeddings for the head, so
+    the two arms cannot end up adapting different objects.
+    """
+    if not embed_fcd:
+        return Z
+    return torch.cat([Z, fcd_from_frames(X).to(Z.device)], dim=1)
+
+
+def expand_head_for_fcd(w0: torch.Tensor, b0: torch.Tensor,
+                        embed_fcd: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Population head ``(n_out, d)`` -> ``(n_out, d + FCD_DIM)`` with ZEROS appended.
+
+    Both the initialization AND the L2-SP anchor: the appended block starts at 0
+    and is pulled back toward 0, so K=0 reproduces the population head exactly.
+    Idempotent-safe -- pass ``embed_fcd=False`` and the head comes back untouched.
+    """
+    if not embed_fcd:
+        return w0, b0
+    pad = torch.zeros(w0.shape[0], FCD_DIM, dtype=w0.dtype, device=w0.device)
+    return torch.cat([w0, pad], dim=1), b0
+
+
+def install_fcd_head(model, embed_fcd: bool):
+    """Widen ``model.head`` to accept ``[z | FCD]``, zero-initialized.
+
+    The appended block is both the initialization and the L2-SP anchor, so a
+    freshly widened head predicts EXACTLY what the population head predicted --
+    K=0 is unchanged by construction. Idempotent: a head that is already wide,
+    or ``embed_fcd=False``, is returned untouched.
+
+    Installing it on the model rather than carrying tensors around is what keeps
+    the option from leaking into every call site: ``forward`` infers the
+    augmentation from ``head.in_features``, ``save_checkpoint`` persists the wide
+    head, and serving picks it up with no flag at all.
+    """
+    import torch.nn as _nn
+    from ProVoice.models.head_adapt import expand_head_for_fcd
+    if not embed_fcd or model.head_uses_fcd():
+        return model
+    w, b = expand_head_for_fcd(model.head.weight.detach(), model.head.bias.detach(), True)
+    head = _nn.Linear(w.shape[1], w.shape[0])
+    head.weight.data, head.bias.data = w.clone(), b.clone()
+    model.head = head.to(w.device)
+    return model
+
+
+def assert_zero_block_identity(model, X: torch.Tensor, lengths: torch.Tensor,
+                               atol: float = 1e-6) -> None:
+    """THE GATE for --embed-fcd: the augmented head with a zero FCD block must
+    reproduce the population head bit-for-bit.
+
+    If this passes, the change is safe by construction: every K=0 prediction, and
+    therefore the entire graceful-degradation guarantee, is provably unchanged.
+    Cheap enough to run before any sweep that uses the flag.
+    """
+    with torch.no_grad():
+        h = model.backbone(model.in_proj(X.to(torch.float32)))
+        idx = (lengths.long() - 1).clamp(min=0)
+        z = h[torch.arange(h.size(0), device=h.device), idx]
+        w0, b0 = model.head.weight.detach(), model.head.bias.detach()
+        base = F.linear(z, w0, b0)
+        w1, b1 = expand_head_for_fcd(w0, b0, True)
+        aug = F.linear(augment_z(z, X, True), w1, b1)
+        gap = (aug - base).abs().max().item()
+    if gap > atol:
+        raise AssertionError(
+            f"--embed-fcd zero-block identity FAILED: max|augmented - population| "
+            f"= {gap:.3e} > {atol:g}. The FCD block is not inert at "
+            f"initialization, so K=0 would no longer reproduce the population "
+            f"model and graceful degradation is broken.")
+    print(f"[embed-fcd] zero-block identity OK (max diff {gap:.2e}) — K=0 "
+          f"reproduces the population head exactly")
+
 
 def l2sp_from_tau(tau: float, n: int) -> float:
     """``lam`` for a batch-MEAN objective that realises prior precision ``tau``.

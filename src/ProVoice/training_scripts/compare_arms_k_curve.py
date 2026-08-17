@@ -97,6 +97,12 @@ def ensure_curve(arm: str, ckpt_dir: pathlib.Path, prefix: str, outdir: pathlib.
            "--ckpt-prefix", prefix,
            "--val-frac", str(args.val_frac), "--k-cap", str(args.k_cap),
            "--max-points", str(args.max_points)]
+    if args.embed_fcd:
+        # ONE flag, BOTH arms. Passing it here rather than expecting two earlier
+        # commands to agree is what makes arm symmetry structural instead of a
+        # convention someone has to remember; the head-width guard above is then
+        # a backstop for checkpoints built elsewhere, not the only defence.
+        cmd += ["--embed-fcd"]
     if subprocess.run(cmd).returncode != 0 or not csv_path.exists():
         print(f"[{arm}] FAILED")
         return None
@@ -151,6 +157,13 @@ def main() -> None:
     ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2)
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60)
     ap.add_argument("--max-points", dest="max_points", type=int, default=20)
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Adapt an FCD-augmented head ([z_64 | FCD_12]) in BOTH arms. "
+                         "Applied here rather than per arm so the two cannot disagree: "
+                         "the comparison isolates theta_init, so anything else that "
+                         "differs between the arms confounds it. Requires nothing of the "
+                         "checkpoints -- the population heads stay narrow and are widened "
+                         "with a zero block at adaptation time.")
     ap.add_argument("--force", action="store_true", help="Recompute curves even if present.")
     ap.add_argument("--extra-arm", dest="extra_arms", action="append", default=[],
                     metavar="PATH:NAME",
@@ -173,6 +186,34 @@ def main() -> None:
             raise SystemExit(f"No tau (expected {args.selected_tau}); pass --tau to override.")
         tau = float(sel["tau"])
     print(f"[tau] {tau:g} — the SAME value for both arms, by design")
+
+    # ARM SYMMETRY: both arms must adapt the SAME object. --embed-fcd widens the
+    # head, and an L2-SP arm run with it against an ANIL arm run without it would
+    # differ by more than their initialization -- which is the one thing this
+    # comparison exists to isolate. Checked from the checkpoints themselves,
+    # because the flag lives in two separate earlier commands and nothing else
+    # would catch the mismatch.
+    def _head_width(d: pathlib.Path, prefix: str) -> Optional[int]:
+        import torch as _t
+        for f in sorted(d.glob(f"{prefix}*.pt")):
+            try:
+                w = _t.load(f, map_location="cpu", weights_only=False)["state_dict"]["head.weight"]
+                return int(w.shape[1])
+            except Exception:
+                continue
+        return None
+
+    _wl = _head_width(pathlib.Path(args.l2sp_ckpt_dir), args.l2sp_prefix)
+    _wa = _head_width(pathlib.Path(args.anil_ckpt_dir), args.anil_prefix)
+    if _wl is not None and _wa is not None and _wl != _wa:
+        raise SystemExit(
+            f"ARM MISMATCH: the L2-SP checkpoints have a {_wl}-input head and the ANIL "
+            f"checkpoints a {_wa}-input one. One arm was built with --embed-fcd and the "
+            f"other without, so they adapt different objects and the comparison would be "
+            f"confounded. Rebuild one arm to match, or pass matching flags upstream.")
+    if _wl is not None:
+        print(f"[arms] head width {_wl} on both arms"
+              + (" (FCD-augmented)" if _wl and _wa and _wl != 64 else ""))
 
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     paths = {

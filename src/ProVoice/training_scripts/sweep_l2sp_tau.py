@@ -63,6 +63,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from ProVoice.models.xlstm_model import load_checkpoint
+from ProVoice.models.head_adapt import install_fcd_head
 from ProVoice.models.head_adapt import (
     adapt_head, DEFAULT_ADAPT_LR, DEFAULT_ADAPT_STEPS,
 )
@@ -145,6 +146,13 @@ def main() -> None:
     ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
                     help="MUST match stage 2's --val-frac: the K=0 floor and these "
                          "curves have to be scored on the same segments.")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Give the adapted head direct access to the task: it sees "
+                         "[z_64 | FCD_12] instead of z_64 alone. The backbone is untouched, "
+                         "so no retraining is implied; the appended block is initialized AND "
+                         "L2-SP-anchored at zero, so K=0 reproduces the population head "
+                         "exactly (checked at startup). MUST match the other arm: both arms "
+                         "have to adapt the identical object or the comparison is confounded.")
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60,
                     help="Only K <= this enters the tau selection average (~25 min of "
                          "labelling). Curves are still recorded and plotted in full.")
@@ -182,6 +190,10 @@ def main() -> None:
             print(f"[skip] {pid}: no rows in {src}")
             continue
         model, arch = load_checkpoint(str(ckpt))
+        # Widen BEFORE any embedding or adaptation: embed_segments infers the
+        # augmentation from the head's width, so this one call switches the whole
+        # driver's sweep over consistently.
+        install_fcd_head(model, args.embed_fcd)
         model.to(device).eval()
         df = pd.DataFrame(drows)
         del drows

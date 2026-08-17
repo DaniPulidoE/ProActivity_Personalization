@@ -113,6 +113,7 @@ from ProVoice.models.xlstm_model import (
 )
 from ProVoice.models.xlstm_model import _as01
 from ProVoice.models.laplace_head import corn_curvature_blocks
+from ProVoice.models.head_adapt import augment_z, install_fcd_head
 from ProVoice.models.head_adapt import (
     adapt_head_tensors,
     l2sp_from_tau,
@@ -221,9 +222,16 @@ def embed(model, xb: torch.Tensor, lb: torch.Tensor, device: str,
     the backbone is how the outer loop trains the backbone.
     """
     with torch.enable_grad() if grad else torch.no_grad():
-        h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
+        x = xb.to(device).to(torch.float32)
+        h = model.backbone(model.in_proj(x))
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
-        return h[torch.arange(h.size(0), device=h.device), idx]
+        z = h[torch.arange(h.size(0), device=h.device), idx]
+        # Inferred from the head rather than passed in: `embed` has ~8 call
+        # sites across the inner loop, the implicit solve and meta-validation,
+        # and a boolean threaded through all of them is a place for the two arms
+        # to silently diverge. The head is widened once at startup
+        # (`install_fcd_head`) and every embedding follows it.
+        return augment_z(z, x, model.head_uses_fcd())
 
 
 def inner_adapt(Z: torch.Tensor, target: torch.Tensor,
@@ -584,6 +592,13 @@ def main():
                          "deployment match, few distinct episodes). 'any': support starts at a "
                          "random segment — a pseudo session start; more episode diversity.")
     # --- inner loop (must mirror the deployed L2-SP head adaptation) ---
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Give the adapted head direct access to the task: it sees "
+                         "[z_64 | FCD_12] instead of z_64 alone. The backbone is untouched, "
+                         "so no retraining is implied; the appended block is initialized AND "
+                         "L2-SP-anchored at zero, so K=0 reproduces the population head "
+                         "exactly (checked at startup). MUST match the other arm: both arms "
+                         "have to adapt the identical object or the comparison is confounded.")
     ap.add_argument("--order", choices=["imaml", "second", "first"], default="imaml",
                     help="DEFAULT 'imaml': solve the inner problem to its argmin (damped "
                          "Newton on a CORN head, LBFGS on a softmax one) and use exact "
@@ -713,6 +728,12 @@ def main():
 
     # checkpoint properties: context_length, head_type, window_seconds, resample_hz
     model, arch = load_checkpoint(args.init_pt)
+    # Widened once, here. The head is a META-PARAMETER, so from this point it is
+    # simply a wider one; `embed` reads the width off the model, which is why no
+    # inner-loop, implicit-solve or meta-validation call site needs to change.
+    if args.embed_fcd:
+        install_fcd_head(model, True)
+        print(f"[embed-fcd] meta-learned head widened to {model.head.in_features} inputs")
     model.to(device).train()
     context_length = arch["context_length"]
     head_type = arch.get("head_type", "softmax")

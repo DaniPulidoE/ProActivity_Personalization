@@ -26,6 +26,8 @@ import argparse
 import csv
 import pathlib
 
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import torch
@@ -43,6 +45,7 @@ from ProVoice.models.xlstm_model import (
     logits_to_label,
 )
 from ProVoice.models.head_adapt import (
+    augment_z,
     adapt_head,
     DEFAULT_ADAPT_LR,
     DEFAULT_ADAPT_STEPS,
@@ -102,8 +105,18 @@ def build_segments(df: pd.DataFrame, window_seconds: float | None = None,
 
 
 @torch.no_grad()
-def embed_segments(model, Xs, vs, context_length: int, device: str, chunk: int = 32):
-    """Frozen in_proj+backbone -> pooled last-step embeddings, shape (N, 64)."""
+def embed_segments(model, Xs, vs, context_length: int, device: str, chunk: int = 32,
+                   embed_fcd: Optional[bool] = None):
+    """Frozen in_proj+backbone -> pooled last-step embeddings, (N, 64) or (N, 76).
+
+    With ``embed_fcd`` the 12 static FCD dims are appended, giving the adapted
+    head direct access to the task. See ``head_adapt`` for why that matters here
+    and why the appended block is anchored at zero.
+    """
+    # None = infer from the head's width, which is the safest default: the
+    # embeddings then cannot be a different width from the head consuming them.
+    if embed_fcd is None:
+        embed_fcd = model.head_uses_fcd()
     collate = make_collate(context_length)
     zs = []
     for i in range(0, len(Xs), chunk):
@@ -111,7 +124,8 @@ def embed_segments(model, Xs, vs, context_length: int, device: str, chunk: int =
         h = model.backbone(model.in_proj(xb.to(device)))
         # RIGHT-padded batches: read the hidden state at the last REAL frame.
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
-        zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
+        z = h[torch.arange(h.size(0), device=h.device), idx]
+        zs.append(augment_z(z, xb.to(device).to(torch.float32), embed_fcd).cpu())
     return torch.cat(zs, dim=0)
 
 

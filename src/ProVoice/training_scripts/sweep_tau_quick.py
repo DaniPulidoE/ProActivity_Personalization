@@ -64,6 +64,7 @@ from torch.utils.data import DataLoader
 
 from ProVoice.models.head_adapt import (
     DEFAULT_ADAPT_LR, DEFAULT_ADAPT_STEPS, DEFAULT_TAU, adapt_head_tensors,
+    assert_zero_block_identity, augment_z, expand_head_for_fcd,
 )
 from ProVoice.models.train_XLSTM import (
     SeqDataset, cache_meta, load_segment_cache, make_collate, set_accuracy, set_mae,
@@ -117,7 +118,7 @@ RESULTS_COLUMNS = [
     "adapt_set_mae_tail", "adapt_set_acc_tail",
     "unadapted_set_mae_tail", "pdconst_set_mae_tail",
     "vs_pdconst_tail", "vs_unadapted_tail",
-    "n_drivers", "n_drivers_tail", "eval_tail", "grad_norm_max",
+    "n_drivers", "n_drivers_tail", "eval_tail", "grad_norm_max", "embed_fcd",
 ]
 
 
@@ -158,7 +159,8 @@ def train_fold_checkpoint(in_jsonl: str, cache: str, fold: Tuple[str, ...],
 
 
 def embed_fold(model, cache: Dict, fold: Tuple[str, ...], context_length: int,
-               device: str) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, List[str], Dict[str, int]]:
+               device: str, embed_fcd: bool = False,
+               ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, List[str], Dict[str, int]]:
     """Pooled embeddings for the fold's held-out drivers, computed ONCE.
 
     Everything downstream is a linear head on these, so the backbone forward
@@ -177,7 +179,10 @@ def embed_fold(model, cache: Dict, fold: Tuple[str, ...], context_length: int,
         for xb, lb, vb in dl:
             h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
             idx = (lb.to(h.device).long() - 1).clamp(min=0)
-            zs.append(h[torch.arange(h.size(0), device=h.device), idx].detach().cpu())
+            z = h[torch.arange(h.size(0), device=h.device), idx]
+            # Augmented HERE, from the batch the embedding came from, so a
+            # segment's FCD can never be paired with another segment's z.
+            zs.append(augment_z(z, xb.to(device).to(torch.float32), embed_fcd).detach().cpu())
             vs.append(vb)
     chrono = {str(s): i for i, s in enumerate(cache["seg_order"])}
     return (torch.cat(zs), torch.cat(vs).float(), np.asarray(ds.pids),
@@ -219,12 +224,17 @@ def const_floor(V: torch.Tensor, sup: List[int], qry: List[int]) -> float:
 def sweep_fold(fold: Tuple[str, ...], fold_i: int, model, cache: Dict, arch: Dict,
                taus: List[float], ks: List[int], adapt_params_list: List[str],
                steps: int, adapt_lr: float, device: str,
-               eval_tail: int = DEFAULT_EVAL_TAIL) -> List[dict]:
+               eval_tail: int = DEFAULT_EVAL_TAIL,
+               embed_fcd: bool = False) -> List[dict]:
     head_type = arch.get("head_type", "corn")
-    Z, V, pids, sids, chrono = embed_fold(model, cache, fold, arch["context_length"], device)
+    Z, V, pids, sids, chrono = embed_fold(model, cache, fold, arch["context_length"],
+                                          device, embed_fcd)
     order = per_driver_order(pids, sids, chrono)
     w0 = model.head.weight.detach().cpu()
     b0 = model.head.bias.detach().cpu()
+    # Zero-padded to the augmented width: this is the init AND the L2-SP anchor,
+    # which is what keeps K=0 identical to the population head.
+    w0, b0 = expand_head_for_fcd(w0, b0, embed_fcd)
     print(f"[fold {fold_i}] {'|'.join(fold)}: {len(Z)} segments, "
           f"{ {p: len(v) for p, v in order.items()} }")
 
@@ -267,6 +277,7 @@ def sweep_fold(fold: Tuple[str, ...], fold_i: int, model, cache: Dict, arch: Dic
                 nan = float("nan")
                 r = {"fold": fold_i, "val_pids": "|".join(fold), "adapt_params": ap,
                      "tau": tau, "K": K, "eval_tail": eval_tail,
+                     "embed_fcd": int(embed_fcd),
                      "adapt_set_mae": float(np.mean(maes)),
                      "adapt_set_acc": float(np.mean(accs)),
                      "unadapted_set_mae": float(np.mean(unad)),
@@ -399,17 +410,24 @@ def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
     if not rows:
         print("[summary] nothing to summarize")
         return
-    for ap in adapt_params_list:
-        sub = [r for r in rows if r["adapt_params"] == ap]
+    # embed_fcd is a separate arm, never averaged into one: pooling an augmented
+    # head with a plain one would hide exactly the comparison the flag exists for.
+    combos = [(ap, e) for ap in adapt_params_list
+              for e in sorted({r.get("embed_fcd", 0) for r in rows})]
+    for ap, efcd in combos:
+        sub = [r for r in rows
+               if r["adapt_params"] == ap and int(r.get("embed_fcd", 0)) == int(efcd)]
         if not sub:
             continue
         best = _tau_table(
             sub, "vs_pdconst",
-            f"=== adapt_params={ap} | SUFFIX query (deployment-realistic; ranks tau) ===\n"
+            f"=== adapt_params={ap}{' +FCD' if efcd else ''} | SUFFIX query "
+            f"(deployment-realistic; ranks tau) ===\n"
             f"    adapted set-MAE MINUS the per-driver floor")
         best_tail = _tau_table(
             sub, "vs_pdconst_tail",
-            f"=== adapt_params={ap} | FIXED TAIL query (K is the only thing varying) ===\n"
+            f"=== adapt_params={ap}{' +FCD' if efcd else ''} | FIXED TAIL query "
+            f"(K is the only thing varying) ===\n"
             f"    adapted set-MAE MINUS the per-driver floor — read the K SHAPE here")
         if best and best_tail and best[0] != best_tail[0]:
             print(f"\n  [note] the two protocols disagree on tau "
@@ -495,6 +513,12 @@ def main() -> None:
                          "matmul. 30 keeps all 12 drivers usable out to K=64 (the shortest "
                          "has 94 segments); 40 already puts K=60 out of reach for them. "
                          "The tail is always disjoint from the support.")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", default="0",
+                    choices=["0", "1", "both"],
+                    help="Whether the adapted head also sees the 12 FCD dims "
+                         "([z_64 | FCD_12]). 'both' runs the pair on the identical folds, "
+                         "taus and Ks so the difference is read paired. The FCD block is "
+                         "anchored at zero, so K=0 is unchanged by construction.")
     ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS)
     ap.add_argument("--adapt-lr", dest="adapt_lr", type=float, default=DEFAULT_ADAPT_LR)
     # Backbone training (only when a fold's checkpoint is absent).
@@ -514,11 +538,13 @@ def main() -> None:
     ks = sorted({int(k) for k in args.ks.split(",") if k.strip()})
     fold_idx = [int(x) for x in args.folds.split(",") if x.strip()]
     adapt_params_list = ["all", "bias"] if args.adapt_params == "both" else [args.adapt_params]
+    embed_fcds = [False, True] if args.embed_fcd == "both" else [args.embed_fcd == "1"]
 
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = pathlib.Path(args.ckpt_dir) if args.ckpt_dir else outdir / "ckpt"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[device] {device} | taus={taus} | K={ks} | adapt_params={adapt_params_list}")
+    print(f"[device] {device} | taus={taus} | K={ks} | adapt_params={adapt_params_list} "
+          f"| embed_fcd={[int(e) for e in embed_fcds]}")
     n_cells = len(fold_idx) * len(adapt_params_list) * len(taus) * len(ks)
     ckpt_dir_p = pathlib.Path(args.ckpt_dir) if args.ckpt_dir else outdir / "ckpt"
     n_new = sum(1 for i in fold_idx
@@ -542,9 +568,16 @@ def main() -> None:
         cache = load_segment_cache(
             args.cache, cache_meta(args.in_jsonl, None,
                                    arch.get("window_seconds"), arch.get("resample_hz")))
-        all_rows += sweep_fold(fold, i, model, cache, arch, taus, ks,
-                               adapt_params_list, args.steps, args.adapt_lr, device,
-                               eval_tail=args.eval_tail)
+        for efcd in embed_fcds:
+            if efcd:
+                # Gate before any adaptation runs: a broken augmentation costs a
+                # second here rather than the whole grid.
+                _ds = SeqDataset.from_cache(cache, arch["context_length"], pids=set(fold))
+                _xb, _lb, _ = make_collate(arch["context_length"])([_ds[0]])
+                assert_zero_block_identity(model, _xb.to(device), _lb.to(device))
+            all_rows += sweep_fold(fold, i, model, cache, arch, taus, ks,
+                                   adapt_params_list, args.steps, args.adapt_lr, device,
+                                   eval_tail=args.eval_tail, embed_fcd=efcd)
 
     if not all_rows:
         raise SystemExit("no cells completed")

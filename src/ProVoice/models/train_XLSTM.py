@@ -34,6 +34,7 @@ from ProVoice.models.xlstm_model import _as01
 from ProVoice.decision_engine import truncate_frames_by_seconds
 from ProVoice.models.head_adapt import (
     DEFAULT_ADAPT_LR, DEFAULT_ADAPT_STEPS, DEFAULT_TAU, adapt_head_tensors,
+    assert_zero_block_identity, augment_z, expand_head_for_fcd,
 )
 
 
@@ -1037,6 +1038,21 @@ def main():
                          "(sweep_l2sp_tau) from checkpoints that depend on this stage's "
                          "output. Fix it here, disclose the value, and re-check at stage 3 "
                          "that the winning config is not tau-sensitive.")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Give the ADAPTED head direct access to the task: it sees "
+                         "[z_64 | FCD_12] instead of z_64 alone (308 parameters instead of "
+                         "260). Affects --adapt-eval only; the backbone, the population "
+                         "head and every stage-1/2 result are untouched, so no retraining "
+                         "is implied. WHY: the label here is close to a function of "
+                         "(driver x task) -- a per-(driver, function) constant reaches "
+                         "set-MAE 0.260 where the trained model reaches 0.956 -- and the "
+                         "head cannot cheaply express that from a pooled state in which "
+                         "FCD has been dragged through 100 recurrent steps. The 5 functions "
+                         "in this study have rank-5 FCD vectors, so a linear map over them "
+                         "can hit arbitrary per-function values: the augmented head can "
+                         "represent that lookup exactly. The new block is initialized AND "
+                         "L2-SP-anchored at zero, so K=0 reproduces the population head "
+                         "bit-for-bit -- checked at startup, not assumed.")
     ap.add_argument("--adapt-steps", dest="adapt_steps", type=int, default=DEFAULT_ADAPT_STEPS)
     ap.add_argument("--adapt-lr", dest="adapt_lr", type=float, default=DEFAULT_ADAPT_LR)
     ap.add_argument("--select-on", dest="select_on",
@@ -1392,7 +1408,7 @@ def main():
                                  # comparable with the suffix columns -- different
                                  # test set. Shapes across K are.
                                  "adapt_set_mae_tail", "adapt_set_acc_tail",
-                                 "adapt_n_drivers_tail",
+                                 "adapt_n_drivers_tail", "embed_fcd",
                                  # Untrained backbone + adapted head. Constant
                                  # per run, repeated per row like init_set_mae.
                                  "init_adapt_set_mae", "init_adapt_set_acc"]
@@ -1426,7 +1442,10 @@ def main():
             xb = xb.to(device).to(torch.float32)
             h = model.backbone(model.in_proj(xb))
             idx = (lb.to(h.device).long() - 1).clamp(min=0)
-            zs.append(h[torch.arange(h.size(0), device=h.device), idx].detach().cpu())
+            z = h[torch.arange(h.size(0), device=h.device), idx]
+            # Augment HERE, from the same batch the embedding came from, so a
+            # segment's FCD can never be paired with another segment's z.
+            zs.append(augment_z(z, xb, args.embed_fcd).detach().cpu())
         return torch.cat(zs) if zs else torch.zeros((0, 1))
 
     def evaluate_adaptation_val() -> Dict[str, float]:
@@ -1464,6 +1483,9 @@ def main():
         sids = list(test_ds.segment_ids)
 
         w0, b0 = model.head.weight.detach().cpu(), model.head.bias.detach().cpu()
+        # Zero-padded to the augmented width. This is both the init and the
+        # L2-SP anchor, which is what makes K=0 identical to the population head.
+        w0, b0 = expand_head_for_fcd(w0, b0, args.embed_fcd)
         per_driver_mae, per_driver_acc, n_cells = [], [], 0
         # Fixed-tail scores, from the SAME adapted heads. Reported only — the
         # selection quantity stays the suffix metric so --select-on keeps meaning
@@ -1535,6 +1557,12 @@ def main():
             out[f"adapt_set_acc_k{k}"] = (float(np.mean(by_k_acc[k])) if by_k_acc[k]
                                           else float("nan"))
         return out
+
+    # THE GATE for --embed-fcd. Runs before training so a broken augmentation
+    # costs a second rather than a whole sweep.
+    if args.adapt_eval and args.embed_fcd and test_dl is not None:
+        _xb, _lb, _ = next(iter(test_dl))
+        assert_zero_block_identity(model, _xb.to(device), _lb.to(device))
 
     # UNTRAINED REFERENCE. Evaluated before a single gradient step, so it is the
     # honest answer to "does training this model achieve anything at all?" —
@@ -1636,7 +1664,8 @@ def main():
         print(f"           argmax MAE={mae_arg:.3f} acc={acc_arg:.3f}"
               f"  |  median MAE={mae_med:.3f} acc={acc_med:.3f}")
         if args.adapt_eval:
-            print(f"           ADAPTED (K={','.join(str(k) for k in adapt_ks)}, "
+            print(f"           ADAPTED{'+FCD' if args.embed_fcd else ''} "
+                  f"(K={','.join(str(k) for k in adapt_ks)}, "
                   f"tau={args.adapt_tau:g}): set-MAE={ad['adapt_set_mae']:.3f} "
                   f"set-acc={ad['adapt_set_acc']:.3f} "
                   f"| tail={ad['adapt_set_mae_tail']:.3f} "
@@ -1656,7 +1685,7 @@ def main():
                                      ad["adapt_set_mae"], ad["adapt_set_acc"],
                                      ad["adapt_n_drivers"], ad["adapt_n_cells"],
                                      ad["adapt_set_mae_tail"], ad["adapt_set_acc_tail"],
-                                     ad["adapt_n_drivers_tail"],
+                                     ad["adapt_n_drivers_tail"], int(args.embed_fcd),
                                      init.get("adapt_mae", float("nan")),
                                      init.get("adapt_acc", float("nan"))]
                                     + [ad.get(c, float("nan")) for c in _adapt_k_columns])

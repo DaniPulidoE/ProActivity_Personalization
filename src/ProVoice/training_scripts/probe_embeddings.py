@@ -146,6 +146,7 @@ from ProVoice.models.train_XLSTM import (
     load_segment_cache, make_collate, per_driver_constant_baseline,
     set_accuracy, set_mae, set_qwk, within_driver_temporal_split,
 )
+from ProVoice.models.head_adapt import augment_z
 from ProVoice.models.xlstm_model import (
     D_IN, DEFAULT_RESAMPLE_HZ, FCD_NAMES, FEATURE_NAMES, XLSTMSequenceClassifier,
     load_checkpoint, logits_to_probs, probs_to_label, soft_corn_loss,
@@ -438,9 +439,15 @@ def embed_all_segments(model: XLSTMSequenceClassifier, segs: Segments,
     model.eval().to(device)
     zs = []
     for xb, lb, _ in dl:
-        h = model.backbone(model.in_proj(xb.to(device).to(torch.float32)))
+        x = xb.to(device).to(torch.float32)
+        h = model.backbone(model.in_proj(x))
         idx = (lb.to(h.device).long() - 1).clamp(min=0)
-        zs.append(h[torch.arange(h.size(0), device=h.device), idx].cpu())
+        z = h[torch.arange(h.size(0), device=h.device), idx]
+        # Inferred from the head's width, the same rule every other embedding
+        # site uses. A plain population checkpoint is unaffected; an FCD-widened
+        # one is probed at the width its head actually consumes instead of
+        # raising a shape error several frames later.
+        zs.append(augment_z(z, x, model.head_uses_fcd()).cpu())
     return torch.cat(zs).numpy().astype(np.float64)
 
 

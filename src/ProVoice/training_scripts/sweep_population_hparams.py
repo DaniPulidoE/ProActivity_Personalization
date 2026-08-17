@@ -145,6 +145,10 @@ RESULTS_COLUMNS = [
     # stays on the suffix metric. Levels are not comparable with the suffix
     # columns (different test set) but the shape across K is the interpretable one.
     "adapt_mae_tail", "adapt_acc_tail",
+    # 0/1. Part of the run KEY, not just a label: an embed-fcd run and a plain one
+    # at otherwise identical settings are different experiments and must not be
+    # skipped as "already done" by the resume logic.
+    "embed_fcd",
 ]
 
 
@@ -379,16 +383,19 @@ def read_done(path: pathlib.Path) -> set:
                 # with a windowed run.
                 w = row.get("window_seconds", "")
                 w = float(w) if w not in ("", None) else None
+                # Rows predating the column read as 0, which is what they were.
                 done.add((float(row["dropout"]), float(row["lr"]), w,
                           row.get("loss", "") or None,
-                          int(row["fold"]), int(row["seed"])))
+                          int(row["fold"]), int(row["seed"]),
+                          int(float(row.get("embed_fcd") or 0))))
             except (KeyError, ValueError):
                 continue        # a torn final line from an interrupted run
     return done
 
 
 def run_tag(dropout: float, lr: float, val_pids: List[str], seed: int,
-            window_seconds: Optional[float] = None, loss: Optional[str] = None) -> str:
+            window_seconds: Optional[float] = None, loss: Optional[str] = None,
+            embed_fcd: bool = False) -> str:
     """Filename tag for a run's artifacts.
 
     ``window_seconds`` is part of it because a 5 s and a 10 s run at the same
@@ -401,6 +408,10 @@ def run_tag(dropout: float, lr: float, val_pids: List[str], seed: int,
         t += f"_w{window_seconds:g}"
     if loss:
         t += f"_{loss}"
+    if embed_fcd:
+        # Suffix only when ON, so every pre-existing tag keeps resolving and
+        # --resummarize still finds curves written before this flag existed.
+        t += "_fcd"
     return t
 
 
@@ -575,7 +586,8 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
             epochs: int, patience: int, min_delta: float, min_select_epoch: int,
             window_seconds: float, loss: str, workdir: pathlib.Path,
             extra: List[str], cache: str = "",
-            threads: int = 0, timeout: float = 0.0) -> Optional[Dict[str, float]]:
+            threads: int = 0, timeout: float = 0.0,
+            embed_fcd: bool = False) -> Optional[Dict[str, float]]:
     """One training run. Returns its curve summary, or None if it failed.
 
     Runs train_XLSTM as a SUBPROCESS rather than importing it: each run needs a
@@ -612,7 +624,7 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
     regimes. Keep --jobs/--threads-per-job FIXED for a whole stage, the same way
     --decision-hz is held fixed across participants.
     """
-    tag = run_tag(dropout, lr, val_pids, seed, window_seconds, loss)
+    tag = run_tag(dropout, lr, val_pids, seed, window_seconds, loss, embed_fcd)
     ckpt = workdir / f"ckpt_{tag}.pt"          # written, then discarded — stage 2 retrains
     mcsv = workdir / f"metrics_{tag}.csv"      # KEPT: --resummarize re-reads these
     cmd = [sys.executable, "-m", "ProVoice.models.train_XLSTM",
@@ -622,7 +634,10 @@ def run_one(in_jsonl: str, dropout: float, lr: float, val_pids: List[str], seed:
            "--epochs", str(epochs), "--patience", str(patience),
            "--min-delta", str(min_delta),
            "--min-select-epoch", str(min_select_epoch),
-           "--window-seconds", str(window_seconds)] + extra
+           "--window-seconds", str(window_seconds)]
+    if embed_fcd:
+        cmd += ["--embed-fcd"]
+    cmd += extra
     if cache:
         cmd += ["--cache", cache]
     env = dict(os.environ)
@@ -822,6 +837,16 @@ def main() -> None:
                          "tau comes from stage 3, which depends on this stage's output - so "
                          "fix it here, disclose it, and verify at stage 3 that the winning "
                          "config is not tau-sensitive.")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", default="0",
+                    choices=["0", "1", "both"],
+                    help="Whether the ADAPTED head also sees the 12 FCD dims "
+                         "([z_64 | FCD_12], 308 parameters instead of 260). 'both' sweeps "
+                         "it as an AXIS, so the two implementations are compared on "
+                         "identical folds and seeds - the only way to read a difference "
+                         "this small. The FCD block is anchored at zero, so it cannot hurt "
+                         "at K=0 by construction. Requires --adapt-eval: the flag changes "
+                         "adaptation only, never the backbone, so no retraining is implied "
+                         "and stage-1/2 results stay valid.")
     ap.add_argument("--rank-on", dest="rank_on",
                     choices=["set_mae", "adapt_set_mae"], default=None,
                     help="Which column summarize() ranks configurations and derives E* from. "
@@ -887,6 +912,9 @@ def main() -> None:
         # explicitly and that wins, since argparse takes the LAST occurrence.
         if not any(a.startswith("--select-on") for a in args.trainer_args):
             trainer_args += ["--select-on", "adapt_set_mae"]
+    embed_fcds = [False, True] if args.embed_fcd == "both" else [args.embed_fcd == "1"]
+    if any(embed_fcds) and not args.adapt_eval:
+        raise SystemExit("--embed-fcd only affects the adaptation head; pass --adapt-eval.")
     rank_on = args.rank_on or ("adapt_set_mae" if args.adapt_eval else "set_mae")
     adapt_ks = sorted({int(k) for k in str(args.adapt_k).split(",") if k.strip()})
     if rank_on == "adapt_set_mae" and not args.adapt_eval:
@@ -937,9 +965,10 @@ def main() -> None:
         print(f"[resume] {len(done)} run(s) already in {results_csv}; they will be skipped")
 
     report_device()
-    total = len(dropouts) * len(lrs) * len(fold_idx) * len(seeds)
+    total = len(dropouts) * len(lrs) * len(fold_idx) * len(seeds) * len(embed_fcds)
+    fcd_txt = (f" x {len(embed_fcds)} embed-fcd" if len(embed_fcds) > 1 else "")
     print(f"[plan] {len(dropouts)} dropout x {len(lrs)} lr x {len(fold_idx)} fold x "
-          f"{len(seeds)} seed = {total} runs (<= {args.epochs} epochs each)")
+          f"{len(seeds)} seed{fcd_txt} = {total} runs (<= {args.epochs} epochs each)")
     for i in fold_idx:
         print(f"  fold {i}: val={list(VALIDATION_FOLDS[i])} "
               f"train={train_pids_for_validation_fold(VALIDATION_FOLDS[i])}")
@@ -964,9 +993,12 @@ def main() -> None:
                 val_pids = list(VALIDATION_FOLDS[i])
                 base = fold_baseline(labels, val_pids)
                 for seed in seeds:
-                    if (dropout, lr, args.window_seconds, args.loss, i, seed) in done:
-                        continue
-                    tasks.append((dropout, lr, i, val_pids, seed, base))
+                    for efcd in embed_fcds:
+                        key = (dropout, lr, args.window_seconds, args.loss, i, seed,
+                               int(efcd))
+                        if key in done:
+                            continue
+                        tasks.append((dropout, lr, i, val_pids, seed, base, efcd))
 
     print(f"[run] {len(tasks)} run(s) to do of {total}; {args.jobs} concurrent x "
           + (f"{threads} torch thread(s) each" if threads else "torch default threads"),
@@ -975,7 +1007,7 @@ def main() -> None:
     def report(t, r) -> str:
         """The per-run block, built as ONE string. With --jobs > 1 several runs
         finish at once, and separate print() calls would interleave line by line."""
-        dropout, lr, i, val_pids, seed, base = t
+        dropout, lr, i, val_pids, seed, base, _efcd = t
         d = r["smoothed_best_set_mae"] - base["const_set_mae"]
         def pct(v):
             tot = sum(v) or 1
@@ -997,13 +1029,13 @@ def main() -> None:
                 f"median MAE={r['mae_median']:.3f}")
 
     def work(t):
-        dropout, lr, i, val_pids, seed, _base = t
+        dropout, lr, i, val_pids, seed, _base, efcd = t
         return t, run_one(args.in_jsonl, dropout, lr, val_pids, seed,
                           args.epochs, args.patience, args.min_delta,
                           args.min_select_epoch, args.window_seconds,
                           args.loss, workdir, trainer_args,
                           cache=args.cache, threads=threads,
-                          timeout=args.run_timeout)
+                          timeout=args.run_timeout, embed_fcd=efcd)
 
     # Only THIS thread touches the writer, so the CSV needs no lock: the pool
     # workers just block on their subprocess and hand back the parsed curve.
@@ -1028,15 +1060,16 @@ def main() -> None:
                 # theoretical one — and at run 97 of 180 re-raising would discard
                 # the summary for the 96 that succeeded.
                 n_failed += 1
-                d, l, i, vp, s, _ = futs[fut]
+                d, l, i, vp, s, _, _efcd = futs[fut]
                 print(f"[ERROR] dropout={d} lr={l:g} fold={i}{vp} seed={s}: "
                       f"{type(e).__name__}: {e}", flush=True)
                 continue
-            dropout, lr, i, val_pids, seed, base = t
+            dropout, lr, i, val_pids, seed, base, efcd = t
             if r is None:
                 n_failed += 1
                 continue
             r.update(base)
+            r["embed_fcd"] = int(efcd)
             # The identity prefix and RESULTS_COLUMNS must stay in step;
             # N_ID is derived from the column list rather than written as
             # a literal, which is what let a sixth identity column slip
@@ -1164,15 +1197,19 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
             w = float(r.get("window_seconds", "") or "nan")
         except ValueError:
             w = float("nan")
+        # embed_fcd is part of the configuration key: averaging an augmented head
+        # together with a plain one would hide exactly the comparison the axis
+        # exists to make.
         by_cfg.setdefault((float(r["dropout"]), float(r["lr"]), w,
-                           r.get("loss", "") or "?"), []).append(r)
+                           r.get("loss", "") or "?",
+                           int(float(r.get("embed_fcd") or 0))), []).append(r)
 
     print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'sd':>6} {'se':>6} "
           f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11} {'const':>8} {'vs const':>8}"
           f"   (smoothed val {'ADAPTED ' if rank_on == 'adapt_set_mae' else ''}set-MAE)")
     table = []
-    for (dropout, lr, win, lss), rs in sorted(
-            by_cfg.items(), key=lambda kv: (str(kv[0][3]), kv[0][0], kv[0][1],
+    for (dropout, lr, win, lss, efcd), rs in sorted(
+            by_cfg.items(), key=lambda kv: (str(kv[0][3]), kv[0][4], kv[0][0], kv[0][1],
                                             -1e9 if kv[0][2] != kv[0][2] else kv[0][2])):
         v = np.array([float(r[rank_col]) for r in rs])
         e_arg = np.array([float(r[argmin_col]) for r in rs])
@@ -1188,7 +1225,7 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
         se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
         q1, q3 = np.percentile(e_1se, [25, 75])
         table.append({"dropout": dropout, "lr": lr, "window_seconds": win,
-                      "loss": lss, "n": len(v),
+                      "loss": lss, "embed_fcd": efcd, "n": len(v),
                       "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0,
                       "se": se, "e_star": int(np.median(e_1se)),
                       "e_argmin": int(np.median(e_arg)),
@@ -1205,7 +1242,9 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
                   if r.get("const_set_mae") not in (None, "")]
         table[-1]["const"] = float(np.mean(cb)) if cb else float("nan")
         table[-1]["delta"] = table[-1]["mean"] - table[-1]["const"]
-        print(f"{lss:>5} {dropout:8.2f} {lr:7.0e} {win:6.4g} {len(v):4d} {v.mean():7.3f} "
+        tag_fcd = "+fcd" if efcd else "    "
+        print(f"{lss:>5}{tag_fcd} {dropout:8.2f} {lr:7.0e} {win:6.4g} "
+              f"{len(v):4d} {v.mean():7.3f} "
               f"{table[-1]['sd']:6.3f} {se:6.3f} {table[-1]['e_star']:8d} "
               f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}"
               f" {table[-1]['const']:8.3f} {table[-1]['delta']:+8.3f}")
@@ -1265,6 +1304,7 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
         # overwrite it, so every --loss ce sweep recorded itself as corn.
         "window_seconds": pick.get("window_seconds"), "loss": pick.get("loss"),
         "epochs": pick["e_star"],
+        "embed_fcd": int(pick.get("embed_fcd", 0)),
         "rank_on": rank_on,
         "epochs_rule": (f"median over runs of the earliest epoch within 1 SE of the "
                         f"smoothed minimum of the {metric_name}"),

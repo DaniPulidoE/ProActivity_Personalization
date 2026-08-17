@@ -731,6 +731,9 @@ class XLSTMSequenceClassifier(nn.Module):
         )
         n_out = n_classes - 1 if head_type == 'corn' else n_classes
         self.head = nn.Linear(embedding_dim, n_out)
+        # Number of static FCD dims appended to the pooled state before the head.
+        # 0 for an ordinary model; see `head_uses_fcd` and forward().
+        self.fcd_dim = 12
         self.backbone.reset_parameters()
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -750,7 +753,23 @@ class XLSTMSequenceClassifier(nn.Module):
         else:
             idx = (lengths.to(h.device).long() - 1).clamp(min=0)
             pooled = h[torch.arange(h.size(0), device=h.device), idx]
+        if self.head_uses_fcd():
+            # FCD-AUGMENTED HEAD. Detected from the head's width, not from a
+            # flag: a checkpoint whose head is `embedding_dim + fcd_dim` wide
+            # says so itself, which is what lets a personalized head be SERVED
+            # without the decision engine knowing anything about the option.
+            # FCD occupies dims 0..fcd_dim-1 of every frame and is static per
+            # function, so timestep 0 is the whole vector.
+            pooled = torch.cat([pooled, x[:, 0, :self.fcd_dim]], dim=1)
         return self.head(pooled)
+
+    def head_uses_fcd(self) -> bool:
+        """True when the head expects ``[z | FCD]`` rather than ``z`` alone.
+
+        Derived from ``head.in_features`` so the model and its checkpoint cannot
+        disagree. ``head_adapt.expand_head_for_fcd`` is what produces such a head.
+        """
+        return self.head.in_features == self.embedding_dim + self.fcd_dim
 
 
 def logits_to_probs(logits: torch.Tensor, head_type: str = 'softmax') -> torch.Tensor:
@@ -994,6 +1013,26 @@ def load_checkpoint(path: str, map_location: str = 'cpu') -> Tuple[XLSTMSequence
     _DATA_CONTRACT_KEYS = ("window_seconds", "resample_hz")
     ctor_kwargs = {k: v for k, v in arch.items() if k not in _DATA_CONTRACT_KEYS}
     model = XLSTMSequenceClassifier(**ctor_kwargs)
+
+    # FCD-AUGMENTED HEAD. A checkpoint personalized with --embed-fcd carries a
+    # head of width `embedding_dim + fcd_dim`, while the constructor always
+    # builds the narrow one. Widen it HERE, from the state_dict's own shape,
+    # before the strict load -- otherwise every such checkpoint fails to load
+    # (size mismatch) and neither serving nor the arm comparison can read one.
+    #
+    # Derived from the weights rather than from an arch flag on purpose: the
+    # head's width IS the fact, so a checkpoint cannot end up disagreeing with
+    # its own metadata, and files written before any flag existed still load.
+    hw = ckpt["state_dict"].get("head.weight")
+    if hw is not None and hw.shape[1] != model.head.in_features:
+        expected = model.embedding_dim + model.fcd_dim
+        if hw.shape[1] != expected:
+            raise ValueError(
+                f"checkpoint head expects {hw.shape[1]} inputs; this model offers "
+                f"{model.head.in_features} (plain) or {expected} (FCD-augmented). "
+                f"The checkpoint does not match this feature schema.")
+        model.head = nn.Linear(hw.shape[1], hw.shape[0])
+
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
     return model, arch
