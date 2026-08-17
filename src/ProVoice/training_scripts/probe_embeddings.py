@@ -639,12 +639,18 @@ def run_bias_screen(segs: Segments, is_train: np.ndarray, drivers: List[str],
 
         with torch.no_grad():
             m = eval_logits(F.linear(Zva, w_pop, b_pop), Vva_t, V[va])
-        out.append({**base, "K": 0, "variant": "population", "n_adapted": 0,
-                    "grad_norm": 0.0, "final_loss": float("nan"), **m})
+        out.append({**base, "k_req": 0, "K": 0, "variant": "population",
+                    "n_adapted": 0, "grad_norm": 0.0, "final_loss": float("nan"), **m})
 
+        # k_req is the GRID value and K the realised support size. They differ
+        # whenever a driver's prefix is shorter than the requested K, and always
+        # for k_req=-1 ("all"), where K is 94-136 depending on the driver.
+        # Summaries group on k_req, so a cell means "at this budget" across all
+        # drivers instead of splitting into 12 groups of one.
         seen = set()
         for K in k_grid:
             k = len(tr_d) if K <= 0 else min(K, len(tr_d))
+            k_req = -1 if K <= 0 else K
             if k in seen:      # a K past this driver's prefix collapses onto "all"
                 continue
             seen.add(k)
@@ -657,7 +663,7 @@ def run_bias_screen(segs: Segments, is_train: np.ndarray, drivers: List[str],
                     steps=args.steps, lr=args.lr, adapt_params=ap)
                 with torch.no_grad():
                     m = eval_logits(F.linear(Zva, w, b), Vva_t, V[va])
-                out.append({**base, "K": k, "variant": variant,
+                out.append({**base, "k_req": k_req, "K": k, "variant": variant,
                             "n_adapted": info["n_adapted"],
                             "grad_norm": info["grad_norm"],
                             "final_loss": info["final_loss"], **m})
@@ -733,22 +739,32 @@ def print_ladder(summary: List[dict]) -> None:
 
 def print_bias(summary: List[dict]) -> None:
     print("\n=== BIAS-ONLY vs FULL HEAD — mean over drivers ===")
-    hdr = (f"{'K':>5} {'variant':>11} {'params':>7} {'NLL':>7} "
+    # k_req = -1 means "the driver's whole train prefix", which belongs at the
+    # END of the budget axis, not before K=0. Sorting maps it to +inf; the CSV
+    # keeps -1, which reads better there than a magic large number would.
+    def order(k: int) -> float:
+        return float("inf") if k < 0 else float(k)
+
+    def label(r) -> str:
+        return "all" if r["k_req"] < 0 else str(r["k_req"])
+
+    hdr = (f"{'K':>5} {'meanK':>6} {'variant':>11} {'params':>7} {'NLL':>7} "
            f"{'setMAE':>8} {'setACC':>8} {'setQWK':>8}")
     print(hdr)
     print("-" * len(hdr))
-    for r in sorted(summary, key=lambda x: (x["K"], x["variant"])):
-        print(f"{r['K']:>5} {r['variant']:>11} {int(r.get('n_adapted_mean') or 0):>7} "
+    for r in sorted(summary, key=lambda x: (order(x["k_req"]), x["variant"])):
+        print(f"{label(r):>5} {r['K_mean']:>6.0f} {r['variant']:>11} "
+              f"{int(r.get('n_adapted_mean') or 0):>7} "
               f"{r['nll_mean']:>7.3f} {r['set_mae_mean']:>8.3f} "
               f"{r['set_acc_mean']:>8.3f} {r['set_qwk_mean']:>8.3f}")
     by_k: Dict[int, Dict[str, float]] = {}
     for r in summary:
-        by_k.setdefault(r["K"], {})[r["variant"]] = r["set_mae_mean"]
+        by_k.setdefault(r["k_req"], {})[r["variant"]] = r["set_mae_mean"]
     print("\nfull-minus-bias set-MAE (negative = the 256 weights buy something):")
-    for K in sorted(by_k):
+    for K in sorted(by_k, key=order):
         d = by_k[K]
         if "full" in d and "bias" in d:
-            print(f"  K={K:<4} {d['full'] - d['bias']:+.4f}")
+            print(f"  K={('all' if K < 0 else K):<4} {d['full'] - d['bias']:+.4f}")
     print("If that column is ~0 at every K, personalization on this representation "
           "reduces to\nlearning each driver's preferred level: both study arms are "
           "tied by construction,\nand the contribution pivots to the K-vs-satisfaction "
@@ -787,7 +803,8 @@ def main() -> None:
     ap.add_argument("--k-grid", dest="k_grid", default="5,10,20,30,50,0",
                     help="Support sizes for the bias screen; 0 = the driver's whole "
                          "train prefix. Each K is clipped to what the driver has, and "
-                         "duplicates after clipping are dropped.")
+                         "duplicates after clipping are dropped. The CSV keeps both the "
+                         "grid value (k_req) and the realised size (K).")
     ap.add_argument("--pids", default="", help="Comma-separated subset of drivers.")
     ap.add_argument("--embed-batch", dest="embed_batch", type=int, default=32)
     ap.add_argument("--device", default="")
@@ -881,8 +898,8 @@ def main() -> None:
     if not args.skip_bias:
         bias = run_bias_screen(segs, is_train, drivers, embed_cache, heads, k_grid, args)
         write_csv(bias, outdir / "bias_vs_full.csv")
-        bsum = summarize(bias, ("K", "variant"),
-                         ("nll", "set_mae", "set_acc", "set_qwk", "n_adapted"))
+        bsum = summarize(bias, ("k_req", "variant"),
+                         ("nll", "set_mae", "set_acc", "set_qwk", "n_adapted", "K"))
         write_csv(bsum, outdir / "bias_summary.csv")
         print_bias(bsum)
 
