@@ -148,12 +148,47 @@ def evaluate(head: nn.Linear, Z: torch.Tensor, V: torch.Tensor, head_type: str):
     }
 
 
-def pick_sweep_points(n_pool: int, max_points: int):
-    """All prefix sizes 1..n_pool, thinned evenly if there are too many."""
-    if n_pool <= max_points:
-        return list(range(1, n_pool + 1))
-    ks = np.unique(np.linspace(1, n_pool, max_points).round().astype(int))
-    return ks.tolist()
+# THE K GRID. Fixed, shared by every driver, and dense where the curve moves.
+#
+# It used to be `linspace(1, n_pool, max_points)`, which had three faults:
+#
+#   * a THIRD of the budget landed above --k-cap on the longer drivers (7 of 20
+#     points for driver 007), where by the tau-selection rule it cannot vote;
+#   * spacing was uniform at ~4.5, so only 6 points fell at K <= 30 -- exactly
+#     where personalization quality changes fastest and where research question
+#     (b) is answered;
+#   * and the grid DEPENDED ON THE DRIVER (002 got 1,4,8,11...; 007 got
+#     1,6,11,16...), so the per-driver curves shared almost no K values and
+#     "the cohort at K=20" could not be read without interpolating.
+#
+# A fixed grid fixes all three at once and costs fewer adaptations per driver.
+# Values below 6 are every integer because the first few labels are where the
+# steepest movement is; above that the spacing widens as the curve flattens.
+K_GRID_BASE = (1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 25, 30, 40, 50, 60)
+# Points ABOVE the cap exist only to show whether the curve has saturated -- they
+# never enter tau selection. Deliberately few, and fixed rather than derived from
+# each driver's pool, so what little is plotted up there is still comparable.
+K_GRID_ABOVE_CAP = (75, 90)
+
+
+def pick_sweep_points(n_pool: int, max_points: int = 0, k_cap: int = 60):
+    """Prefix sizes to evaluate: a FIXED grid, clipped to what the driver has.
+
+    Driver-independent by construction below ``k_cap``, which is what lets the
+    per-driver curves be averaged at a given K instead of interpolated.
+
+    ``max_points`` is a ceiling, not a target: 0 (default) means "use the whole
+    grid". A smaller value thins it evenly, keeping the endpoints. Kept in the
+    signature because callers pass it positionally.
+    """
+    ks = [k for k in K_GRID_BASE if k <= min(k_cap, n_pool)]
+    ks += [k for k in K_GRID_ABOVE_CAP if k_cap < k <= n_pool]
+    if not ks:                      # a driver shorter than the smallest grid point
+        return list(range(1, max(1, n_pool) + 1))
+    if max_points and len(ks) > max_points:
+        idx = np.unique(np.linspace(0, len(ks) - 1, max_points).round().astype(int))
+        ks = [ks[i] for i in idx]
+    return ks
 
 
 def plot_curve(ks, maes, accs, base_mae, base_acc, n_val, out_png: pathlib.Path):
@@ -263,7 +298,11 @@ def main():
     ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS,
                     help="Full-batch gradient steps per sweep point. Fixed and "
                          "k-INDEPENDENT on purpose (was --epochs).")
-    ap.add_argument("--max-points", dest="max_points", type=int, default=60,
+    ap.add_argument("--k-cap", dest="k_cap", type=int, default=60,
+                    help="Upper end of the DENSE part of the K grid (see K_GRID_BASE). "
+                         "Points above it come from K_GRID_ABOVE_CAP and exist only to "
+                         "show saturation. Keep identical to sweep_l2sp_tau's --k-cap.")
+    ap.add_argument("--max-points", dest="max_points", type=int, default=0,
                     help="Cap on the number of sweep points (thinned evenly if exceeded).")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -312,7 +351,7 @@ def main():
     print(f"[baseline] population head: set-acc={base['acc']:.3f} "
           f"macro-F1={base['f1']:.3f} set-MAE={base['mae']:.3f} QWK={base['qwk']:.3f}")
 
-    ks = pick_sweep_points(len(Vpool), args.max_points)
+    ks = pick_sweep_points(len(Vpool), args.max_points, args.k_cap)
     results, infos = [], []
     worst_grad = 0.0
     for k in ks:

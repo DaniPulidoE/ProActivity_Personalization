@@ -84,7 +84,8 @@ GRAD_NORM_WARN = 1e-3
 
 
 def sweep_driver(model, arch, df: pd.DataFrame, taus: List[float], val_frac: float,
-                 max_points: int, steps: int, lr: float, device: str) -> List[dict]:
+                 max_points: int, steps: int, lr: float, device: str,
+                 k_cap: int = 60) -> List[dict]:
     """Full tau x K grid for ONE driver. The backbone runs once, not once per tau."""
     head_type = arch.get("head_type", "softmax")
     gids, Xs, vs = build_segments(df, window_seconds=arch.get("window_seconds"),
@@ -116,7 +117,7 @@ def sweep_driver(model, arch, df: pd.DataFrame, taus: List[float], val_frac: flo
     base = evaluate(pop_head, Zval, Vval, head_type)   # K=0 floor, same tail
     out = []
     for tau in taus:
-        for k in pick_sweep_points(len(Vpool), max_points):
+        for k in pick_sweep_points(len(Vpool), max_points, k_cap):
             head, info = adapt_head(pop_head, Zpool[:k], Vpool[:k], tau=tau,
                                     head_type=head_type, steps=steps, lr=lr)
             m = evaluate(head, Zval, Vval, head_type)
@@ -156,8 +157,12 @@ def main() -> None:
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60,
                     help="Only K <= this enters the tau selection average (~25 min of "
                          "labelling). Curves are still recorded and plotted in full.")
-    ap.add_argument("--max-points", dest="max_points", type=int, default=20,
-                    help="K grid resolution per driver.")
+    ap.add_argument("--max-points", dest="max_points", type=int, default=0,
+                    help="Ceiling on the number of K points, NOT a target. 0 (default) "
+                         "uses the whole fixed grid (sweep_train_frac.K_GRID_BASE): every "
+                         "driver is evaluated at the SAME K values below --k-cap, which is "
+                         "what makes the per-driver curves averageable at a given K rather "
+                         "than only interpolatable. A smaller value thins the grid evenly.")
     ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS)
     ap.add_argument("--lr", type=float, default=DEFAULT_ADAPT_LR)
     ap.add_argument("--pids", default="")
@@ -199,7 +204,8 @@ def main() -> None:
         del drows
         print(f"[{pid}] {len(taus)} tau x K grid from {ckpt.name}", flush=True)
         res = sweep_driver(model, arch, df, taus, args.val_frac,
-                           args.max_points, args.steps, args.lr, device)
+                           args.max_points, args.steps, args.lr, device,
+                           k_cap=args.k_cap)
         del df, model
         for r in res:
             r["pid"] = pid
