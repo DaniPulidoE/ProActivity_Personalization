@@ -55,6 +55,8 @@ import pathlib
 from typing import Dict, List
 
 import numpy as np
+
+from ProVoice.training_scripts.blocked_stats import blocked_effects
 import pandas as pd
 import torch
 
@@ -162,6 +164,15 @@ def main() -> None:
                          "L2-SP-anchored at zero, so K=0 reproduces the population head "
                          "exactly (checked at startup). MUST match the other arm: both arms "
                          "have to adapt the identical object or the comparison is confounded.")
+    ap.add_argument("--resummarize", action="store_true",
+                    help="Re-rank an existing l2sp_tau_sweep.csv and rewrite "
+                         "selected_tau.json without sweeping again. The selection is a pure "
+                         "function of that table, so a change to how taus are compared -- or "
+                         "a run that died in summarize -- must not cost another sweep. "
+                         "--val-frac and --embed-fcd are still read from the command line "
+                         "because they are recorded as provenance; pass the same values the "
+                         "sweep ran with (embed_fcd is also a column in the CSV and is "
+                         "cross-checked).")
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60,
                     help="Only K <= this enters the tau selection average (~25 min of "
                          "labelling). Curves are still recorded and plotted in full.")
@@ -181,6 +192,23 @@ def main() -> None:
     ckpt_dir = pathlib.Path(args.ckpt_dir)
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.resummarize:
+        csvp = outdir / "l2sp_tau_sweep.csv"
+        if not csvp.exists():
+            raise SystemExit(f"--resummarize: {csvp} does not exist")
+        d = pd.read_csv(csvp, dtype={"pid": str})
+        if "embed_fcd" in d.columns:
+            got = sorted(int(x) for x in d["embed_fcd"].dropna().unique())
+            if got != [int(args.embed_fcd)]:
+                raise SystemExit(
+                    f"--resummarize: the CSV was produced with embed_fcd={got} but "
+                    f"--embed-fcd says {int(args.embed_fcd)}. That value is recorded as "
+                    f"provenance and decides what object the tau applies to, so it is "
+                    f"refused rather than written wrong.")
+        summarize(d, sorted(d["tau"].unique()), args.k_cap, outdir,
+                  args.val_frac, int(args.embed_fcd))
+        return
 
     # MEMORY: never hold the whole file. data/labeled_data.jsonl parses to a
     # MEASURED 4.0 GB as raw dicts; one driver's normalized rows are ~1/12th of
@@ -237,11 +265,22 @@ def main() -> None:
         w.writeheader()
         w.writerows([{c: r[c] for c in cols} for r in all_rows])
 
-    summarize(pd.DataFrame(all_rows), taus, args.k_cap, outdir)
+    summarize(pd.DataFrame(all_rows), taus, args.k_cap, outdir,
+              args.val_frac, int(args.embed_fcd))
 
 
-def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.Path) -> None:
-    """Within-driver mean over K <= k_cap, then across drivers; pick tau."""
+def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.Path,
+              val_frac: float, embed_fcd: int) -> None:
+    """Within-driver mean over K <= k_cap, then across drivers; pick tau.
+
+    ``val_frac`` and ``embed_fcd`` are PARAMETERS, not read off a global ``args``.
+    They were reaching the output JSON through the module namespace, which does
+    not exist -- ``args`` is local to ``main`` -- so this function raised
+    NameError on its last statement, after the whole sweep had run. The CSV is
+    written before this call and survived; only ``selected_tau.json`` was lost.
+    Passing them in also makes ``--resummarize`` possible, which is how a run
+    that hit the crash recovers without re-sweeping.
+    """
     sub = df[df["k"] <= k_cap]
     if sub.empty:
         raise SystemExit(f"no sweep points with K <= {k_cap}")
@@ -257,8 +296,30 @@ def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.P
               f"{int(r['count']):8d}")
     print(f"{'floor':>8} {floor:13.3f}    (unadapted population model, K=0)")
 
-    best = agg.loc[agg["mean"].idxmin()]
-    within = agg[agg["mean"] <= best["mean"] + best["se"]]
+    # BLOCK ON DRIVER. Every tau is scored on the identical 12 drivers, so
+    # between-driver difficulty is common to all of them and cancels in any
+    # tau-vs-tau comparison. Leaving it in `se` is not a rounding matter here:
+    # the between-driver sd is 0.343 (se ~0.099 at n=12) while the whole sub-1
+    # tau grid spans 0.028, so EVERY tau lands inside the 1-SE band and the
+    # tie-break below returns the largest tau unconditionally -- a selection
+    # made without consulting the data. See training_scripts/blocked_stats.
+    blocked = blocked_effects(
+        (float(r["tau"]), r["pid"], float(r["set_mae"]))
+        for _, r in per_driver.iterrows())
+    if blocked is None:
+        print("[rank] not every tau was scored on every driver — falling back to the "
+              "RAW between-driver se, which cannot resolve taus on this cohort.")
+    else:
+        agg["mean_blocked"] = agg["tau"].map(lambda t: blocked[float(t)][0])
+        agg["se_blocked"] = agg["tau"].map(lambda t: blocked[float(t)][1])
+        n_blk = next(iter(blocked.values()))[2]
+        print(f"[rank] selecting on the DRIVER-BLOCKED mean over {n_blk} driver(s); "
+              f"'se' above is the unblocked between-driver spread, kept for reference.")
+
+    rank_col = "mean_blocked" if blocked is not None else "mean"
+    se_col = "se_blocked" if blocked is not None else "se"
+    best = agg.loc[agg[rank_col].idxmin()]
+    within = agg[agg[rank_col] <= best[rank_col] + best[se_col]]
     pick = within.loc[within["tau"].idxmax()]
     if float(pick["tau"]) != float(best["tau"]):
         print(f"[tie-break] {len(within)} tau within 1 SE of the minimum; "
@@ -269,6 +330,12 @@ def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.P
         "mean_set_mae": float(pick["mean"]),
         "between_driver_sd": float(pick["std"]),
         "se": float(pick["se"]),
+        "selection_estimator": ("driver-blocked" if blocked is not None
+                                else "raw between-driver (UNBLOCKED)"),
+        "mean_set_mae_blocked": (float(pick["mean_blocked"]) if blocked is not None
+                                 else None),
+        "se_blocked": float(pick["se_blocked"]) if blocked is not None else None,
+        "n_tau_within_1se": int(len(within)),
         "n_drivers": int(pick["count"]),
         "k_cap": k_cap,
         "unadapted_floor_set_mae": float(floor),
@@ -276,8 +343,8 @@ def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.P
         # Everything that changes what tau MEANS. val_frac decides which
         # segments the curves were scored on; embed_fcd decides what object was
         # adapted. A tau is only transferable to another run that matches both.
-        "val_frac": args.val_frac,
-        "embed_fcd": int(args.embed_fcd),
+        "val_frac": val_frac,
+        "embed_fcd": int(embed_fcd),
         "adapt_steps": DEFAULT_ADAPT_STEPS, "adapt_lr": DEFAULT_ADAPT_LR,
         "note": ("Single prior precision for ALL K, all drivers and BOTH study arms. "
                  "lambda = tau/(2K) is derived per adaptation by head_adapt. Selected on "

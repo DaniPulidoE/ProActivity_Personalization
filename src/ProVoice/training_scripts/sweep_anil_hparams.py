@@ -82,10 +82,11 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ProVoice.training_scripts.blocked_stats import blocked_effects
 from ProVoice.training_scripts.folds import (
     VALIDATION_FOLDS, train_pids_for_validation_fold,
 )
@@ -108,6 +109,7 @@ RESULTS_COLUMNS = [
     "metrics_epoch",           # which epoch the *_at_best columns describe
     "epochs_run",
     "val_qwk_at_best",
+    "val_acc_at_best",
     # The meta-TRAINING signal, reported alongside so a run that failed to train
     # is distinguishable from one that trained fine and did not transfer.
     "query_loss_first", "query_loss_at_best", "query_loss_last",
@@ -120,6 +122,31 @@ ID_COLUMNS = ["outer_lr", "crop_frac", "jitter_std", "tau", "fold", "val_pids", 
 N_ID = len(ID_COLUMNS)
 assert RESULTS_COLUMNS[:N_ID] == ID_COLUMNS
 assert len(set(RESULTS_COLUMNS)) == len(RESULTS_COLUMNS)
+
+
+def parse_val_ks(spec: str) -> List[int]:
+    try:
+        ks = sorted({int(t) for t in spec.split(",") if t.strip()})
+    except ValueError as e:
+        raise SystemExit(f"--val-ks must be comma-separated integers, got {spec!r}") from e
+    if not ks or ks[0] < 1:
+        raise SystemExit(f"--val-ks must be positive integers, got {ks}")
+    return ks
+
+
+def results_columns(val_ks: List[int]) -> List[str]:
+    """Header for the results table, widened by the meta-validation K grid.
+
+    The per-K columns are what make the ranking auditable. A single mean over
+    {5,10,20,30,60} can improve because the arm got better at K=60 while getting
+    worse at K=5 -- opposite conclusions for the deployment story -- and the mean
+    cannot distinguish those. They are also the only way to compare this arm's
+    shape against the L2-SP learning curve, since the two use different
+    evaluation protocols and so are comparable in SHAPE but not in level.
+    """
+    return (RESULTS_COLUMNS
+            + [f"val_set_mae_k{k}" for k in val_ks]
+            + [f"val_set_acc_k{k}" for k in val_ks])
 
 
 def read_json(p: pathlib.Path) -> Optional[Dict]:
@@ -202,7 +229,8 @@ def ensure_fold_population(in_jsonl: str, fold_idx: int, val_pids: List[str],
     return ckpt
 
 
-def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, float]]:
+def curve_stats(rows: List[dict], min_select_epoch: int,
+                val_ks: List[int]) -> Optional[Dict[str, float]]:
     """Per-run numbers from one meta-training curve. Mirrors the population sweep."""
     rows = [r for r in rows if r.get("val_set_mae") not in ("", None)]
     if not rows:
@@ -236,6 +264,12 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
         "metrics_epoch": int(rows[j]["epoch"]),
         "epochs_run": len(rows),
         "val_qwk_at_best": num("val_set_qwk"),
+        "val_acc_at_best": num("val_set_acc"),
+        # Per-K, read at the SELECTED epoch -- the same row every other
+        # *_at_best column describes, so the breakdown and the mean cannot
+        # describe different points on the curve.
+        **{f"val_set_mae_k{k}": num(f"val_set_mae_k{k}") for k in val_ks},
+        **{f"val_set_acc_k{k}": num(f"val_set_acc_k{k}") for k in val_ks},
         "query_loss_first": float(ql[0]),
         "query_loss_at_best": float(ql[j]),
         "query_loss_last": float(ql[-1]),
@@ -264,6 +298,10 @@ def run_one(in_jsonl: str, init_ckpt: pathlib.Path, outer_lr: float, crop: float
            "--meta-epochs", str(args.meta_epochs), "--episodes", str(args.episodes),
            "--meta-batch", str(args.meta_batch), "--patience", str(args.patience),
            "--k-min", str(args.k_min), "--k-max", str(args.k_max),
+           # Explicit: this decides what val_set_mae means, hence what M* and
+           # the whole ranking are selected for. Never inherited from the
+           # child's default.
+           "--val-ks", args.val_ks,
            "--fo-warmup-epochs", "0"]
     # ARM SYMMETRY: threaded to the child rather than assumed, so a
     # plain and an augmented arm cannot be produced by the same command.
@@ -286,7 +324,7 @@ def run_one(in_jsonl: str, init_ckpt: pathlib.Path, outer_lr: float, crop: float
         print(f"  [FAIL] {tag}: no metrics CSV")
         return None
     stats = curve_stats(list(csv.DictReader(mcsv.open("r", encoding="utf-8", newline=""))),
-                        args.min_select_epoch)
+                        args.min_select_epoch, parse_val_ks(args.val_ks))
     if stats is None:
         print(f"  [FAIL] {tag}: no meta-validation rows in the curve")
         return None
@@ -339,6 +377,20 @@ def main() -> None:
                          "position and is the diversity defence against meta-overfitting; "
                          "meta-validation always uses the true session prefix regardless. "
                          "Passed explicitly because the default encodes no decision.")
+    ap.add_argument("--summarize-only", dest="summarize_only", action="store_true",
+                    help="Re-rank an existing results CSV and rewrite selected_anil.json "
+                         "without running anything. The ranking is a pure function of the "
+                         "table, so a change to how configs are compared must not cost "
+                         "another overnight sweep.")
+    ap.add_argument("--val-ks", dest="val_ks", default="5,10,20,30,60",
+                    help="Meta-validation support sizes, passed to xlstm_maml. The ranking "
+                         "quantity is the flat mean over drivers x this grid, and the results "
+                         "CSV gains a val_set_mae_k<K>/val_set_acc_k<K> pair per K at the "
+                         "selected epoch. Widening this is nearly free (the driver is embedded "
+                         "once and sliced) and it is what stops the arm from being tuned "
+                         "exclusively for the first three minutes of labelling. Changing it "
+                         "changes the header, so a results file started under a different grid "
+                         "is refused rather than appended to.")
     ap.add_argument("--jobs", type=int, default=1,
                     help="Concurrent meta-training runs. They are independent "
                          "subprocesses, so this is the same trade the population sweep "
@@ -397,11 +449,31 @@ def main() -> None:
     print(f"[plan] {len(outer_lrs)} outer_lr x {len(augs)} aug x {len(fold_idx)} fold x "
           f"{len(seeds)} seed = {total} meta-training runs (<= {args.meta_epochs} epochs)")
 
+    if args.summarize_only:
+        if not results_csv.exists():
+            raise SystemExit(f"--summarize-only: {results_csv} does not exist")
+        summarize(results_csv, outdir, tau)
+        return
+
+    COLS = results_columns(parse_val_ks(args.val_ks))
     new = not results_csv.exists()
+    if not new:
+        # Appending rows of a different width to an existing file produces a
+        # table no reader can parse and no one notices until the analysis.
+        with results_csv.open("r", encoding="utf-8", newline="") as _f:
+            hdr = next(csv.reader(_f), [])
+        if hdr and hdr != COLS:
+            extra, missing = set(hdr) - set(COLS), set(COLS) - set(hdr)
+            raise SystemExit(
+                f"{results_csv} was written with a different column set "
+                f"(+{sorted(extra)} / -{sorted(missing)}). Almost certainly a different "
+                f"--val-ks, which also makes the val_set_mae values incomparable, so "
+                f"resuming into it would pool two rankings. Use a fresh --outdir, or "
+                f"re-run the earlier rows under the new grid.")
     fh = results_csv.open("a", encoding="utf-8", newline="")
     writer = csv.writer(fh)
     if new:
-        writer.writerow(RESULTS_COLUMNS); fh.flush()
+        writer.writerow(COLS); fh.flush()
 
     # PHASE 1 -- warm starts, SERIALLY. One per fold, cached. Building them inside
     # the parallel phase would let two runs on the same fold race to write the same
@@ -453,7 +525,7 @@ def main() -> None:
                 continue
             val_pids = list(VALIDATION_FOLDS[i])
             writer.writerow([olr, crop, jit, tau, i, "|".join(val_pids), seed]
-                            + [r[c] for c in RESULTS_COLUMNS[N_ID:]])
+                            + [r[c] for c in COLS[N_ID:]])
             fh.flush()
             print(f"[{n_done}/{len(tasks)}] outer_lr={olr:g} crop={crop:g} "
                   f"jitter={jit:g} fold={i}{val_pids} seed={seed}\n"
@@ -484,8 +556,21 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path, tau: float) -> No
         by.setdefault((float(r["outer_lr"]), float(r["crop_frac"]), float(r["jitter_std"])),
                       []).append(r)
 
-    print(f"\n{'outer_lr':>9} {'crop':>5} {'jit':>5} {'n':>4} {'val MAE':>8} {'sd':>6} "
-          f"{'se':>6} {'M*':>4} {'argmin':>7} {'qloss drop':>11} {'res':>8}")
+    paired = blocked_effects(
+        (cfg, (r["fold"], r["seed"]), float(r["smoothed_best_val_mae"]))
+        for cfg, rs in by.items() for r in rs
+        if r.get("smoothed_best_val_mae") not in ("", None))
+    if paired is None:
+        print("[rank] design too unbalanced to block on fold — falling back to the RAW mean. "
+              "Its se is dominated by between-fold difficulty, so treat the ranking as "
+              "indicative only and re-run the missing cells.")
+    else:
+        nb = next(iter(paired.values()))[2]
+        print(f"[rank] ranking on the FOLD-BLOCKED mean over {nb} complete (fold, seed) "
+              f"block(s); 'val MAE' below is that estimate, 'raw' is the unblocked mean.")
+
+    print(f"\n{'outer_lr':>9} {'crop':>5} {'jit':>5} {'n':>4} {'val MAE':>8} {'raw':>7} "
+          f"{'sd':>6} {'se':>6} {'M*':>4} {'argmin':>7} {'qloss drop':>11} {'res':>8}")
     table = []
     for (olr, crop, jit), rs in sorted(by.items()):
         v = np.array([float(r["smoothed_best_val_mae"]) for r in rs])
@@ -493,16 +578,22 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path, tau: float) -> No
         ma = np.array([float(r["best_epoch_smoothed"]) for r in rs])
         qd = np.array([float(r["query_loss_drop"]) for r in rs])
         res = np.array([float(r["inner_res_max"]) for r in rs if r["inner_res_max"] not in ("", "nan")])
-        se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
+        raw_mean = float(v.mean())
+        raw_se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
+        if paired is not None:
+            mean, se, n_blocks = paired[(olr, crop, jit)]
+        else:
+            mean, se, n_blocks = raw_mean, raw_se, 0
         table.append({"outer_lr": olr, "crop_frac": crop, "jitter_std": jit, "n": len(v),
-                      "mean": float(v.mean()),
+                      "mean": mean, "raw_mean": raw_mean, "raw_se": raw_se,
+                      "n_blocks": n_blocks, "blocked": paired is not None,
                       "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0, "se": se,
                       "m_star": int(np.median(m1)), "argmin": int(np.median(ma)),
                       "qloss_drop": float(qd.mean()),
                       "res_max": float(res.max()) if res.size else float("nan")})
         t = table[-1]
         print(f"{olr:9.0e} {crop:5.2f} {jit:5.3f} {len(v):4d} {t['mean']:8.3f} "
-              f"{t['sd']:6.3f} {se:6.3f} {t['m_star']:4d} {t['argmin']:7d} "
+              f"{raw_mean:7.3f} {t['sd']:6.3f} {se:6.3f} {t['m_star']:4d} {t['argmin']:7d} "
               f"{t['qloss_drop']:+11.3f} {t['res_max']:8.1e}")
 
     best = min(table, key=lambda t: t["mean"])
@@ -524,6 +615,12 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path, tau: float) -> No
                             "smoothed meta-val minimum",
         "meta_epochs_argmin_median": pick["argmin"],
         "mean_val_set_mae": pick["mean"], "se": pick["se"], "n_runs": pick["n"],
+        # Which estimator actually chose this, and how far it sits from the raw
+        # mean. A large gap between them means the fold spread was doing the
+        # ranking before, and any earlier selection off this grid is suspect.
+        "ranking_estimator": ("fold-blocked" if pick["blocked"] else "raw mean (UNBLOCKED)"),
+        "n_blocks": pick["n_blocks"],
+        "raw_mean_val_set_mae": pick["raw_mean"], "raw_se": pick["raw_se"],
         "mean_query_loss_drop": pick["qloss_drop"],
         "worst_inner_residual": pick["res_max"],
         "outer_lr_on_grid_edge": bool(edge),

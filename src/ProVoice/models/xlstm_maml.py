@@ -128,6 +128,7 @@ from ProVoice.models.train_XLSTM import (
     iter_jsonl,
     normalize_row,
     make_collate,
+    set_accuracy,
     set_mae,
     set_qwk,
 )
@@ -567,6 +568,61 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
     return set_mae(Yl, Yp), set_qwk(Yl, Yp, 5)
 
 
+def evaluate_adaptation_multi_k(model, segs: List[Segment], ks: List[int],
+                                collate, device: str, loss_fn, head_type: str,
+                                steps: int, lr: float, tau: float,
+                                ) -> Dict[int, Tuple[float, float, float, int]]:
+    """:func:`evaluate_adaptation` at SEVERAL support sizes, embedding once.
+
+    Returns ``{requested_K: (set_mae, set_acc, set_qwk, effective_K)}``.
+
+    The driver's whole segment list goes through the backbone ONE time and the
+    result is sliced per K. Calling :func:`evaluate_adaptation` in a loop instead
+    repeats the only expensive part -- a backbone forward over the driver's ~120
+    segments -- once per K, which is what made a wide meta-validation grid look
+    unaffordable.
+
+    What that buys, measured on 120 synthetic segments: a 2-point grid drops
+    6.8s -> 4.9s per driver per epoch, and a 5-point grid costs 10.8s. So the
+    term that scaled with the grid is gone, but the ADAPTATION does not vanish
+    -- 2000 AdamW steps is ~2s per (driver, K) and is now the dominant cost.
+    Widening {5,10} -> {5,10,20,30,60} is ~1.6x the old validation cost, not the
+    2.5x a naive per-K reading would predict; against ~54s/epoch of meta-training
+    that is roughly +12% per epoch.
+
+    HOW EXACT THIS IS, measured rather than asserted. ``make_collate`` right-pads
+    every segment to the fixed ``context_length``, so no segment's embedding
+    depends on the CONTENT of its batch -- but it does depend slightly on the
+    batch's SIZE, because that selects a different matmul kernel and so a
+    different float32 reduction order. Measured: the support block comes back
+    bit-identical, the query block differs by ~1e-6 per embedding coordinate.
+    That does not survive to the metric -- the embeddings are consumed by 2000
+    adaptation steps and then an argmax over 5 ordinal classes. Checked against
+    :func:`evaluate_adaptation` over 3 seeds x K in {5,10,20,30,60}: all 15 cells
+    returned identical set-MAE and set-QWK to full printed precision. So this is
+    a faster route to the same numbers, NOT a bit-reproducible one; a run that
+    needs bit-level reproduction against the old path will not get it.
+
+    Effective K is returned because it is CLIPPED to leave at least one query
+    segment; a caller averaging over the grid needs to know when two requested
+    K values collapsed onto the same evaluation and are being double-counted.
+    """
+    n = len(segs)
+    x, l, v = collate(segs)
+    Z = embed(model, x, l, device)          # grad=False by default: no graph
+    V = v.to(device)
+    out: Dict[int, Tuple[float, float, float, int]] = {}
+    for K in ks:
+        Kc = max(1, min(int(K), n - 1))
+        w, b, _ = adapt_head_tensors(Z[:Kc], V[:Kc], model.head.weight, model.head.bias,
+                                     tau=tau, head_type=head_type, steps=steps, lr=lr)
+        with torch.no_grad():
+            pred = logits_to_label(F.linear(Z[Kc:], w, b), head_type)
+        Yl, Yp = v[Kc:].numpy(), pred.cpu().numpy()
+        out[int(K)] = (set_mae(Yl, Yp), set_accuracy(Yl, Yp), set_qwk(Yl, Yp, 5), Kc)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="ANIL meta-training of the xLSTM LoA model (head-only proximal "
@@ -671,6 +727,22 @@ def main():
                     help="Comma-separated participant ids held out for meta-validation "
                          "(drive this externally for leave-one-driver-out). Empty: hold out "
                          "~20%% of drivers at random.")
+    ap.add_argument("--val-ks", dest="val_ks", default="5,10,20,30,60",
+                    help="Support sizes at which meta-validation adapts the held-out "
+                         "drivers. THIS DEFINES WHAT val_set_mae MEANS, and therefore what "
+                         "M* and the configuration ranking are selected FOR. The old grid "
+                         "was {--k-min, --k-max} = {5,10}, which tuned the arm purely for the "
+                         "first three minutes of labelling while the L2-SP learning curve "
+                         "shows personalization does its real work above K=30. Decoupled from "
+                         "--k-min/--k-max on purpose: those set the TRAINING episode regime, "
+                         "this sets what the model is SELECTED for, and there is no reason the "
+                         "two must coincide. The reported val_set_mae/val_set_acc are FLAT "
+                         "MEANS over drivers x this grid; per-K columns go to --metrics-csv so "
+                         "any other weighting is recoverable without re-running. Costs almost "
+                         "nothing to widen (see evaluate_adaptation_multi_k). Values are "
+                         "clipped per driver to leave a query tail. RECORD IT -- runs with "
+                         "different grids produce val_set_mae numbers that are not comparable "
+                         "and must not be pooled into one ranking.")
     ap.add_argument("--val-adapt-steps", type=int, default=DEFAULT_ADAPT_STEPS,
                     help="Full-batch steps for meta-validation adaptation, which runs through "
                          "head_adapt.adapt_head_tensors — the same function that serves. "
@@ -817,9 +889,17 @@ def main():
     # output file
     outp = pathlib.Path(args.out_pt); outp.parent.mkdir(parents=True, exist_ok=True)
 
-    # Meta-val K values: adaptation quality at both ends of the deployment
-    # support-size range (clipped per driver so a query tail always remains).
-    val_ks = sorted({args.k_min, args.k_max})
+    # Meta-val K values (clipped per driver so a query tail always remains).
+    try:
+        val_ks = sorted({int(t) for t in args.val_ks.split(",") if t.strip()})
+    except ValueError as e:
+        raise ValueError(
+            f"--val-ks must be comma-separated integers, got {args.val_ks!r}") from e
+    if not val_ks or val_ks[0] < 1:
+        raise ValueError(f"--val-ks must be positive integers, got {val_ks}")
+    print(f"[val] meta-validation K grid: {val_ks} "
+          f"(flat mean over {len(val_pids)} driver(s) x {len(val_ks)} K = "
+          f"{len(val_pids) * len(val_ks)} cells)")
 
     # Per-epoch metrics for the sweep. TWO signals, deliberately both:
     #   query_loss  — meta-TRAINING progress, on `--episode-start any` episodes.
@@ -839,7 +919,15 @@ def main():
         metrics_writer.writerow([
             "epoch", "order_this_epoch", "query_loss",
             "val_set_mae", "val_set_qwk", "val_n_drivers", "val_ks",
-            "inner_res_max", "inner_unconverged", "n_episodes"])
+            "inner_res_max", "inner_unconverged", "n_episodes"]
+            # APPENDED, so the leading columns keep their positions and every
+            # existing reader (all csv.DictReader) is unaffected. The mean alone
+            # cannot answer the question the wider grid was added for -- whether
+            # the meta-init helps more as labels accumulate -- because a flat
+            # mean hides the slope across K.
+            + ["val_set_acc"]
+            + [f"val_set_mae_k{k}" for k in val_ks]
+            + [f"val_set_acc_k{k}" for k in val_ks])
 
     best_val = float("inf")
     bad_epochs = 0
@@ -929,26 +1017,47 @@ def main():
         # ---- meta-validation: deployment-style adaptation on held-out drivers ----
         if val_pids:
             model.eval()
-            maes, qwks = [], []
+            maes, accs, qwks = [], [], []
+            per_k_mae = {k: [] for k in val_ks}
+            per_k_acc = {k: [] for k in val_ks}
+            clipped = set()
             for pid in val_pids:
-                for K in val_ks:
-                    Kc = min(K, len(drivers[pid]) - 1)
-                    m, q = evaluate_adaptation(
-                        model, drivers[pid], Kc, collate, device, loss_fn, head_type,
-                        args.val_adapt_steps, args.val_adapt_lr, args.tau)
-                    maes.append(m); qwks.append(q)
+                res = evaluate_adaptation_multi_k(
+                    model, drivers[pid], val_ks, collate, device, loss_fn, head_type,
+                    args.val_adapt_steps, args.val_adapt_lr, args.tau)
+                for K, (m, a, q, Kc) in res.items():
+                    maes.append(m); accs.append(a); qwks.append(q)
+                    per_k_mae[K].append(m); per_k_acc[K].append(a)
+                    if Kc != K:
+                        clipped.add((pid, K, Kc))
             model.train()
+            if clipped and ep == 0:
+                # Once, at epoch 0. Two requested K values clipping to the same
+                # effective K are counted twice in the flat mean, silently
+                # reweighting the selection criterion toward that driver.
+                print(f"[warn] --val-ks clipped (pid, asked, used): {sorted(clipped)} — "
+                      f"that driver has too few segments to leave a query tail.")
             val_mae, val_qwk = float(np.mean(maes)), float(np.mean(qwks))
+            val_acc = float(np.mean(accs))
+            kmae = {k: (float(np.mean(v)) if v else float("nan"))
+                    for k, v in per_k_mae.items()}
+            kacc = {k: (float(np.mean(v)) if v else float("nan"))
+                    for k, v in per_k_acc.items()}
+            k_note = " ".join(f"K{k}={kmae[k]:.3f}" for k in val_ks)
             print(f"[epoch {ep:02d}] query_loss={train_loss:.4f} "
-                  f"val_set-MAE={val_mae:.3f} val_set-QWK={val_qwk:.3f} "
-                  f"(drivers={len(val_pids)}, K={val_ks}){res_note}")
+                  f"val_set-MAE={val_mae:.3f} val_set-ACC={val_acc:.3f} "
+                  f"val_set-QWK={val_qwk:.3f} (drivers={len(val_pids)}) "
+                  f"[{k_note}]{res_note}")
             if metrics_writer is not None:
                 metrics_writer.writerow([
                     ep, ("first" if warm else args.order), train_loss,
                     val_mae, val_qwk, len(val_pids), "|".join(str(k) for k in val_ks),
                     (max(ep_res) if ep_res else ""),
                     (sum(r > args.imaml_tol for r in ep_res) if ep_res else ""),
-                    len(ep_losses)])
+                    len(ep_losses)]
+                    + [val_acc]
+                    + [kmae[k] for k in val_ks]
+                    + [kacc[k] for k in val_ks])
                 metrics_fh.flush()   # the sweep reads these while the run is in flight
             if val_mae < best_val:
                 best_val = val_mae
@@ -967,7 +1076,7 @@ def main():
                     ep, ("first" if warm else args.order), train_loss,
                     "", "", 0, "", (max(ep_res) if ep_res else ""),
                     (sum(r > args.imaml_tol for r in ep_res) if ep_res else ""),
-                    len(ep_losses)])
+                    len(ep_losses)] + ["" for _ in range(1 + 2 * len(val_ks))])
                 metrics_fh.flush()
             save_checkpoint(model, str(outp), arch=arch)
 

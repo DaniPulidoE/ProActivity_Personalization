@@ -69,6 +69,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ProVoice.models.train_XLSTM import constant_baseline, iter_jsonl, set_mae
+from ProVoice.training_scripts.blocked_stats import blocked_effects
 from ProVoice.training_scripts.folds import VALIDATION_FOLDS, train_pids_for_validation_fold
 
 LEVELS = [f"Level_{i}" for i in range(1, 6)]
@@ -1214,7 +1215,21 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
                            r.get("loss", "") or "?",
                            int(float(r.get("embed_fcd") or 0))), []).append(r)
 
-    print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'sd':>6} {'se':>6} "
+    # Blocked on (fold, seed): every config is run on every fold and seed, so the
+    # fold's difficulty is a constant that cancels between configs and must not
+    # be inside the error bar that decides the 1-SE tie-break below.
+    blocked = blocked_effects(
+        (cfg, (r.get("fold", ""), r.get("seed", "")), float(r[rank_col]))
+        for cfg, rs in by_cfg.items() for r in rs if r.get(rank_col) not in ("", None))
+    if blocked is None:
+        print("[rank] design too unbalanced to block on (fold, seed) — falling back to "
+              "the RAW mean, whose se is dominated by between-fold difficulty. Treat the "
+              "ranking as indicative and re-run the missing cells.")
+    else:
+        print(f"[rank] ranking on the FOLD-BLOCKED mean over "
+              f"{next(iter(blocked.values()))[2]} complete (fold, seed) block(s).")
+
+    print(f"\n{'dropout':>8} {'lr':>7} {'n':>4} {'mean':>7} {'raw':>7} {'sd':>6} {'se':>6} "
           f"{'E*(1se)':>8} {'argmin':>7} {'IQR':>11} {'const':>8} {'vs const':>8}"
           f"   (smoothed val {'ADAPTED ' if rank_on == 'adapt_set_mae' else ''}set-MAE)")
     table = []
@@ -1232,11 +1247,17 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
             print("[warn] some rows predate the 1-SE rule; falling back to argmin epochs "
                   "for this config. Delete sweep_results.csv and re-run for a clean E*.")
             e_1se = e_arg
-        se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
+        raw_mean = float(v.mean())
+        raw_se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float("nan")
+        key = (dropout, lr, win, lss, efcd)
+        mean, se, n_blocks = (blocked[key] if blocked is not None and key in blocked
+                              else (raw_mean, raw_se, 0))
         q1, q3 = np.percentile(e_1se, [25, 75])
         table.append({"dropout": dropout, "lr": lr, "window_seconds": win,
                       "loss": lss, "embed_fcd": efcd, "n": len(v),
-                      "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0,
+                      "mean": mean, "raw_mean": raw_mean, "raw_se": raw_se,
+                      "n_blocks": n_blocks, "blocked": blocked is not None,
+                      "sd": float(v.std(ddof=1)) if len(v) > 1 else 0.0,
                       "se": se, "e_star": int(np.median(e_1se)),
                       "e_argmin": int(np.median(e_arg)),
                       "e_iqr": (int(q1), int(q3))})
@@ -1254,7 +1275,7 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
         table[-1]["delta"] = table[-1]["mean"] - table[-1]["const"]
         tag_fcd = "+fcd" if efcd else "    "
         print(f"{lss:>5}{tag_fcd} {dropout:8.2f} {lr:7.0e} {win:6.4g} "
-              f"{len(v):4d} {v.mean():7.3f} "
+              f"{len(v):4d} {table[-1]['mean']:7.3f} {table[-1]['raw_mean']:7.3f} "
               f"{table[-1]['sd']:6.3f} {se:6.3f} {table[-1]['e_star']:8d} "
               f"{table[-1]['e_argmin']:7d} {str(table[-1]['e_iqr']):>11}"
               f" {table[-1]['const']:8.3f} {table[-1]['delta']:+8.3f}")
@@ -1316,6 +1337,9 @@ def summarize(results_csv: pathlib.Path, outdir: pathlib.Path,
         "epochs": pick["e_star"],
         "embed_fcd": int(pick.get("embed_fcd", 0)),
         "rank_on": rank_on,
+        "ranking_estimator": ("fold-blocked" if pick.get("blocked") else "raw mean (UNBLOCKED)"),
+        "n_blocks": pick.get("n_blocks", 0),
+        "raw_mean": pick.get("raw_mean"), "raw_se": pick.get("raw_se"),
         "epochs_rule": (f"median over runs of the earliest epoch within 1 SE of the "
                         f"smoothed minimum of the {metric_name}"),
         "epochs_argmin_median": pick["e_argmin"],
