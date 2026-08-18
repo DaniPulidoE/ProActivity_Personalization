@@ -122,6 +122,14 @@ def sweep_driver(model, arch, df: pd.DataFrame, taus: List[float], val_frac: flo
                                     head_type=head_type, steps=steps, lr=lr)
             m = evaluate(head, Zval, Vval, head_type)
             out.append({"tau": tau, "k": k, "l2sp": info["l2sp"],
+                        # PROVENANCE. --embed-fcd only widens the head in memory;
+                        # the on-disk checkpoints stay narrow, so without this
+                        # column an FCD run and a plain one are indistinguishable
+                        # after the fact. Read off the head itself rather than the
+                        # flag, so the row cannot disagree with what was adapted.
+                        "head_in": int(pop_head.in_features),
+                        "embed_fcd": int(pop_head.in_features
+                                         > model.embedding_dim),
                         "grad_norm": info["grad_norm"], "n_val": n_val,
                         "set_mae": m["mae"], "set_acc": m["acc"],
                         "set_qwk": m["qwk"], "set_macro_f1": m["f1"],
@@ -222,7 +230,8 @@ def main() -> None:
 
     out_csv = outdir / "l2sp_tau_sweep.csv"
     cols = ["pid", "tau", "k", "l2sp", "n_val", "set_mae", "set_acc", "set_qwk",
-            "set_macro_f1", "base_set_mae", "base_set_acc", "grad_norm"]
+            "set_macro_f1", "base_set_mae", "base_set_acc", "grad_norm",
+            "head_in", "embed_fcd"]
     with out_csv.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -264,6 +273,11 @@ def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.P
         "k_cap": k_cap,
         "unadapted_floor_set_mae": float(floor),
         "beats_floor": bool(pick["mean"] < floor),
+        # Everything that changes what tau MEANS. val_frac decides which
+        # segments the curves were scored on; embed_fcd decides what object was
+        # adapted. A tau is only transferable to another run that matches both.
+        "val_frac": args.val_frac,
+        "embed_fcd": int(args.embed_fcd),
         "adapt_steps": DEFAULT_ADAPT_STEPS, "adapt_lr": DEFAULT_ADAPT_LR,
         "note": ("Single prior precision for ALL K, all drivers and BOTH study arms. "
                  "lambda = tau/(2K) is derived per adaptation by head_adapt. Selected on "

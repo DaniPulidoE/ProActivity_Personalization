@@ -1,0 +1,13 @@
+{
+  "tau": 0.05,
+  "decided": "2026-08-18",
+  "decided_by": "operator, on the merged tau response (see selected_on)",
+  "selected_on": "mean set-MAE over K<=60, averaged within driver then across, on the MERGED sweeps results/l2sp_sweep (tau 0.05-100) and results/l2sp_sweep_fcd_extend (tau 0.005-2). The two agree on their five shared taus (79/1090 cells differ, mean 0.004) and share a K=0 floor identical to full precision, i.e. the same LODO checkpoints and the same evaluation tail.",
+  "why_not_the_minimum": "The paired minimum is tau=0.005 (1.2569 vs 1.2716 at 0.05), but the whole grid below tau=1 spans only 0.028 against a between-driver sd of 0.343 -- tau is a tenth-order effect. tau=0.05 is the best-converged point in the entire grid (98% of cells at |grad|<=1e-3) and is interior rather than at an edge. Convergence is not cosmetic: the Laplace layer expands about the MAP, so an unconverged head invalidates the posterior rather than merely being undertrained.",
+  "why_not_selected_tau_json": "Both sweeps' selected_tau.json are UNUSABLE. The tie-break takes the largest tau within one BETWEEN-DRIVER SE, and that SE (~0.10) exceeds the entire tau effect, so the 1-SE band covers the whole grid and the rule simply returns the grid maximum: 20.0 in one run, 2.0 in the other, purely because their grids ended there. Driver difficulty is ~10x the tau effect, so an unpaired SE is the wrong yardstick; the paired ordering is what was used here.",
+  "embed_fcd": 1,
+  "val_frac": 0.3,
+  "adapt_steps": 2000,
+  "adapt_lr": 0.005,
+  "applies_to": "BOTH study arms. sweep_anil_hparams and compare_arms_k_curve must be pointed at THIS file (--selected-tau), not at either sweep's own output, or they will freeze the tie-break artifact into the comparison."
+}

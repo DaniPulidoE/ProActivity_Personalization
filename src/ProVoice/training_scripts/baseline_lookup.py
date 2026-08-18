@@ -67,7 +67,30 @@ import pandas as pd
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function
 from ProVoice.models.train_XLSTM import set_accuracy, set_mae
 
-VARIANTS = ("driver", "driver_function", "driver_function_fcd")
+VARIANTS = ("driver", "driver_function", "driver_function_fcd",
+            "driver_function_oracle")
+# NOT DEPLOYABLE, and not a baseline in the usual sense. The oracle fits each
+# (driver, function) cell's constant on the QUERY ITSELF instead of on the
+# driver's earlier labels, so it is the argmin over the (driver x function)
+# hypothesis class evaluated on the data it was fitted to. Nothing keyed only on
+# who-is-driving and which-task can beat it.
+#
+# It exists to DECOMPOSE the deployable lookup's error:
+#
+#     deployable lookup at K=60 : 0.476
+#     oracle (structural limit) : 0.167
+#     ------------------------------------
+#     estimation error (closes with K) : 0.309
+#
+# which is what says the lookup is NOT near its ceiling -- most of its remaining
+# error is finite-sample, not structural. That matters for reading the arm
+# comparison: the "the lookup will saturate and the model will overtake it"
+# argument is not available on this cohort.
+#
+# It bounds the LOOKUP, not the personalized model. The model sees driver state
+# and so belongs to a strictly richer class; it could in principle explain
+# within-cell variation that no (driver x function) rule can.
+ORACLE_VARIANT = "driver_function_oracle"
 DEFAULT_KS: Tuple[int, ...] = (5, 10, 20, 30, 40, 50, 60)
 MIN_QUERY = 20              # matches train_XLSTM._ADAPT_MIN_QUERY
 DEFAULT_EVAL_TAIL = 30      # matches sweep_tau_quick.DEFAULT_EVAL_TAIL
@@ -76,8 +99,8 @@ DEFAULT_EVAL_TAIL = 30      # matches sweep_tau_quick.DEFAULT_EVAL_TAIL
 # rest are diagnostics. pid is written zero-padded and must be READ as a string
 # downstream or '001' becomes 1 and the arm join comes back empty.
 RESULTS_COLUMNS = [
-    "pid", "k", "variant", "set_mae", "set_acc", "n_val", "n_support",
-    "n_functions_seen", "n_fallback",
+    "pid", "k", "variant", "fit_on", "set_mae", "set_acc", "n_val", "n_support",
+    "n_functions_seen", "n_fallback", "mean_cell_rows",
     "set_mae_tail", "set_acc_tail", "n_val_tail",
 ]
 
@@ -204,20 +227,33 @@ def curve_for_driver(g: pd.DataFrame, pid: str, ks: Sequence[int], variant: str,
                      min_cell: int, eval_tail: int) -> List[dict]:
     rows = []
     n = len(g)
+    # The oracle fits on the SCORED set, every other variant on the support. That
+    # one line is the whole difference, and it is why the oracle is a ceiling
+    # rather than a method: it is handed the answers.
+    is_oracle = variant == ORACLE_VARIANT
+    rule = "driver_function" if is_oracle else variant
     for K in ks:
         if n < K + MIN_QUERY:
             continue
         support, query = g.iloc[:K], g.iloc[K:]
-        table, driver_c = build_table(support, min_cell)
+        table, driver_c = build_table(query if is_oracle else support, min_cell)
         if driver_c is None:
             continue
-        pred, n_fb = predict(query, table, driver_c, variant)
+        pred, n_fb = predict(query, table, driver_c, rule)
         q_lv = np.stack(query["marks"].to_numpy())
+        # Rows per (driver, function) cell in the SET THE TABLE WAS FITTED ON.
+        # For the oracle this is the honest caveat: a function appearing once or
+        # twice in the query is fitted essentially perfectly, so the oracle is
+        # optimistically biased and the true structural limit is somewhat above it.
+        fit_set = query if is_oracle else support
+        cell_n = fit_set.groupby("functionname").size()
         r = {"pid": pid, "k": int(K), "variant": variant,
+             "fit_on": "query (ORACLE)" if is_oracle else "support",
              "set_mae": float(set_mae(q_lv, pred)),
              "set_acc": float(set_accuracy(q_lv, pred)),
              "n_val": int(len(query)), "n_support": int(K),
              "n_functions_seen": int(len(table)), "n_fallback": int(n_fb),
+             "mean_cell_rows": float(cell_n.mean()) if len(cell_n) else float("nan"),
              "set_mae_tail": float("nan"), "set_acc_tail": float("nan"),
              "n_val_tail": 0}
         # Fixed tail, disjoint from the support. The suffix query moves with K,
@@ -225,7 +261,14 @@ def curve_for_driver(g: pd.DataFrame, pid: str, ks: Sequence[int], variant: str,
         # tail holds the query still so K is the only thing varying.
         if eval_tail > 0 and K + eval_tail <= n:
             tail = g.iloc[-eval_tail:]
-            t_pred, _ = predict(tail, table, driver_c, variant)
+            # The oracle needs its own table here: it is defined by fitting on
+            # whatever is being scored, and the tail is a different set from the
+            # suffix query.
+            t_table, t_dc = (build_table(tail, min_cell) if is_oracle
+                             else (table, driver_c))
+            if t_dc is None:
+                t_table, t_dc = table, driver_c
+            t_pred, _ = predict(tail, t_table, t_dc, rule)
             t_lv = np.stack(tail["marks"].to_numpy())
             r["set_mae_tail"] = float(set_mae(t_lv, t_pred))
             r["set_acc_tail"] = float(set_accuracy(t_lv, t_pred))
@@ -246,7 +289,8 @@ def _metric_table(df: pd.DataFrame, col: str, ks: Sequence[int],
     but lands inside the accepted set half the time reads very differently under
     the two.
     """
-    print(f"\n{title}   ({'lower' if lower_is_better else 'HIGHER'} is better)")
+    print(f"\n{title}   ({'lower' if lower_is_better else 'HIGHER'} is better;"
+          f" *_oracle is fitted on the scored set and is NOT deployable)")
     print(f"{'variant':<22}" + "".join(f"{'K=' + str(k):>9}" for k in ks) + f"{'mean':>9}")
     for variant in VARIANTS:
         sub = df[df["variant"] == variant]
@@ -267,6 +311,22 @@ def summarize(rows: List[dict], ks: Sequence[int]) -> None:
     df = pd.DataFrame(rows)
     _metric_table(df, "set_mae", ks, "set-MAE", lower_is_better=True)
     _metric_table(df, "set_acc", ks, "set-ACCURACY", lower_is_better=False)
+    if ORACLE_VARIANT in set(df["variant"]):
+        # The number the oracle exists to produce.
+        dep = df[df["variant"] == "driver_function"].groupby("pid")["set_mae"].mean().mean()
+        orc = df[df["variant"] == ORACLE_VARIANT].groupby("pid")["set_mae"].mean().mean()
+        cells = df[df["variant"] == ORACLE_VARIANT]["mean_cell_rows"].mean()
+        print(f"\nERROR DECOMPOSITION for the (driver x function) rule")
+        print(f"  deployable lookup, fitted on the support : {dep:.3f}")
+        print(f"  ORACLE, fitted on the scored set         : {orc:.3f}  <- structural limit")
+        print(f"  estimation error, closes with more K     : {dep - orc:.3f}")
+        print(f"  The lookup is {'NOT ' if dep - orc > 0.1 else ''}near its ceiling"
+              f"{'; most of its remaining error is finite-sample.' if dep - orc > 0.1 else '.'}")
+        print(f"  CAVEAT: oracle cells hold {cells:.1f} rows on average — small cells are "
+              f"fitted almost perfectly, so the true limit is somewhat ABOVE this.")
+        print(f"  The oracle bounds the LOOKUP, not a state-conditioned model, which "
+              f"belongs to a richer class.")
+
     fb = df[df["variant"] == "driver_function"]["n_fallback"].sum()
     tot = df[df["variant"] == "driver_function"]["n_val"].sum()
     print(f"\nunseen-function rate for driver_function: {fb}/{tot} "
