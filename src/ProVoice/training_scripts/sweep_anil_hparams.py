@@ -74,8 +74,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import csv
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -267,7 +269,15 @@ def run_one(in_jsonl: str, init_ckpt: pathlib.Path, outer_lr: float, crop: float
     # plain and an augmented arm cannot be produced by the same command.
     if args.embed_fcd:
         cmd += ["--embed-fcd"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    env = dict(os.environ)
+    if getattr(args, "threads_per_job", 0) > 0:
+        # In the ENVIRONMENT, not as a flag: torch sizes its pool at import, so a
+        # flag parsed in the child's main() would be too late. Same mechanism the
+        # population sweep uses.
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS"):
+            env[var] = str(args.threads_per_job)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
         print(f"  [FAIL] {tag} (exit {proc.returncode})")
         print("  " + "\n  ".join(proc.stderr.strip().splitlines()[-8:]))
@@ -329,6 +339,21 @@ def main() -> None:
                          "position and is the diversity defence against meta-overfitting; "
                          "meta-validation always uses the true session prefix regardless. "
                          "Passed explicitly because the default encodes no decision.")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Concurrent meta-training runs. They are independent "
+                         "subprocesses, so this is the same trade the population sweep "
+                         "makes: throughput comes from COUNT rather than width, because "
+                         "the model does not scale inside a process. Warm starts are "
+                         "built SERIALLY before the pool opens, so two runs on the same "
+                         "fold can never race to create the same checkpoint. Pair with "
+                         "--threads-per-job so jobs x threads does not exceed the core "
+                         "count. KEEP IT FIXED for a whole sweep: thread count changes "
+                         "float reduction order, so resuming at a different setting mixes "
+                         "two numeric regimes into one results table.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch intra-op threads per run (0 = leave torch's default). "
+                         "Set as an environment variable on the child, since torch sizes "
+                         "its pool at import.")
     ap.add_argument("--min-select-epoch", dest="min_select_epoch", type=int, default=3)
     args = ap.parse_args()
 
@@ -378,35 +403,74 @@ def main() -> None:
     if new:
         writer.writerow(RESULTS_COLUMNS); fh.flush()
 
-    n = 0
+    # PHASE 1 -- warm starts, SERIALLY. One per fold, cached. Building them inside
+    # the parallel phase would let two runs on the same fold race to write the same
+    # checkpoint file, and the loser would meta-train from a half-written init.
+    inits: Dict[int, pathlib.Path] = {}
     for i in fold_idx:
-        val_pids = list(VALIDATION_FOLDS[i])
-        init_ckpt = ensure_fold_population(args.in_jsonl, i, val_pids, pop_cfg, ckpt_dir)
-        if init_ckpt is None:
+        ck = ensure_fold_population(args.in_jsonl, i, list(VALIDATION_FOLDS[i]),
+                                    pop_cfg, ckpt_dir)
+        if ck is None:
             print(f"[fold {i}] SKIPPED — warm-start model could not be built")
-            n += len(outer_lrs) * len(augs) * len(seeds)
             continue
-        for olr in outer_lrs:
-            for crop, jit in augs:
-                for seed in seeds:
-                    n += 1
-                    if (olr, crop, jit, tau, i, seed) in done:
-                        continue
-                    print(f"[{n}/{total}] outer_lr={olr:g} crop={crop:g} jitter={jit:g} "
-                          f"fold={i}{val_pids} seed={seed}", flush=True)
-                    r = run_one(args.in_jsonl, init_ckpt, olr, crop, jit, tau,
-                                val_pids, seed, args, workdir)
-                    if r is None:
-                        continue
-                    writer.writerow([olr, crop, jit, tau, i, "|".join(val_pids), seed]
-                                    + [r[c] for c in RESULTS_COLUMNS[N_ID:]])
-                    fh.flush()
-                    print(f"      val set-MAE {r['smoothed_best_val_mae']:.3f} "
-                          f"@epoch {r['best_epoch_smoothed']} (1se {r['best_epoch_1se']}) | "
-                          f"query_loss {r['query_loss_first']:.3f} -> "
-                          f"{r['query_loss_last']:.3f} (drop {r['query_loss_drop']:+.3f}) | "
-                          f"inner_res {r['inner_res_max']:.1e}")
-    fh.close()
+        inits[i] = ck
+
+    # PHASE 2 -- the grid, flattened so --jobs dispatches across folds and not
+    # only within the innermost seed loop.
+    tasks = [(i, olr, crop, jit, seed)
+             for i in fold_idx if i in inits
+             for olr in outer_lrs
+             for (crop, jit) in augs
+             for seed in seeds
+             if (olr, crop, jit, tau, i, seed) not in done]
+    print(f"[run] {len(tasks)} run(s) to do of {total}; {max(1, args.jobs)} concurrent x "
+          + (f"{args.threads_per_job} torch thread(s) each" if args.threads_per_job
+             else "torch default threads"), flush=True)
+
+    def work(t):
+        i, olr, crop, jit, seed = t
+        return t, run_one(args.in_jsonl, inits[i], olr, crop, jit, tau,
+                          list(VALIDATION_FOLDS[i]), seed, args, workdir)
+
+    # Only THIS thread touches the writer, so the CSV needs no lock: the pool
+    # workers block on their subprocess and hand back the parsed curve.
+    n_done = n_failed = 0
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, args.jobs))
+    futs = {ex.submit(work, t): t for t in tasks}
+    try:
+        for fut in cf.as_completed(futs):
+            n_done += 1
+            try:
+                (i, olr, crop, jit, seed), r = fut.result()
+            except Exception as e:
+                # One run must not take the batch down; at run 40 of 48,
+                # re-raising would discard the 39 that succeeded.
+                n_failed += 1
+                print(f"[ERROR] {futs[fut]}: {type(e).__name__}: {e}", flush=True)
+                continue
+            if r is None:
+                n_failed += 1
+                continue
+            val_pids = list(VALIDATION_FOLDS[i])
+            writer.writerow([olr, crop, jit, tau, i, "|".join(val_pids), seed]
+                            + [r[c] for c in RESULTS_COLUMNS[N_ID:]])
+            fh.flush()
+            print(f"[{n_done}/{len(tasks)}] outer_lr={olr:g} crop={crop:g} "
+                  f"jitter={jit:g} fold={i}{val_pids} seed={seed}\n"
+                  f"      val set-MAE {r['smoothed_best_val_mae']:.3f} "
+                  f"@epoch {r['best_epoch_smoothed']} (1se {r['best_epoch_1se']}) | "
+                  f"query_loss {r['query_loss_first']:.3f} -> "
+                  f"{r['query_loss_last']:.3f} (drop {r['query_loss_drop']:+.3f}) | "
+                  f"inner_res {r['inner_res_max']:.1e}", flush=True)
+    except KeyboardInterrupt:
+        print(f"\n[interrupt] cancelling {sum(f.cancel() for f in futs)} queued run(s); "
+              f"waiting for those in flight...", flush=True)
+    finally:
+        ex.shutdown(wait=True)
+        fh.close()
+    if n_failed:
+        print(f"[warn] {n_failed} run(s) failed and were not recorded; re-run the same "
+              f"command to retry just those (completed runs are skipped).")
     summarize(results_csv, outdir, tau)
 
 
