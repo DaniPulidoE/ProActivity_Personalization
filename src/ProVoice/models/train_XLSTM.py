@@ -983,11 +983,17 @@ def main():
                          "does not transfer across drivers', which the cross-driver sweep "
                          "cannot do because both look identical there. Never select a "
                          "shipped configuration on it.")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="Validation tail fraction per driver under --split-mode "
                          "within-driver. Ignored in 'participant' mode, where the "
                          "validation set is a set of DRIVERS, not a fraction of each "
-                         "driver's timeline.")
+                         "driver's timeline. NOTE this is the same NAME but not the same "
+                         "THING as the --val-frac in run_lodo_population / sweep_l2sp_tau: "
+                         "there it reserves an evaluation tail that adaptation is scored "
+                         "on, here it is the TRAIN/VAL split point of a subject-dependent "
+                         "diagnostic. Raised 0.2 -> 0.3 with the others for consistency, "
+                         "but sweep_within_driver pins 0.2 explicitly so its completed "
+                         "20-run result stays reproducible.")
     ap.add_argument("--no-val", dest="no_val", action="store_true",
                     help="Train on EVERY participant in the input with no validation set, no "
                          "per-epoch evaluation and no best-epoch selection; the final-epoch "

@@ -154,7 +154,17 @@ def main() -> None:
     ap.add_argument("--selected-anil", dest="selected_anil",
                     default="results/anil_sweep/selected_anil.json")
     ap.add_argument("--tau", type=float, default=None, help="Override the frozen tau.")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2)
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
+                    help="Chronologically-last fraction of each driver's segments held out "
+                         "as the query tail, passed to BOTH arms so they cannot disagree. "
+                         "Raised 0.2 -> 0.3 on 2026-08-18: at 0.2 the tail was only 19-27 "
+                         "segments per driver, below the 20-segment minimum the "
+                         "--adapt-eval path enforces, so each (driver, K) point rested on "
+                         "a query set too small to be stable. At 0.3 it is 28-41 (median "
+                         "36) and every driver still reaches K=60, the shortest pool being "
+                         "66. MUST match run_lodo_population, sweep_l2sp_tau and "
+                         "probe_embeddings, or the K=0 floor and these curves are measured "
+                         "on different segments.")
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60)
     ap.add_argument("--max-points", dest="max_points", type=int, default=20)
     ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",

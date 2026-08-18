@@ -241,7 +241,14 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--min-select-epoch", dest="min_select_epoch", type=int, default=3)
     ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=10.0)
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2)
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+                    help="PINNED at 0.2, deliberately, while the personalization path "
+                         "moved to 0.3. This sweep is a finished diagnostic — the 20-run "
+                         "CORN-vs-CE result (corn 0.956 vs a 1.201 per-driver floor) was "
+                         "measured at an 80/20 split, and silently re-running it at 70/30 "
+                         "would produce numbers that look comparable and are not. It is "
+                         "also a different quantity from the other scripts' --val-frac: a "
+                         "TRAIN/VAL split point, not an evaluation tail.")
     ap.add_argument("--losses", default=",".join(LOSSES))
     ap.add_argument("--seeds", default=",".join(str(s) for s in SEEDS))
     ap.add_argument("--jobs", type=int, default=1,

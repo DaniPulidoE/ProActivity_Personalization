@@ -90,7 +90,7 @@ def main():
                          "(K→0 ⇒ τ→0). Larger τ keeps the personalized model closer to the "
                          "population model; τ→∞ recovers it exactly. Must match the τ "
                          "scripts/sweep_train_frac.py drew its learning curve with.")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="Fraction of segments reserved as the chronologically-LAST validation "
                          "tail. Keep this fixed across runs so learning curves share one "
                          "measuring stick.")

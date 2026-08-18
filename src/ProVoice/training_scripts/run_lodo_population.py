@@ -153,7 +153,7 @@ def main() -> None:
                     help="Stage-1 output. --dropout/--lr/--epochs override it individually.")
     ap.add_argument("--ckpt-dir", dest="ckpt_dir", default="trained_models/lodo")
     ap.add_argument("--outdir", default="results/lodo")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="Tail fraction scored separately. MUST match stage 3's --val-frac, "
                          "or the floor and the learning curves are measured on different "
                          "segments.")

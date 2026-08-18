@@ -247,7 +247,7 @@ def main():
     ap.add_argument("--in-model", dest="in_model", default="trained_models/state_xlstm.pt")
     ap.add_argument("--out",      dest="out_png",  default="results/train_frac_sweep.png",
                     help="Output plot path; a CSV with the raw numbers is written next to it.")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="Chronologically-last fraction of segments held out as the fixed "
                          "validation tail (same convention as fine_tune_XLSTM.py).")
     ap.add_argument("--lr",     type=float, default=DEFAULT_ADAPT_LR)

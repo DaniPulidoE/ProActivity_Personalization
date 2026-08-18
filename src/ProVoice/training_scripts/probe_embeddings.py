@@ -795,7 +795,7 @@ def main() -> None:
     ap.add_argument("--ckpt-dir", dest="ckpt_dir", default="trained_models/lodo",
                     help="Stage 2's output. Absent => rows 0-4 only, no bias screen.")
     ap.add_argument("--outdir", default="results/embedding_probes")
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="MUST match run_lodo_population's --val-frac, or its floor and "
                          "these numbers are measured on different segments.")
     ap.add_argument("--tau", type=float, default=DEFAULT_TAU,

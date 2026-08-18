@@ -143,7 +143,7 @@ def main() -> None:
                          "comparable.")
     ap.add_argument("--outdir", default="results/l2sp_sweep")
     ap.add_argument("--taus", default=",".join(str(t) for t in TAU_GRID))
-    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.2,
+    ap.add_argument("--val-frac", dest="val_frac", type=float, default=0.3,
                     help="MUST match stage 2's --val-frac: the K=0 floor and these "
                          "curves have to be scored on the same segments.")
     ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
