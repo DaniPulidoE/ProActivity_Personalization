@@ -189,6 +189,13 @@ _ADAPT_MIN_QUERY = 20
 # query still so K is the only thing varying. 30 keeps all 12 drivers usable to
 # K=64 (shortest has 94 segments). 0 disables.
 _ADAPT_EVAL_TAIL = 30
+# The adapted score under each decode rule. argmax = the PMF's mode (optimal for
+# accuracy), median = CORN's rank rule sum_k 1[q_k>0.5] (optimal for MAE). Logged
+# so a head-vs-head comparison can hold the decoder fixed post hoc instead of
+# re-running, exactly as mae_argmax/mae_median already allow for the UNADAPTED
+# metrics.
+_ADAPT_DECODER_KEYS = ("adapt_mae_argmax", "adapt_acc_argmax",
+                       "adapt_mae_median", "adapt_acc_median")
 
 
 def cache_name(window_seconds: float, resample_hz: float) -> str:
@@ -1409,6 +1416,7 @@ def main():
                                  # test set. Shapes across K are.
                                  "adapt_set_mae_tail", "adapt_set_acc_tail",
                                  "adapt_n_drivers_tail", "embed_fcd",
+                                 *_ADAPT_DECODER_KEYS,
                                  # Untrained backbone + adapted head. Constant
                                  # per run, repeated per row like init_set_mae.
                                  "init_adapt_set_mae", "init_adapt_set_acc"]
@@ -1470,7 +1478,8 @@ def main():
         empty = {"adapt_set_mae": float("nan"), "adapt_set_acc": float("nan"),
                  "adapt_n_drivers": 0, "adapt_n_cells": 0,
                  "adapt_set_mae_tail": float("nan"), "adapt_set_acc_tail": float("nan"),
-                 "adapt_n_drivers_tail": 0}
+                 "adapt_n_drivers_tail": 0,
+                 **{k: float("nan") for k in _ADAPT_DECODER_KEYS}}
         for _k in adapt_ks:
             empty[f"adapt_set_mae_k{_k}"] = float("nan")
             empty[f"adapt_set_acc_k{_k}"] = float("nan")
@@ -1491,6 +1500,15 @@ def main():
         # selection quantity stays the suffix metric so --select-on keeps meaning
         # what it meant, and so this cannot silently change what ships.
         per_driver_mae_tail, per_driver_acc_tail = [], []
+        # BOTH decode rules on the SAME adapted head. argmax is the PMF's mode and
+        # is optimal for 0/1 loss; the CORN rank rule is its median and is optimal
+        # for absolute error — so each wins the metric it minimises, and a
+        # CORN-vs-CE comparison that does not hold the decoder fixed measures head
+        # AND decoder together. Measured on the unadapted metrics across 756 runs:
+        # median better on set-MAE by ~0.06, argmax better on set-accuracy by
+        # ~0.03, every stage, |t| 3.6-10.5. Whether that ordering SURVIVES
+        # adaptation was untestable until these columns existed.
+        pd_dec = {k: [] for k in _ADAPT_DECODER_KEYS}
         # by_k[K] collects one score per DRIVER at that K, so the per-K column is
         # a mean over drivers — the same footing as the aggregate, just without
         # the mean over K. Aggregating cells instead would weight drivers by how
@@ -1504,6 +1522,7 @@ def main():
             order = sorted(where, key=lambda i: chrono.get(sids[i], len(chrono) + i))
             maes, accs = [], []
             maes_t, accs_t = [], []
+            dec_k = {k: [] for k in _ADAPT_DECODER_KEYS}
             for K in adapt_ks:
                 if len(order) < K + _ADAPT_MIN_QUERY:
                     continue
@@ -1520,8 +1539,15 @@ def main():
                 with torch.no_grad():
                     probs = logits_to_probs(torch.nn.functional.linear(Z[qry], w, b), head_type)
                     pred = probs_to_label(probs, head_type).cpu().numpy()
+                    # One extra label decode each — a comparison, not a re-fit.
+                    pred_arg = probs_to_label(probs, "softmax").cpu().numpy()
+                    pred_med = probs_to_label(probs, "corn").cpu().numpy()
                 lv = V[qry].numpy()
                 m_k, a_k = set_mae(lv, pred), set_accuracy(lv, pred)
+                dec_k["adapt_mae_argmax"].append(set_mae(lv, pred_arg))
+                dec_k["adapt_acc_argmax"].append(set_accuracy(lv, pred_arg))
+                dec_k["adapt_mae_median"].append(set_mae(lv, pred_med))
+                dec_k["adapt_acc_median"].append(set_accuracy(lv, pred_med))
                 maes.append(m_k)
                 accs.append(a_k)
                 by_k_mae[K].append(m_k)
@@ -1541,6 +1567,12 @@ def main():
             if maes_t:
                 per_driver_mae_tail.append(float(np.mean(maes_t)))
                 per_driver_acc_tail.append(float(np.mean(accs_t)))
+            for k in _ADAPT_DECODER_KEYS:
+                if dec_k[k]:
+                    # Mean over K WITHIN the driver, matching how adapt_set_mae is
+                    # built, so the decoder columns sit on the same footing as the
+                    # canonical one and can be differenced against it directly.
+                    pd_dec[k].append(float(np.mean(dec_k[k])))
         if not per_driver_mae:
             return empty
         out = {"adapt_set_mae": float(np.mean(per_driver_mae)),
@@ -1550,7 +1582,9 @@ def main():
                                       if per_driver_mae_tail else float("nan")),
                "adapt_set_acc_tail": (float(np.mean(per_driver_acc_tail))
                                       if per_driver_acc_tail else float("nan")),
-               "adapt_n_drivers_tail": len(per_driver_mae_tail)}
+               "adapt_n_drivers_tail": len(per_driver_mae_tail),
+               **{k: (float(np.mean(pd_dec[k])) if pd_dec[k] else float("nan"))
+                  for k in _ADAPT_DECODER_KEYS}}
         for k in adapt_ks:
             out[f"adapt_set_mae_k{k}"] = (float(np.mean(by_k_mae[k])) if by_k_mae[k]
                                           else float("nan"))
@@ -1632,9 +1666,17 @@ def main():
         sacc = set_accuracy(Yl, Yp); mf1 = set_macro_f1(Yl, Yp, 5)
         err = set_mae(Yl, Yp); kappa = set_qwk(Yl, Yp, 5)
         cur_lr = opt.param_groups[0]["lr"]
-        ad = (evaluate_adaptation_val() if args.adapt_eval else
-              {"adapt_set_mae": float("nan"), "adapt_set_acc": float("nan"),
-               "adapt_n_drivers": 0, "adapt_n_cells": 0})
+        # The no-adapt fallback must carry EVERY key the metrics row writes, or a
+        # plain run with --metrics-csv dies on a KeyError at the first epoch. Built
+        # from one list rather than a second literal, so adding an adapt column
+        # cannot leave the two out of step again.
+        ad = (evaluate_adaptation_val() if args.adapt_eval
+              else {k: (0 if k.startswith("adapt_n_") else float("nan"))
+                    for k in ("adapt_set_mae", "adapt_set_acc",
+                              "adapt_n_drivers", "adapt_n_cells",
+                              "adapt_set_mae_tail", "adapt_set_acc_tail",
+                              "adapt_n_drivers_tail", *_ADAPT_DECODER_KEYS,
+                              *_adapt_k_columns)})
         # THE selection quantity. Both are always logged; this only picks which
         # one drives the save, --patience and the [BEST] line.
         score = ad["adapt_set_mae"] if args.select_on == "adapt_set_mae" else err
@@ -1686,6 +1728,7 @@ def main():
                                      ad["adapt_n_drivers"], ad["adapt_n_cells"],
                                      ad["adapt_set_mae_tail"], ad["adapt_set_acc_tail"],
                                      ad["adapt_n_drivers_tail"], int(args.embed_fcd),
+                                     *[ad.get(k, float("nan")) for k in _ADAPT_DECODER_KEYS],
                                      init.get("adapt_mae", float("nan")),
                                      init.get("adapt_acc", float("nan"))]
                                     + [ad.get(c, float("nan")) for c in _adapt_k_columns])

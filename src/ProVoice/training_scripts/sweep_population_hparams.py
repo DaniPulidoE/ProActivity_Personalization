@@ -145,6 +145,11 @@ RESULTS_COLUMNS = [
     # stays on the suffix metric. Levels are not comparable with the suffix
     # columns (different test set) but the shape across K is the interpretable one.
     "adapt_mae_tail", "adapt_acc_tail",
+    # The ADAPTED score under each decode rule, at the adapt-selected epoch. The
+    # unadapted pair (mae_argmax/mae_median) has always been here; these are their
+    # post-adaptation counterparts, so the decoder can be held fixed in a
+    # comparison that reflects what actually ships.
+    "adapt_mae_argmax", "adapt_acc_argmax", "adapt_mae_median", "adapt_acc_median",
     # 0/1. Part of the run KEY, not just a label: an embed-fcd run and a plain one
     # at otherwise identical settings are different experiments and must not be
     # skipped as "already done" by the resume logic.
@@ -533,6 +538,9 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
         out["adapt_acc_at_best_adapt"] = float(
             rows[idx[ja]].get("adapt_set_acc", "nan") or "nan")
         out["adapt_n_drivers"] = float(rows[idx[ja]].get("adapt_n_drivers", 0) or 0)
+        for _k in ("adapt_mae_argmax", "adapt_acc_argmax",
+                   "adapt_mae_median", "adapt_acc_median"):
+            out[_k] = _f(rows[idx[ja]].get(_k))
         out["adapt_mae_tail"] = _f(rows[idx[ja]].get("adapt_set_mae_tail"))
         out["adapt_acc_tail"] = _f(rows[idx[ja]].get("adapt_set_acc_tail"))
         # Per-K values are read AT THE ADAPT-SELECTED EPOCH, not at their own
@@ -547,7 +555,9 @@ def curve_stats(rows: List[dict], min_select_epoch: int) -> Optional[Dict[str, f
                 out[f"adapt_acc_k{col.rsplit('_k', 1)[1]}"] = _f(val)
     else:
         for k in ("smoothed_best_adapt_mae", "best_adapt_mae",
-                  "adapt_acc_at_best_adapt", "adapt_mae_tail", "adapt_acc_tail"):
+                  "adapt_acc_at_best_adapt", "adapt_mae_tail", "adapt_acc_tail",
+                  "adapt_mae_argmax", "adapt_acc_argmax",
+                  "adapt_mae_median", "adapt_acc_median"):
             out[k] = float("nan")
         out["best_epoch_smoothed_adapt"] = -1
         out["best_epoch_1se_adapt"] = -1
