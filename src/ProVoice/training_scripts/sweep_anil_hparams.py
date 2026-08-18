@@ -263,6 +263,10 @@ def run_one(in_jsonl: str, init_ckpt: pathlib.Path, outer_lr: float, crop: float
            "--meta-batch", str(args.meta_batch), "--patience", str(args.patience),
            "--k-min", str(args.k_min), "--k-max", str(args.k_max),
            "--fo-warmup-epochs", "0"]
+    # ARM SYMMETRY: threaded to the child rather than assumed, so a
+    # plain and an augmented arm cannot be produced by the same command.
+    if args.embed_fcd:
+        cmd += ["--embed-fcd"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         print(f"  [FAIL] {tag} (exit {proc.returncode})")
@@ -299,6 +303,15 @@ def main() -> None:
                          "exists; the real run should read it from --selected-tau so both "
                          "arms provably share one value.")
     ap.add_argument("--pop-ckpt-dir", dest="pop_ckpt_dir", default="trained_models/anil_warmstart")
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Meta-train an FCD-AUGMENTED head ([z_64 | FCD_12]) — passed straight through "
+                         "to xlstm_maml. MUST MATCH THE L2-SP ARM. That arm was run "
+                         "with --embed-fcd, so omitting it here makes the two arms "
+                         "adapt heads of different width, and the comparison would "
+                         "then measure more than theta_init — which is the one thing "
+                         "it exists to isolate. compare_arms_k_curve refuses a "
+                         "head-width mismatch, but only after the meta-training is "
+                         "already spent.")
     ap.add_argument("--outer-lrs", default=",".join(f"{x:g}" for x in OUTER_LRS))
     ap.add_argument("--augs", default="0,0;0.2,0.02",
                     help="Semicolon-separated crop_frac,jitter_std pairs.")

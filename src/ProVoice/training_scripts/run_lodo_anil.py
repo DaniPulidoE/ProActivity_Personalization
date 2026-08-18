@@ -92,6 +92,15 @@ def main() -> None:
     ap.add_argument("--jitter-std", dest="jitter_std", type=float, default=None)
     ap.add_argument("--meta-epochs", dest="meta_epochs", type=int, default=None)
     ap.add_argument("--tau", type=float, default=None)
+    ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
+                    help="Meta-train an FCD-AUGMENTED head ([z_64 | FCD_12]) — passed straight through "
+                         "to xlstm_maml. MUST MATCH THE L2-SP ARM. That arm was run "
+                         "with --embed-fcd, so omitting it here makes the two arms "
+                         "adapt heads of different width, and the comparison would "
+                         "then measure more than theta_init — which is the one thing "
+                         "it exists to isolate. compare_arms_k_curve refuses a "
+                         "head-width mismatch, but only after the meta-training is "
+                         "already spent.")
     ap.add_argument("--episodes", type=int, default=200)
     ap.add_argument("--meta-batch", dest="meta_batch", type=int, default=4)
     ap.add_argument("--k-min", dest="k_min", type=int, default=5)
@@ -180,6 +189,10 @@ def main() -> None:
                    "--meta-batch", str(args.meta_batch),
                    "--k-min", str(args.k_min), "--k-max", str(args.k_max),
                    "--fo-warmup-epochs", "0", "--seed", str(args.seed)]
+            # ARM SYMMETRY: threaded to the child rather than assumed, so a
+            # plain and an augmented arm cannot be produced by the same command.
+            if args.embed_fcd:
+                cmd += ["--embed-fcd"]
             proc = subprocess.run(cmd)
             if proc.returncode != 0:
                 raise SystemExit(f"fold {test_pid} meta-training failed (exit {proc.returncode})")
