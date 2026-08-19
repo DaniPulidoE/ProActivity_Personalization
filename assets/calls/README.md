@@ -12,6 +12,25 @@ see `docs/live_study_setup.md` §5.4, §6.4). Drop the files in; no code changes
 | `loa4_line.wav` | "Call from Mark. Answering now." |
 | `caller_reply.wav` | The caller's canned line (~2–3 s), played whenever the call is answered — including after a manual ACCEPT at LoA 0/1. |
 
+## Icon
+
+`viber.png` (CC0, credited in `manifest.json`) is the receiver glyph drawn in
+every panel header. Two things about how it is consumed:
+
+- **It is knockout art.** The rounded badge is opaque and the handset is punched
+  *through* it to transparency, so blitting the file paints a solid block with a
+  hole in it. `_load_glyph_mask` recovers the hole as an alpha mask, which is
+  then tinted — so the icon recolours with the panel (neutral on the driver's
+  card, assistant blue on the assistant's) rather than being a fixed sticker.
+  Any replacement in the same knockout style works unchanged; a normal
+  filled-glyph PNG would need the inversion removed.
+- **It already contains the ring arcs**, so the icon looks the same whether the
+  phone is ringing or connected. The drawn fallback in `_draw_handset` still
+  varies, and takes over if the file is missing or numpy is unavailable.
+
+Only the rendered handset is used — no brand mark appears in the panel — but the
+filename is worth changing to something neutral if the asset set grows.
+
 Rules that are part of the experimental design, not preferences:
 
 - **Render offline, once.** No TTS at run time: `pyttsx3.runAndWait()` blocks and

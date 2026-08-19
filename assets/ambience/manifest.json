@@ -1,5 +1,4 @@
 {
-  "_comment": "Provenance for the cabin ambience clips. Fill these in: the drive warns at startup about any blank field, and this doubles as the attribution appendix for the thesis. Prefer CC0; avoid CC-BY-NC (see README.md).",
   "clips": {
     "background_audio.wav": {
       "freesound_id": "685078",

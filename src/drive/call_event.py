@@ -156,6 +156,17 @@ _ASSISTANT_LINE = {
     4: 'Call from %s. Answering now.',
 }
 
+# Bitmap glyph for the receiver, dropped in beside the clips with its licence
+# recorded in assets/calls/manifest.json. Blitted AS DRAWN -- scaled and nothing
+# else. Override the file with PROVOICE_CALL_ICON.
+#
+# Consequence to be aware of: the artwork carries its own colours, so the icon
+# looks identical on the driver's phone card and on the assistant's panel. The
+# driver / assistant distinction is still carried by the border weight and
+# colour, the diamond marker, which widget is on screen and the button verbs --
+# the icon simply stops being one of the cues.
+ICON_FILE = 'phone-call.png'
+
 _SOUND_FILES = {
     'ring': 'ring.wav',
     1: 'loa1_line.wav',
@@ -171,6 +182,18 @@ def _default_assets_dir():
     root = os.path.abspath(os.path.join(here, '..', '..'))
     return os.environ.get('PROVOICE_CALL_ASSETS_DIR',
                           os.path.join(root, 'assets', 'calls'))
+
+
+def _load_icon(path):
+    """The icon surface, or None. Never raises: a missing file is not fatal."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return pygame.image.load(path).convert_alpha()
+    except Exception as exc:                                  # noqa: BLE001
+        print('[WARN] call_event: could not read icon %s (%s); '
+              'falling back to the drawn receiver.' % (path, exc))
+        return None
 
 
 def _load_sound(path):
@@ -237,6 +260,11 @@ class CallEvent(object):
         self._ring_channel = None
         self._voice_channel = None
         self._load_sounds()
+        name = os.environ.get('PROVOICE_CALL_ICON') or ICON_FILE
+        self._glyph = _load_icon(
+            name if os.path.isabs(name) else os.path.join(self._assets_dir, name))
+        self.icon_source = os.path.basename(name) if self._glyph is not None else None
+        self._icon_cache = {}
 
     # -- layout --------------------------------------------------------------
 
@@ -250,9 +278,9 @@ class CallEvent(object):
         """
         if self._font_text is None:
             return 0
-        cands = [(self._font_title, '◆ ASSISTANT'),
+        cands = [(self._font_title, 'ASSISTANT'),
                  (self._font_title, 'INCOMING CALL'),
-                 (self._font_text, '[A] Answer   ★ RECOMMENDED'),
+                 (self._font_text, '[A] Answer         RECOMMENDED'),
                  (self._font_text, '[A] Yes        [B] No'),
                  (self._font_text, '[B] Decline'),
                  (self._font_text, '[B] Cancel'),
@@ -290,30 +318,97 @@ class CallEvent(object):
         return pygame.Rect(int(width * PANEL_LEFT_FRAC),
                            int(height * PANEL_BOTTOM_FRAC) - h, w, h)
 
-    def _draw_handset(self, display, cx, cy, size, colour, waves=False):
-        """A handset silhouette: a bar at -40 degrees with a bulb at each end.
+    def _icon(self, size):
+        """The icon scaled to `size`, cached. smoothscale resamples the full
+        source every call, which does not belong in a frame."""
+        key = int(size)
+        hit = self._icon_cache.get(key)
+        if hit is None:
+            hit = pygame.transform.smoothscale(self._glyph, (key, key))
+            self._icon_cache[key] = hit
+        return hit
 
-        Drawn rather than loaded: it costs no asset, scales with the window like
-        every other element here, and recolours with the panel border so the
-        icon carries the same driver's-phone / assistant's-panel distinction the
-        rest of the layout does.
+    def _draw_handset(self, display, cx, cy, size, colour, waves=False):
+        """A telephone receiver: two bulbous ends joined by a bowed handle.
+
+        The first version drew equal-width circles on a straight bar, which
+        reads as a dumbbell rather than a phone. What makes the silhouette
+        legible at ~22 px is the CONTRAST between fat ends and a thin handle,
+        plus the bow -- a straight connector looks like a barbell at any size.
+
+        Drawn rather than loaded from an asset: it costs no file, scales with
+        the window like everything else here, and recolours with the panel
+        border, so the icon carries the same driver's-phone / assistant's-panel
+        distinction the rest of the layout does.
         """
-        r = max(2, int(size * 0.20))
-        half = size * 0.28
-        dx, dy = math.cos(math.radians(-40)) * half, math.sin(math.radians(-40)) * half
-        p0 = (int(cx - dx), int(cy - dy))
-        p1 = (int(cx + dx), int(cy + dy))
-        pygame.draw.line(display, colour, p0, p1, max(2, int(size * 0.17)))
-        pygame.draw.circle(display, colour, p0, r)
-        pygame.draw.circle(display, colour, p1, r)
+        if self._glyph is not None:
+            # `colour` and `waves` are ignored: the artwork is used as drawn, in
+            # its own colours, the same in every state. The drawn fallback below
+            # still honours both.
+            icon = self._icon(size * 1.35)
+            display.blit(icon, (int(cx - icon.get_width() / 2),
+                                int(cy - icon.get_height() / 2)))
+            return
+
+        # The ends are bars PERPENDICULAR to the handle, not blobs along it.
+        # That is what separates a telephone receiver from a barbell, and it is
+        # the whole reason the first two attempts read as gym equipment.
+        handle = max(2, int(size * 0.11))
+        cap_w = max(3, int(size * 0.16))
+        half = size * 0.34
+        ang = math.radians(-45)
+        ux, uy = math.cos(ang), math.sin(ang)            # along the handle
+        px, py = -uy, ux                                 # across it
+        p0 = (cx - ux * half, cy - uy * half)            # mouthpiece
+        p1 = (cx + ux * half, cy + uy * half)            # earpiece
+
+        # Handle bows away from the diagonal, the way a receiver's does.
+        bow = size * 0.20
+        ctrl = (cx + px * bow, cy + py * bow)
+        pts = []
+        for k in range(9):
+            t = k / 8.0
+            u = 1.0 - t
+            pts.append((u * u * p0[0] + 2 * u * t * ctrl[0] + t * t * p1[0],
+                        u * u * p0[1] + 2 * u * t * ctrl[1] + t * t * p1[1]))
+        pygame.draw.lines(display, colour, False, pts, handle)
+
+        cap = size * 0.21
+        for end in (p0, p1):
+            a = (end[0] - px * cap, end[1] - py * cap)
+            b = (end[0] + px * cap, end[1] + py * cap)
+            pygame.draw.line(display, colour, a, b, cap_w)
+            for tip in (a, b):
+                pygame.draw.circle(display, colour,
+                                   (int(tip[0]), int(tip[1])), cap_w // 2)
+
         if waves:
-            # Two arcs off the earpiece. Static, not animated: the icon is
-            # identical in every condition and should stay that way.
-            for k, rad in enumerate((size * 0.52, size * 0.72)):
+            # Two arcs off the earpiece. Static, never animated: the icon is
+            # identical in every condition and must stay that way.
+            for k, rad in enumerate((size * 0.62, size * 0.84)):
                 box = pygame.Rect(0, 0, int(rad * 2), int(rad * 2))
                 box.center = (int(cx), int(cy))
-                pygame.draw.arc(display, colour, box, math.radians(18),
-                                math.radians(62), max(1, int(size * 0.09) - k))
+                pygame.draw.arc(display, colour, box, math.radians(20),
+                                math.radians(70), max(1, int(size * 0.10) - k))
+
+    def _draw_diamond(self, display, cx, cy, size, colour):
+        """The assistant marker. Was a U+25C6 glyph, which freesansbold.ttf
+        does not have -- it rendered as an empty .notdef box. Same for the star
+        below and the U+25A0 the status strip used to carry. Anything outside
+        Latin-1 has to be DRAWN here, not typed.
+        """
+        r = size * 0.34
+        pygame.draw.polygon(display, colour, [
+            (cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)])
+
+    def _draw_star(self, display, cx, cy, size, colour):
+        """The recommendation marker (was U+2605; see _draw_diamond)."""
+        outer, inner, pts = size * 0.50, size * 0.22, []
+        for k in range(10):
+            rad = outer if k % 2 == 0 else inner
+            a = math.radians(-90 + k * 36)
+            pts.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+        pygame.draw.polygon(display, colour, pts)
 
     # -- audio ---------------------------------------------------------------
 
@@ -408,6 +503,11 @@ class CallEvent(object):
         methods would make it the caller's job to remember both, and the one
         that got forgotten would be the decline -- silently unlogged.
         """
+        # Rendering reads this instead of calling pygame.time.get_ticks()
+        # itself. The two agree in the drive loop, but the countdown digit and
+        # the call timer are computed from it -- and when they disagreed, the
+        # preview showed "Answering in 5" and a call duration of -1:59.
+        self._now_ms = now_ms
         pending = self._take_pending()
         if pending is not None:
             return pending
@@ -590,9 +690,16 @@ class CallEvent(object):
                            self.icon_size, COL_PHONE, waves=ring)
         tx = x + self.icon_size + PANEL_ICON_GAP
         header = 'INCOMING CALL'
-        if self.loa == 1:
-            header += '   ◆'              # assistant present, passive
+        head_y = y
         y = self._blit(display, self._font_title, header, COL_WHITE, tx, y)
+        if self.loa == 1:
+            # Assistant present but passive: it annotates the driver's card
+            # rather than owning it.
+            self._draw_diamond(display,
+                               tx + self._font_title.size(header)[0]
+                               + self.icon_size * 0.7,
+                               head_y + self._font_title.get_height() / 2,
+                               self.icon_size, COL_ASSISTANT)
         y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, tx, y)
         y += 6
 
@@ -600,8 +707,17 @@ class CallEvent(object):
             # The badge IS the suggestion. Marker (star) plus colour, never
             # colour alone -- and it sits on the DRIVER's control, which is what
             # distinguishes advising from taking over.
-            y = self._blit(display, self._font_text,
-                           '[A] Answer   ★ RECOMMENDED', COL_ASSISTANT, tx, y)
+            # Text first, then the star into the gap the spaces reserve --
+            # measuring the FULL string up to the badge is what keeps the glyph
+            # off the R. Drawing it from a guessed offset put it on top.
+            label = '[A] Answer         RECOMMENDED'
+            gap_at = self._font_text.size('[A] Answer   ')[0]
+            y_mid = y + self._font_text.get_height() / 2
+            self._blit(display, self._font_text, label, COL_ASSISTANT, tx, y)
+            self._draw_star(display, tx + gap_at + self._font_text.get_height() * 0.3,
+                            y_mid, self._font_text.get_height() * 0.95,
+                            COL_ASSISTANT)
+            y += self._font_text.get_height() + 4
         else:
             y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, tx, y)
         return self._blit(display, self._font_text, '[B] Decline', COL_WHITE, tx, y)
@@ -613,8 +729,11 @@ class CallEvent(object):
                            self.icon_size, COL_ASSISTANT,
                            waves=self.state in (RINGING, AWAIT_INPUT, COUNTDOWN))
         x = x + self.icon_size + PANEL_ICON_GAP
-        y = self._blit(display, self._font_title, '◆ ASSISTANT',
-                       COL_ASSISTANT, x, y)
+        self._draw_diamond(display, x + self.icon_size * 0.35,
+                           y + self._font_title.get_height() / 2,
+                           self.icon_size, COL_ASSISTANT)
+        y = self._blit(display, self._font_title, 'ASSISTANT', COL_ASSISTANT,
+                       x + self.icon_size * 1.05, y)
 
         line = _ASSISTANT_LINE.get(self.loa)
         if line:
@@ -641,18 +760,22 @@ class CallEvent(object):
         return y
 
     def _countdown_remaining(self):
-        left = COUNTDOWN_S - self._elapsed(pygame.time.get_ticks()) / 1000.0
-        return max(1, int(left) + 1)
+        left = COUNTDOWN_S - self._elapsed(self._now_ms) / 1000.0
+        return max(1, min(int(COUNTDOWN_S), int(left) + 1))
 
     def _render_countdown_bar(self, display, x, y):
         """A draining bar, and the ONLY place in the five renderings one appears."""
-        frac = 1.0 - min(1.0, self._elapsed(pygame.time.get_ticks())
-                         / (COUNTDOWN_S * 1000.0))
+        frac = max(0.0, 1.0 - min(1.0, self._elapsed(self._now_ms)
+                                  / (COUNTDOWN_S * 1000.0)))
+        # (c) Span the PANEL's inner width, taken from the rect -- the caller's
+        # x has already been shifted right past the icon, so using it here ran
+        # the bar out through the border and over the road.
+        bx = self.rect.left + PANEL_PAD
         full = self.rect.width - 2 * PANEL_PAD
-        pygame.draw.rect(display, COL_DIM, (x, y, full, 8), 1)
+        pygame.draw.rect(display, COL_DIM, (bx, y, full, 8), 1)
         if frac > 0:
             pygame.draw.rect(display, COL_COUNTDOWN,
-                             (x + 1, y + 1, max(0, int((full - 2) * frac)), 6))
+                             (bx + 1, y + 1, max(0, int((full - 2) * frac)), 6))
         return y + 16
 
     def _render_status_strip(self, display):
@@ -664,18 +787,18 @@ class CallEvent(object):
                          (self.rect.left + PANEL_PAD, y - 6),
                          (self.rect.right - PANEL_PAD, y - 6), 1)
         if self.state == CONNECTED:
-            secs = int(self._elapsed(pygame.time.get_ticks()) / 1000.0)
+            secs = max(0, int(self._elapsed(self._now_ms) / 1000.0))
             text = '%s — connected     %02d:%02d' % (
                 self.caller_name, secs // 60, secs % 60)
             colour = COL_CONNECTED
         else:
             text = '%s — ringing, on hold' % self.caller_name
             colour = COL_DIM
-        small = int(self._font_small.get_height() * 0.9)
-        self._draw_handset(display, self.rect.left + PANEL_PAD + small / 2,
-                           y + self._font_small.get_height() / 2, small, colour)
+        # No icon here. At the small font's ~13 px the receiver loses its
+        # silhouette and reads as a smudge; the header already carries it, and
+        # the strip's job is the caller's state, which is words.
         display.blit(self._font_small.render(text, True, colour),
-                     (self.rect.left + PANEL_PAD + small + 6, y))
+                     (self.rect.left + PANEL_PAD, y))
 
     @staticmethod
     def _wrap(text, font, max_w):
