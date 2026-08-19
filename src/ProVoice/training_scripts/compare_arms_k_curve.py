@@ -96,7 +96,13 @@ def ensure_curve(arm: str, ckpt_dir: pathlib.Path, prefix: str, outdir: pathlib.
            "--outdir", str(arm_dir), "--taus", f"{tau:g}",
            "--ckpt-prefix", prefix,
            "--val-frac", str(args.val_frac), "--k-cap", str(args.k_cap),
-           "--max-points", str(args.max_points)]
+           "--max-points", str(args.max_points),
+           # Passed explicitly, and to BOTH arms from one place. Left to the
+           # child's default this ran at 2000 steps while the standalone L2-SP
+           # sweeps used 6000, so the arm curves were not comparable in level to
+           # the sweep they are read beside -- and since lambda = tau/(2K) the
+           # shortfall grows with K, which is the region the comparison is read in.
+           "--steps", str(args.steps)]
     if args.embed_fcd:
         # ONE flag, BOTH arms. Passing it here rather than expecting two earlier
         # commands to agree is what makes arm symmetry structural instead of a
@@ -165,6 +171,17 @@ def main() -> None:
                          "66. MUST match run_lodo_population, sweep_l2sp_tau and "
                          "probe_embeddings, or the K=0 floor and these curves are measured "
                          "on different segments.")
+    ap.add_argument("--steps", type=int, default=6000,
+                    help="Full-batch adaptation steps per (driver, K) cell, passed to "
+                         "sweep_l2sp_tau for BOTH arms. Default 6000, matching the "
+                         "standalone L2-SP sweeps; head_adapt's own default of 2000 leaves "
+                         "roughly a third of cells above GRAD_NORM_WARN at large K, because "
+                         "lambda = tau/(2K) weakens the anchor as K grows and the objective "
+                         "gets harder to drive to its optimum. The adaptation objective is "
+                         "strictly convex, so a large residual means under-optimized, not "
+                         "hard -- and any residual difference BETWEEN the arms at the same K "
+                         "biases the comparison. Raise further if the sweep's [converge] "
+                         "line still reports HIGH.")
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60)
     ap.add_argument("--max-points", dest="max_points", type=int, default=20)
     ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
