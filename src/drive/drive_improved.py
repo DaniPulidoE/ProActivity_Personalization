@@ -156,11 +156,13 @@ except ImportError:
 
 try:
     from .ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
+    from .call_event import CallEvent
 except ImportError:
     # Launched as a plain script path rather than -m src.drive.drive_improved,
     # so there is no package context for a relative import.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
+    from call_event import CallEvent
 
 OBJECT_TO_COLOR = [
     (255, 255, 255),
@@ -2525,11 +2527,28 @@ class HUD(object):
     def _render_speed(self, display):
         """Draw the speed readout as a HUD element over the steering wheel.
 
-        Centered horizontally, and anchored to the base of the windshield
-        (a fixed fraction of window height) rather than the bottom screen
-        edge — that's where the wheel sits in the driver-seat camera, and
-        it mimics where a real HUD projects speed: just above the dash, not
-        down on the hood where it is easy to miss.
+        VERTICAL: the block's BOTTOM edge sits at exactly 0.8 of window height
+        (``y`` is that line minus the glyph height), anchoring it to the base of
+        the windshield rather than the bottom screen edge — that's where the
+        wheel sits in the driver-seat camera, and it mimics where a real HUD
+        projects speed: just above the dash, not down on the hood where it is
+        easy to miss.
+
+        HORIZONTAL: ``(dim[0] - block_w) // 3.5`` puts it LEFT OF CENTRE, at
+        roughly 26-27 % of the window width — measured 27.2 % at "8" and 26.1 %
+        at "120", identically at 720p, 1080p and 1440p. It is *not* centred and
+        *not* in the bottom-right corner, whatever this docstring and the
+        ``--speed`` help text used to say (both corrected 2026-08-19; the
+        placement had moved and neither followed).
+
+        KNOWN WART: because ``x`` is derived from ``block_w``, the whole block
+        DRIFTS LEFT as the number gains digits — about 1.1 % of window width
+        between a one- and a three-digit speed, i.e. 14 px at 720p, visible as a
+        sideways shift each time the driver crosses 10 or 100 km/h. Only the
+        unit was stabilised against this (see the blit below); the block was
+        not. Anything positioned RELATIVE to this readout inherits the drift, so
+        anchor to absolute coordinates instead — see the call-event panel in
+        ``docs/live_study_setup.md`` §6.1.
         """
         if not self.show_speed:
             return
@@ -3110,6 +3129,10 @@ def game_loop(args):
     pygame.font.init()
     world = None
     ambience = None
+    # Pre-declared for the same reason as ambience: the finally block below
+    # touches it, and an exception before the try body assigns it would turn a
+    # real error into a NameError that hides it.
+    call_preview = None
     original_settings = None
 
     try:
@@ -3171,6 +3194,17 @@ def game_loop(args):
         # participant only.
         ambience = Ambience(gain=args.ambient_gain, seed=args.ambient_seed,
                             assets_dir=args.ambient_dir)
+        # Trial mode only (--call-preview). Sized from args.width/height, which
+        # fullscreen has already overwritten with the desktop resolution above,
+        # so the panel lands where it will in the study rather than where a
+        # stale 1280x720 would put it.
+        call_preview = (CallEvent((args.width, args.height))
+                        if args.call_preview else None)
+        if call_preview is not None:
+            print('[call-preview] press 0-4 to stage a call at that LoA, '
+                  'A / B to answer. Panel %dx%d at (%d, %d). Nothing is logged.'
+                  % (call_preview.rect.w, call_preview.rect.h,
+                     call_preview.rect.x, call_preview.rect.y))
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
@@ -3581,12 +3615,31 @@ def game_loop(args):
             # -- a local field it just wrote, not an RPC to the server, so the
             # engine note follows the pedal for free on a loop this project
             # already tunes for frame rate.
-            ambience.set_ducked(False)
+            if call_preview is not None:
+                for event in events:
+                    if (event.type == pygame.KEYDOWN and event.unicode in '01234'
+                            and not call_preview.active):
+                        call_preview.arm(now_ms, int(event.unicode),
+                                         window_idx=0)
+                    else:
+                        call_preview.handle_event(event, now_ms=now_ms)
+                finished = call_preview.update(now_ms)
+                if finished:
+                    print('[call-preview] %s' % finished)
+
+            # Duck under the call the same way the LoA popup ducks: its audio has
+            # to be heard over the engine bed, and in the study the driver is
+            # answering it while still moving.
+            ambience.set_ducked(call_preview is not None and call_preview.active)
             ambience.update(world.hud.speed_kmh,
                             throttle=getattr(
                                 getattr(controller, '_control', None),
                                 'throttle', 0.0))
             world.render(display)
+            if call_preview is not None:
+                # AFTER world.render, which blits the camera frame and then the
+                # HUD -- the panel belongs on top of both.
+                call_preview.render(display)
             pygame.display.flip()
 
     finally:
@@ -3613,6 +3666,8 @@ def game_loop(args):
         if world is not None:
             world.destroy()
 
+        if call_preview is not None:
+            call_preview.stop()
         if ambience is not None:
             ambience.stop()
 
@@ -3761,8 +3816,18 @@ def main():
              '0.5 about a quarter. The view gets softer, not smaller. Check the '
              'effect in the [SYNC] ceiling line from fixed_npc_traffic.py.')
     argparser.add_argument(
+        '--call-preview', dest='call_preview', action='store_true',
+        help='Trial mode for the live study call pop-up: drive normally and '
+             'press 0-4 to stage an incoming call at that Level of Autonomy, '
+             'A / B to answer it. Shows the panel over the REAL camera view at '
+             'the real resolution, alongside the real HUD, so placement and '
+             'legibility can be judged before any of it is wired into the study '
+             'loop. Nothing is logged and no decision is read -- the LoA comes '
+             'from the key press, not from ProVoice. NOT for participant runs.')
+    argparser.add_argument(
         '--speed', action='store_true',
-        help='Show the vehicle speed in km/h in the bottom-right corner. Unlike '
+        help='Show the vehicle speed in km/h low on screen and left of centre '
+             '(~27%% of window width, bottom edge at 80%% of height). Unlike '
              'the F1 debug panel this is a single large readout suitable to have '
              'in front of a participant. Off by default because it changes the '
              'driving task -- it gives the driver a precise instrument to regulate '
@@ -3844,15 +3909,15 @@ def main():
     condition_group = argparser.add_mutually_exclusive_group()
     condition_group.add_argument(
         '--condition-sun-rain', dest='condition_sun_rain', action='store_true',
-        help='Scripted weather condition: precipitation starts at %.0f%% and '
-             'ramps linearly down to 0%% over %.0f minutes, from the moment '
+        help='Scripted weather condition: precipitation starts at %.0f%%%% and '
+             'ramps linearly down to 0%%%% over %.0f minutes, from the moment '
              'driving starts (the start-screen "start" action, not process '
              'launch). Mutually exclusive with --condition-rain-sun.'
              % (CONDITION_PEAK_PRECIPITATION, CONDITION_RAMP_MINUTES))
     condition_group.add_argument(
         '--condition-rain-sun', dest='condition_rain_sun', action='store_true',
-        help='Scripted weather condition: sunny (0%% precipitation) for the '
-             'first %.0f minutes of driving, then ramps linearly up to %.0f%% '
+        help='Scripted weather condition: sunny (0%%%% precipitation) for the '
+             'first %.0f minutes of driving, then ramps linearly up to %.0f%%%% '
              'over the following %.0f minutes. Mutually exclusive with '
              '--condition-sun-rain.'
              % (CONDITION_SUN_HOLD_MINUTES, CONDITION_PEAK_PRECIPITATION,

@@ -53,6 +53,7 @@ skipped window, because a fabricated level is indistinguishable from a served on
 in the results.
 """
 
+import math
 import os
 
 import pygame
@@ -66,15 +67,23 @@ from pygame.locals import K_a, K_b
 # the speed is at 0.80 h because that is the base of the windshield, and a panel
 # centred on that line would reach ~0.87 h and overlap the rendered wheel.
 #
-# Fractions of the window, resolved once in __init__ -- NOT recomputed from the
-# content, so the footprint is identical for all five renderings. A panel that
-# shrank at LoA 4 would make size a salience cue riding along with the condition.
+# The box is MEASURED, once, from the widest string any of the five renderings
+# can produce (``_measure``), not set to a guessed fraction of the window. A
+# fraction has to be picked for the worst case and then looks empty in every
+# other state -- which is exactly how the first version read. Measuring keeps
+# the footprint identical across the five (the invariant that matters: a panel
+# that shrank at LoA 4 would make size a salience cue riding along with the
+# condition) while removing the dead space.
+#
+# The clamps are guard rails, not the layout: they stop a pathological font or a
+# very long caller name from producing a panel that spans the windscreen.
 PANEL_LEFT_FRAC = 0.44
-PANEL_WIDTH_FRAC = 0.34
 PANEL_BOTTOM_FRAC = 0.80
-PANEL_HEIGHT_FRAC = 0.15
+PANEL_MIN_WIDTH_FRAC = 0.16
+PANEL_MAX_WIDTH_FRAC = 0.34
 
 PANEL_PAD = 14
+PANEL_ICON_GAP = 10
 PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate used
 
 
@@ -212,13 +221,6 @@ class CallEvent(object):
         self._answered = False
         self._pending_outcome = None
 
-        width, height = dim
-        self.rect = pygame.Rect(
-            int(width * PANEL_LEFT_FRAC),
-            int(height * (PANEL_BOTTOM_FRAC - PANEL_HEIGHT_FRAC)),
-            int(width * PANEL_WIDTH_FRAC),
-            int(height * PANEL_HEIGHT_FRAC))
-
         if pygame.font.get_init():
             self._font_title = pygame.font.Font(pygame.font.get_default_font(), 22)
             self._font_text = pygame.font.Font(pygame.font.get_default_font(), 18)
@@ -226,11 +228,92 @@ class CallEvent(object):
         else:                        # standalone import, no display yet
             self._font_title = self._font_text = self._font_small = None
 
+        self.icon_size = (self._font_title.get_height()
+                          if self._font_title else 22)
+        self.rect = self._layout(dim)
+
         self._assets_dir = assets_dir or _default_assets_dir()
         self._sounds = {}
         self._ring_channel = None
         self._voice_channel = None
         self._load_sounds()
+
+    # -- layout --------------------------------------------------------------
+
+    def _measure(self):
+        """Widest string any of the five renderings can produce, in pixels.
+
+        Every candidate is listed explicitly rather than measured lazily at draw
+        time, because the box must be identical in all five states -- sizing it
+        to whatever happens to be on screen would make the panel breathe between
+        conditions.
+        """
+        if self._font_text is None:
+            return 0
+        cands = [(self._font_title, '◆ ASSISTANT'),
+                 (self._font_title, 'INCOMING CALL'),
+                 (self._font_text, '[A] Answer   ★ RECOMMENDED'),
+                 (self._font_text, '[A] Yes        [B] No'),
+                 (self._font_text, '[B] Decline'),
+                 (self._font_text, '[B] Cancel'),
+                 (self._font_text, self.caller_name),
+                 (self._font_small, '%s — ringing, on hold' % self.caller_name),
+                 (self._font_small, '%s — connected     00:00' % self.caller_name)]
+        for loa, tmpl in _ASSISTANT_LINE.items():
+            if not tmpl:
+                continue
+            if loa == 3:
+                # What is DRAWN is the live countdown ("Answering in 3…"),
+                # never the three-digit template -- measuring the template made
+                # the panel ~25 %% wider than anything it can display.
+                tmpl = 'Call from %s. Answering in 3…'
+            cands.append((self._font_text, '"%s"' % (tmpl % self.caller_name)))
+        return max(f.size(t)[0] for f, t in cands)
+
+    def _layout(self, dim):
+        """The panel rect: measured width, row-counted height, fixed anchor."""
+        width, height = dim
+        if self._font_text is None:
+            return pygame.Rect(int(width * PANEL_LEFT_FRAC), 0,
+                               int(width * PANEL_MIN_WIDTH_FRAC), 0)
+
+        content = self._measure() + self.icon_size + PANEL_ICON_GAP
+        w = int(min(max(content + 2 * PANEL_PAD, width * PANEL_MIN_WIDTH_FRAC),
+                    width * PANEL_MAX_WIDTH_FRAC))
+
+        # Tallest rendering is LoA 3: header, one spoken line, the countdown
+        # bar, the cancel row, then the separator and status strip.
+        th, xh, sh = (self._font_title.get_height(), self._font_text.get_height(),
+                      self._font_small.get_height())
+        h = (2 * PANEL_PAD + (th + 4) + 2 * (xh + 4) + 16 + 6 + sh + 6)
+
+        return pygame.Rect(int(width * PANEL_LEFT_FRAC),
+                           int(height * PANEL_BOTTOM_FRAC) - h, w, h)
+
+    def _draw_handset(self, display, cx, cy, size, colour, waves=False):
+        """A handset silhouette: a bar at -40 degrees with a bulb at each end.
+
+        Drawn rather than loaded: it costs no asset, scales with the window like
+        every other element here, and recolours with the panel border so the
+        icon carries the same driver's-phone / assistant's-panel distinction the
+        rest of the layout does.
+        """
+        r = max(2, int(size * 0.20))
+        half = size * 0.28
+        dx, dy = math.cos(math.radians(-40)) * half, math.sin(math.radians(-40)) * half
+        p0 = (int(cx - dx), int(cy - dy))
+        p1 = (int(cx + dx), int(cy + dy))
+        pygame.draw.line(display, colour, p0, p1, max(2, int(size * 0.17)))
+        pygame.draw.circle(display, colour, p0, r)
+        pygame.draw.circle(display, colour, p1, r)
+        if waves:
+            # Two arcs off the earpiece. Static, not animated: the icon is
+            # identical in every condition and should stay that way.
+            for k, rad in enumerate((size * 0.52, size * 0.72)):
+                box = pygame.Rect(0, 0, int(rad * 2), int(rad * 2))
+                box.center = (int(cx), int(cy))
+                pygame.draw.arc(display, colour, box, math.radians(18),
+                                math.radians(62), max(1, int(size * 0.09) - k))
 
     # -- audio ---------------------------------------------------------------
 
@@ -501,11 +584,16 @@ class CallEvent(object):
 
     def _render_phone_card(self, display, x, y):
         """LoA 0 and 1: the driver's own phone. The assistant only annotates."""
-        header = '■ INCOMING CALL'
+        ring = self.state in (RINGING, AWAIT_INPUT)
+        self._draw_handset(display, x + self.icon_size / 2,
+                           y + self._font_title.get_height() / 2,
+                           self.icon_size, COL_PHONE, waves=ring)
+        tx = x + self.icon_size + PANEL_ICON_GAP
+        header = 'INCOMING CALL'
         if self.loa == 1:
-            header += '        ◆'          # assistant present, passive
-        y = self._blit(display, self._font_title, header, COL_WHITE, x, y)
-        y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, x, y)
+            header += '   ◆'              # assistant present, passive
+        y = self._blit(display, self._font_title, header, COL_WHITE, tx, y)
+        y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, tx, y)
         y += 6
 
         if self.loa == 1:
@@ -513,13 +601,18 @@ class CallEvent(object):
             # colour alone -- and it sits on the DRIVER's control, which is what
             # distinguishes advising from taking over.
             y = self._blit(display, self._font_text,
-                           '[A] Answer   ★ RECOMMENDED', COL_ASSISTANT, x, y)
+                           '[A] Answer   ★ RECOMMENDED', COL_ASSISTANT, tx, y)
         else:
-            y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, x, y)
-        return self._blit(display, self._font_text, '[B] Decline', COL_WHITE, x, y)
+            y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, tx, y)
+        return self._blit(display, self._font_text, '[B] Decline', COL_WHITE, tx, y)
 
     def _render_assistant(self, display, x, y):
         """LoA 2-4: the assistant's panel has replaced the phone card."""
+        self._draw_handset(display, x + self.icon_size / 2,
+                           y + self._font_title.get_height() / 2,
+                           self.icon_size, COL_ASSISTANT,
+                           waves=self.state in (RINGING, AWAIT_INPUT, COUNTDOWN))
+        x = x + self.icon_size + PANEL_ICON_GAP
         y = self._blit(display, self._font_title, '◆ ASSISTANT',
                        COL_ASSISTANT, x, y)
 
@@ -572,14 +665,17 @@ class CallEvent(object):
                          (self.rect.right - PANEL_PAD, y - 6), 1)
         if self.state == CONNECTED:
             secs = int(self._elapsed(pygame.time.get_ticks()) / 1000.0)
-            text = '■ %s — connected     %02d:%02d' % (
+            text = '%s — connected     %02d:%02d' % (
                 self.caller_name, secs // 60, secs % 60)
             colour = COL_CONNECTED
         else:
-            text = '■ %s — ringing, on hold' % self.caller_name
+            text = '%s — ringing, on hold' % self.caller_name
             colour = COL_DIM
+        small = int(self._font_small.get_height() * 0.9)
+        self._draw_handset(display, self.rect.left + PANEL_PAD + small / 2,
+                           y + self._font_small.get_height() / 2, small, colour)
         display.blit(self._font_small.render(text, True, colour),
-                     (self.rect.left + PANEL_PAD, y))
+                     (self.rect.left + PANEL_PAD + small + 6, y))
 
     @staticmethod
     def _wrap(text, font, max_w):
