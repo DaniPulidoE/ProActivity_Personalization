@@ -203,27 +203,56 @@ def main() -> None:
     # comparison exists to isolate. Checked from the checkpoints themselves,
     # because the flag lives in two separate earlier commands and nothing else
     # would catch the mismatch.
-    def _head_width(d: pathlib.Path, prefix: str) -> Optional[int]:
-        import torch as _t
+    def _head_width(d: pathlib.Path, prefix: str) -> tuple:
+        """(stored width, width AS ADAPTED) for the first readable checkpoint.
+
+        The two differ, and comparing the STORED widths is wrong: --embed-fcd has
+        deliberately asymmetric on-disk consequences. For the L2-SP arm the head is
+        widened in memory at load time, so pop_heldout_*.pt stays narrow; for the
+        ANIL arm the head is a META-PARAMETER, so meta-training persists the widened
+        one. A correct pair of arms therefore stores 64 and 76 and adapts 76 and 76.
+        The earlier version of this guard rejected exactly that configuration.
+
+        The effective width is obtained by running the checkpoint through the same
+        two functions the sweep runs it through, rather than re-deriving the rule --
+        install_fcd_head is idempotent, so an already-wide head is returned untouched.
+        """
+        from ProVoice.models.head_adapt import install_fcd_head
+        from ProVoice.models.xlstm_model import load_checkpoint
         for f in sorted(d.glob(f"{prefix}*.pt")):
             try:
-                w = _t.load(f, map_location="cpu", weights_only=False)["state_dict"]["head.weight"]
-                return int(w.shape[1])
+                model, _arch = load_checkpoint(str(f))
+                stored = int(model.head.in_features)
+                install_fcd_head(model, args.embed_fcd)
+                return stored, int(model.head.in_features)
             except Exception:
                 continue
-        return None
+        return None, None
 
-    _wl = _head_width(pathlib.Path(args.l2sp_ckpt_dir), args.l2sp_prefix)
-    _wa = _head_width(pathlib.Path(args.anil_ckpt_dir), args.anil_prefix)
+    _sl, _wl = _head_width(pathlib.Path(args.l2sp_ckpt_dir), args.l2sp_prefix)
+    _sa, _wa = _head_width(pathlib.Path(args.anil_ckpt_dir), args.anil_prefix)
     if _wl is not None and _wa is not None and _wl != _wa:
         raise SystemExit(
-            f"ARM MISMATCH: the L2-SP checkpoints have a {_wl}-input head and the ANIL "
-            f"checkpoints a {_wa}-input one. One arm was built with --embed-fcd and the "
-            f"other without, so they adapt different objects and the comparison would be "
-            f"confounded. Rebuild one arm to match, or pass matching flags upstream.")
+            f"ARM MISMATCH: after --embed-fcd={int(args.embed_fcd)} is applied the L2-SP "
+            f"arm adapts a {_wl}-input head (stored {_sl}) and the ANIL arm a {_wa}-input "
+            f"one (stored {_sa}). They adapt different objects, so the comparison would "
+            f"measure more than the initialization. Rebuild one arm to match.")
     if _wl is not None:
-        print(f"[arms] head width {_wl} on both arms"
-              + (" (FCD-augmented)" if _wl and _wa and _wl != 64 else ""))
+        print(f"[arms] adapting a {_wl}-input head on both arms"
+              + (" (FCD-augmented)" if _wl != _sl or (_sa is not None and _wl != _sa)
+                 else "")
+              + f"  [stored: l2sp {_sl}, anil {_sa}]")
+        # Symmetric in the OBJECT but not in what meta-training saw: a plain ANIL
+        # checkpoint widened here carries a zero FCD block its meta-training never
+        # used, so its anchor is uninformed about the task input the L2-SP arm's
+        # adaptation will exploit. Not fatal, but it is not the intended arm either.
+        # "_sa != _wa" means the ANIL checkpoint had to be widened HERE, which can
+        # only happen if meta-training ran without --embed-fcd. No constant needed.
+        if args.embed_fcd and _sa is not None and _sa != _wa:
+            print("[arms][WARN] the ANIL checkpoints were meta-trained WITHOUT --embed-fcd "
+                  "and are being widened here with a zero block. Both arms adapt the same "
+                  "object, but ANIL's meta-learned anchor never saw the FCD input. "
+                  "Re-run run_lodo_anil with --embed-fcd for the intended comparison.")
 
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     paths = {
