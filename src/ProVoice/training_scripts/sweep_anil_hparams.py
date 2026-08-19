@@ -452,7 +452,23 @@ def main() -> None:
     if args.summarize_only:
         if not results_csv.exists():
             raise SystemExit(f"--summarize-only: {results_csv} does not exist")
-        summarize(results_csv, outdir, tau)
+        # tau comes from the TABLE, never from selected_tau.json. Re-ranking must
+        # describe the runs that exist; reading the live tau file here would stamp
+        # whatever tau was selected LATER onto rows produced under an earlier one,
+        # and selected_anil.json is what run_lodo_anil trusts.
+        ran = sorted({r["tau"] for r in csv.DictReader(
+            results_csv.open("r", encoding="utf-8", newline="")) if r.get("tau")})
+        if len(ran) != 1:
+            raise SystemExit(
+                f"--summarize-only: {results_csv} mixes tau values {ran}. Ranking across "
+                f"them would compare configurations tuned against different anchors; "
+                f"split the file by tau first.")
+        csv_tau = float(ran[0])
+        if csv_tau != tau:
+            print(f"[tau] {csv_tau:g} (from the results table). NOTE: "
+                  f"{args.selected_tau} currently says {tau:g} — the table wins, because "
+                  f"these runs were meta-trained at {csv_tau:g}.")
+        summarize(results_csv, outdir, csv_tau)
         return
 
     COLS = results_columns(parse_val_ks(args.val_ks))
