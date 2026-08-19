@@ -727,6 +727,18 @@ def main():
                     help="Comma-separated participant ids held out for meta-validation "
                          "(drive this externally for leave-one-driver-out). Empty: hold out "
                          "~20%% of drivers at random.")
+    ap.add_argument("--no-meta-val", dest="no_meta_val", action="store_true",
+                    help="Meta-train on EVERY driver in the file: no held-out drivers, no "
+                         "meta-validation, no early stopping, and the checkpoint left on disk "
+                         "is the one after exactly --meta-epochs epochs. This is what the LODO "
+                         "runner needs, and it must be REQUESTED rather than inferred from an "
+                         "absent --val-pids: an empty --val-pids means 'choose for me', and "
+                         "the fallback below then holds out ~20%% of the drivers at random. "
+                         "That silently (a) drops those drivers from meta-training, breaking "
+                         "arm symmetry against an L2-SP checkpoint trained on all of them, "
+                         "(b) re-enables early stopping, and (c) makes save_checkpoint fire "
+                         "only on val improvement, so the saved model is the best epoch on a "
+                         "random pair of drivers rather than the M*-th epoch.")
     ap.add_argument("--val-ks", dest="val_ks", default="5,10,20,30,60",
                     help="Support sizes at which meta-validation adapts the held-out "
                          "drivers. THIS DEFINES WHAT val_set_mae MEANS, and therefore what "
@@ -772,6 +784,12 @@ def main():
     args = ap.parse_args()
     if not (1 <= args.k_min <= args.k_max):
         raise ValueError(f"Need 1 <= k-min <= k-max, got {args.k_min}, {args.k_max}")
+    # Checked HERE, not at the split: the split happens after the JSONL is parsed,
+    # and this file is large enough that failing there wastes minutes on a typo.
+    if args.no_meta_val and args.val_pids:
+        raise ValueError(
+            "--no-meta-val and --val-pids are contradictory: the first says hold out "
+            "nobody, the second names who to hold out. Pass exactly one.")
     if args.fo_warmup_epochs < 0:
         raise ValueError(f"--fo-warmup-epochs must be >= 0, got {args.fo_warmup_epochs}")
     if args.order == "imaml" and args.tau <= 0.0:
@@ -862,7 +880,10 @@ def main():
           f"{ {p: len(s) for p, s in drivers.items()} }")
 
     # train-val split over drivers
-    if args.val_pids: # user-specified hold-out
+    if args.no_meta_val:
+        # EXPLICIT: every driver meta-trains, nothing is held back.
+        val_pids = []
+    elif args.val_pids: # user-specified hold-out
         val_pids = [p.strip() for p in args.val_pids.split(",") if p.strip()]
         missing = [p for p in val_pids if p not in drivers]
         if missing:
@@ -871,13 +892,24 @@ def main():
         pids = sorted(drivers)
         rng.shuffle(pids)
         val_pids = pids[:max(1, round(0.2 * len(pids)))] if len(pids) >= 3 else []
+        if val_pids:
+            # LOUD, because a caller that meant "no meta-validation" and simply omitted
+            # --val-pids gets a materially different experiment and only this line says so.
+            print(f"[split][WARN] no --val-pids given: holding out {val_pids} AT RANDOM for "
+                  f"meta-validation. These drivers do NOT meta-train, early stopping is ON, "
+                  f"and the saved checkpoint is the best epoch on them — not the last. "
+                  f"If you wanted to train on everyone for a fixed number of epochs, "
+                  f"pass --no-meta-val.")
     train_pids = [p for p in sorted(drivers) if p not in val_pids]
     # error handling for too few drivers after the split
     if not train_pids:
         raise ValueError("No meta-training drivers left after the validation hold-out.")
     if not val_pids:
-        print("[warn] no meta-validation drivers (need >= 3 total) — no early stopping; "
-              "the LAST epoch's model is saved.")
+        print("[split] no meta-validation: "
+              + ("requested via --no-meta-val" if args.no_meta_val
+                 else "fewer than 3 drivers available")
+              + " — no early stopping, every epoch is saved, so the file on disk is the "
+                "model after exactly --meta-epochs epochs.")
     print(f"[split] meta-train drivers={train_pids}  meta-val drivers={val_pids}")
 
     # collate
@@ -897,9 +929,10 @@ def main():
             f"--val-ks must be comma-separated integers, got {args.val_ks!r}") from e
     if not val_ks or val_ks[0] < 1:
         raise ValueError(f"--val-ks must be positive integers, got {val_ks}")
-    print(f"[val] meta-validation K grid: {val_ks} "
-          f"(flat mean over {len(val_pids)} driver(s) x {len(val_ks)} K = "
-          f"{len(val_pids) * len(val_ks)} cells)")
+    if val_pids:
+        print(f"[val] meta-validation K grid: {val_ks} "
+              f"(flat mean over {len(val_pids)} driver(s) x {len(val_ks)} K = "
+              f"{len(val_pids) * len(val_ks)} cells)")
 
     # Per-epoch metrics for the sweep. TWO signals, deliberately both:
     #   query_loss  — meta-TRAINING progress, on `--episode-start any` episodes.

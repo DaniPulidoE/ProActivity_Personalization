@@ -177,10 +177,17 @@ def main() -> None:
             n = write_subset_streaming(src, train_pids, sub)
             cmd = [sys.executable, "-m", "ProVoice.models.xlstm_maml",
                    "--in", str(sub), "--init", str(init), "--out", str(out),
-                   # No --val-pids: that is what makes this "no meta-validation,
-                   # no epoch selection". xlstm_maml then saves every epoch, so
-                   # the file left on disk is the FINAL one, which is what M*
-                   # means here.
+                   # --no-meta-val, EXPLICITLY. Omitting --val-pids does NOT mean
+                   # "no meta-validation" -- xlstm_maml reads an absent value as
+                   # "choose for me" and holds out ~20 % of the drivers at random,
+                   # which would (a) meta-train this fold on 9 drivers while the
+                   # L2-SP arm's checkpoint saw all 11, breaking the one asymmetry
+                   # the comparison exists to isolate, (b) re-enable early stopping,
+                   # and (c) leave the best-epoch-on-a-random-pair checkpoint on disk
+                   # instead of the M*-th. M* is derived by the 1-SE rule precisely
+                   # BECAUSE nothing here selects epochs; that only holds if the
+                   # child agrees.
+                   "--no-meta-val",
                    "--order", "imaml", "--episode-start", args.episode_start,
                    "--tau", str(tau), "--outer-lr", str(outer_lr),
                    "--outer-opt", args.outer_opt,
