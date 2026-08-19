@@ -2560,7 +2560,7 @@ class HUD(object):
         pad = max(6, int(self.dim[0] * 0.006))
         block_w = value.get_width() + pad + unit.get_width()
         block_h = value.get_height()
-        x = (self.dim[0] - block_w) // 3.5
+        x = (self.dim[0] - block_w) // 4
         y = int(self.dim[1] * 0.8) - block_h
 
         # Dimmed plate behind the digits: the camera view is arbitrary and white

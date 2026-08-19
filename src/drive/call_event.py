@@ -77,8 +77,8 @@ from pygame.locals import K_a, K_b
 #
 # The clamps are guard rails, not the layout: they stop a pathological font or a
 # very long caller name from producing a panel that spans the windscreen.
-PANEL_LEFT_FRAC = 0.44
-PANEL_BOTTOM_FRAC = 0.80
+PANEL_LEFT_FRAC = 0.35
+PANEL_BOTTOM_FRAC = 0.82
 PANEL_MIN_WIDTH_FRAC = 0.16
 PANEL_MAX_WIDTH_FRAC = 0.34
 
