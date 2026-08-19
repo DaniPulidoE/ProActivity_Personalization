@@ -132,6 +132,11 @@ def sweep_driver(model, arch, df: pd.DataFrame, taus: List[float], val_frac: flo
                         "head_in": int(pop_head.in_features),
                         "embed_fcd": int(pop_head.in_features
                                          > model.embedding_dim),
+                        # The budget this cell ACTUALLY ran, taken from the adapter's
+                        # own info dict rather than from the flag. grad_norm alone
+                        # cannot distinguish "few steps" from "hard cell", and the two
+                        # call for opposite fixes; together they can.
+                        "adapt_steps": int(info["steps"]),
                         "grad_norm": info["grad_norm"], "n_val": n_val,
                         "set_mae": m["mae"], "set_acc": m["acc"],
                         "set_qwk": m["qwk"], "set_macro_f1": m["f1"],
@@ -207,7 +212,7 @@ def main() -> None:
                     f"provenance and decides what object the tau applies to, so it is "
                     f"refused rather than written wrong.")
         summarize(d, sorted(d["tau"].unique()), args.k_cap, outdir,
-                  args.val_frac, int(args.embed_fcd))
+                  args.val_frac, int(args.embed_fcd), args.steps, args.lr)
         return
 
     # MEMORY: never hold the whole file. data/labeled_data.jsonl parses to a
@@ -253,24 +258,25 @@ def main() -> None:
 
     if not all_rows:
         raise SystemExit("nothing swept — is stage 2 done?")
+    print(f"[adapt] {args.steps} full-batch steps at lr {args.lr:g} per (driver, tau, K) cell")
     print(f"[converge] worst |grad| over the whole sweep = {worst_grad:.2e} "
           f"({'OK' if worst_grad < GRAD_NORM_WARN else 'HIGH — raise --steps or --lr'})")
 
     out_csv = outdir / "l2sp_tau_sweep.csv"
     cols = ["pid", "tau", "k", "l2sp", "n_val", "set_mae", "set_acc", "set_qwk",
             "set_macro_f1", "base_set_mae", "base_set_acc", "grad_norm",
-            "head_in", "embed_fcd"]
+            "head_in", "embed_fcd", "adapt_steps"]
     with out_csv.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows([{c: r[c] for c in cols} for r in all_rows])
 
     summarize(pd.DataFrame(all_rows), taus, args.k_cap, outdir,
-              args.val_frac, int(args.embed_fcd))
+              args.val_frac, int(args.embed_fcd), args.steps, args.lr)
 
 
 def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.Path,
-              val_frac: float, embed_fcd: int) -> None:
+              val_frac: float, embed_fcd: int, steps: int, lr: float) -> None:
     """Within-driver mean over K <= k_cap, then across drivers; pick tau.
 
     ``val_frac`` and ``embed_fcd`` are PARAMETERS, not read off a global ``args``.
@@ -345,7 +351,13 @@ def summarize(df: pd.DataFrame, taus: List[float], k_cap: int, outdir: pathlib.P
         # adapted. A tau is only transferable to another run that matches both.
         "val_frac": val_frac,
         "embed_fcd": int(embed_fcd),
-        "adapt_steps": DEFAULT_ADAPT_STEPS, "adapt_lr": DEFAULT_ADAPT_LR,
+        # The values THIS run used, not the module defaults. Recording the constants
+        # here made the file claim adapt_steps=2000 for any run launched with
+        # --steps, and this JSON is precisely what makes a tau transferable between
+        # runs -- steps/lr do not move the MAP, but they decide whether it was
+        # reached, so a tau selected from under-converged cells is not the same
+        # object as one selected from converged cells.
+        "adapt_steps": int(steps), "adapt_lr": float(lr),
         "note": ("Single prior precision for ALL K, all drivers and BOTH study arms. "
                  "lambda = tau/(2K) is derived per adaptation by head_adapt. Selected on "
                  "mean set-MAE over K <= k_cap, averaged within driver then across "

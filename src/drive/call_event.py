@@ -1,0 +1,647 @@
+#!/usr/bin/env python
+
+"""Simulated incoming phone call, handled according to the predicted LoA.
+
+The interactive event of the live follow-up study. Design record and rationale:
+``docs/live_study_setup.md`` (§5 the ladder, §6 the UI spec). This module is the
+implementation of that spec and nothing else -- it owns no study logic, reads no
+files, and knows nothing about K conditions or checkpoints.
+
+WHAT THE LoA CONTROLS
+---------------------
+The call is a WORLD EVENT, not a system action: the phone rings in every
+condition, identically. What the LoA governs is how involved the assistant gets.
+
+This matters and is not decoration. If LoA 0 produced no on-screen event, the
+driver would perceive nothing and the satisfaction rating for that window would
+have no referent -- and since unpersonalized heads plausibly predict LoA 0 more
+often, the unratable windows would concentrate in one experimental condition.
+That is missing data correlated with the independent variable.
+
+    LoA  assistant                     affordance        no input ->
+    ---  ---------------------------   ---------------   ------------
+    0    silent                        ACCEPT / DECLINE  rings out
+    1    "Call from X."  + badge       ACCEPT / DECLINE  rings out
+    2    "...Want me to answer?"       YES / NO          NOT answered
+    3    "...Answering in 3, 2, 1."    CANCEL            ANSWERED
+    4    "...Answering now."           none              answered
+
+The "no input" column is the formal content of the ladder: doing nothing yields
+*nothing* for 0-2 and *the action* for 3-4, and that flip is what "veto" means.
+
+WHY 0->1 IS ONE MARKER AND 1->2 IS THE WHOLE PANEL
+--------------------------------------------------
+For a binary, immediate action, "suggest" and "ask approval" collapse in natural
+language -- any natural phrasing of a suggestion about answering a call ("want to
+take it?") *is* asking approval. So the distinction cannot live in the wording,
+and it does not: it lives in who owns the screen. At LoA 1 the driver is
+operating their own phone card and the assistant merely annotates it with a
+badge; at LoA 2 the card is replaced by an assistant panel and the driver is
+answering the assistant, not the phone.
+
+That asymmetry mirrors ``decision_engine._LOA_POLICY``, which groups the levels
+low/low/medium/high/high -- the visual hinge sits exactly where the policy hinge
+does. These two rungs are ~59% of the labels drivers gave for this function, so
+they are the ones that have to be separable.
+
+DEGRADES TO SILENCE, NEVER TO A GUESS
+-------------------------------------
+Missing audio files, no mixer, no audio device: the panel still renders and the
+interaction still resolves, exactly as ``ambience.py`` degrades. What it will
+NOT do is invent an LoA -- ``arm()`` refuses a ``None`` LoA and the caller logs a
+skipped window, because a fabricated level is indistinguishable from a served one
+in the results.
+"""
+
+import os
+
+import pygame
+from pygame.locals import K_a, K_b
+
+
+# --- Geometry ---------------------------------------------------------------
+#
+# The panel sits in the HUD band to the RIGHT of the speed readout, sharing its
+# baseline (docs/live_study_setup.md §6.1). Bottom-aligned and growing UPWARD:
+# the speed is at 0.80 h because that is the base of the windshield, and a panel
+# centred on that line would reach ~0.87 h and overlap the rendered wheel.
+#
+# Fractions of the window, resolved once in __init__ -- NOT recomputed from the
+# content, so the footprint is identical for all five renderings. A panel that
+# shrank at LoA 4 would make size a salience cue riding along with the condition.
+PANEL_LEFT_FRAC = 0.44
+PANEL_WIDTH_FRAC = 0.34
+PANEL_BOTTOM_FRAC = 0.80
+PANEL_HEIGHT_FRAC = 0.15
+
+PANEL_PAD = 14
+PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate used
+
+
+# --- Palette ----------------------------------------------------------------
+#
+# Marker AND colour in every state, per the convention in drive_improved.py: the
+# state has to survive a projector and a colour-blind participant.
+COL_WHITE = (255, 255, 255)
+COL_PHONE = (200, 200, 200)        # neutral: this card belongs to the driver
+COL_ASSISTANT = (140, 200, 255)    # the blue drive_improved uses for context
+COL_DIM = (140, 140, 140)
+COL_CONNECTED = (120, 240, 150)
+COL_COUNTDOWN = (255, 170, 90)
+
+
+# --- Input ------------------------------------------------------------------
+#
+# MUST stay in sync with drive_improved.py's wheel mapping. Button 7 is QUIT,
+# honoured everywhere in the drive UI -- never bind it here.
+#
+# [A] is ALWAYS the affirmative (Answer / Yes) and [B] ALWAYS the negative
+# (Decline / No / Cancel), at every LoA. If ACCEPT and YES were different
+# physical buttons, a motor confound would ride along with the condition.
+CALL_WHEEL_BUTTON_AFFIRM = 6
+CALL_WHEEL_BUTTON_NEGATIVE = 5
+
+CALL_KEY_AFFIRM = K_a
+CALL_KEY_NEGATIVE = K_b
+
+
+# --- Timing -----------------------------------------------------------------
+#
+# Onset is FIXED relative to window start and identical across conditions; only
+# the resolution time varies. That asymmetry is intrinsic (autonomy is partly a
+# claim about interaction time) but the onset must not add to it.
+DEFAULT_ONSET_OFFSET_S = 5.0   # from arm() to the phone ringing
+DEFAULT_CAP_S = 8.0            # ringing -> forced timeout, for the input rungs
+RING_LEAD_S = 1.2              # ring alone before the assistant speaks or acts
+COUNTDOWN_S = 3.0              # LoA 3 only
+CONNECTED_HOLD_S = 3.0         # caller's canned reply, then auto hang-up
+
+
+# --- States -----------------------------------------------------------------
+IDLE = 'idle'
+ARMED = 'armed'
+RINGING = 'ringing'
+AWAIT_INPUT = 'await_input'
+COUNTDOWN = 'countdown'
+DONE = 'done'
+CONNECTED = 'connected'
+
+# Which middle state each LoA enters after the ring lead-in. This dict is the
+# ONLY place the LoA is branched on -- everything else is shared, which is what
+# makes the five renderings one component instead of five.
+_LOA_ROUTE = {
+    0: AWAIT_INPUT,
+    1: AWAIT_INPUT,
+    2: AWAIT_INPUT,
+    3: COUNTDOWN,
+    4: CONNECTED,
+}
+
+# Assistant utterance per LoA. LoA 0 is silent -- that is the whole content of
+# "no assistive action is taken".
+_ASSISTANT_LINE = {
+    0: None,
+    1: 'Call from %s.',
+    2: 'Call from %s. Want me to answer?',
+    3: 'Call from %s. Answering in 3… 2… 1…',
+    4: 'Call from %s. Answering now.',
+}
+
+_SOUND_FILES = {
+    'ring': 'ring.wav',
+    1: 'loa1_line.wav',
+    2: 'loa2_line.wav',
+    3: 'loa3_line.wav',
+    4: 'loa4_line.wav',
+    'reply': 'caller_reply.wav',
+}
+
+
+def _default_assets_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, '..', '..'))
+    return os.environ.get('PROVOICE_CALL_ASSETS_DIR',
+                          os.path.join(root, 'assets', 'calls'))
+
+
+def _load_sound(path):
+    """A Sound, or None. Never raises: a missing clip must not end a session."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        if not pygame.mixer.get_init():
+            return None
+        return pygame.mixer.Sound(path)
+    except Exception as exc:                                  # noqa: BLE001
+        print('[WARN] call_event: could not load %s (%s).' % (path, exc))
+        return None
+
+
+class CallEvent(object):
+    """One incoming-call event per window, rendered according to a served LoA.
+
+    Lifecycle per window::
+
+        arm(now_ms, loa, window_idx)     -> schedules it at the fixed offset
+        update(now_ms)                   -> every frame; returns the outcome
+                                            dict on the tick it resolves
+        handle_event(pygame_event)       -> while `active`
+        render(display)                  -> every frame; no-op when inactive
+
+    Deliberately does NOT freeze the simulation. The label pop-up dims the whole
+    screen and holds the clock; this does neither, because the driver is still
+    driving and the event is meant to be handled in traffic.
+    """
+
+    def __init__(self, dim, assets_dir=None, caller_name='Mark',
+                 onset_offset_s=DEFAULT_ONSET_OFFSET_S, cap_s=DEFAULT_CAP_S,
+                 enabled=True):
+        self.dim = dim
+        self.enabled = enabled
+        self.caller_name = caller_name
+        self.onset_offset_ms = float(onset_offset_s) * 1000.0
+        self.cap_ms = float(cap_s) * 1000.0
+
+        self.state = IDLE
+        self.loa = None
+        self.window_idx = None
+        self._onset_ms = 0
+        self._state_entered_ms = 0
+        self._response = None
+        self._response_ms = None
+        self._answered = False
+        self._pending_outcome = None
+
+        width, height = dim
+        self.rect = pygame.Rect(
+            int(width * PANEL_LEFT_FRAC),
+            int(height * (PANEL_BOTTOM_FRAC - PANEL_HEIGHT_FRAC)),
+            int(width * PANEL_WIDTH_FRAC),
+            int(height * PANEL_HEIGHT_FRAC))
+
+        if pygame.font.get_init():
+            self._font_title = pygame.font.Font(pygame.font.get_default_font(), 22)
+            self._font_text = pygame.font.Font(pygame.font.get_default_font(), 18)
+            self._font_small = pygame.font.Font(pygame.font.get_default_font(), 15)
+        else:                        # standalone import, no display yet
+            self._font_title = self._font_text = self._font_small = None
+
+        self._assets_dir = assets_dir or _default_assets_dir()
+        self._sounds = {}
+        self._ring_channel = None
+        self._voice_channel = None
+        self._load_sounds()
+
+    # -- audio ---------------------------------------------------------------
+
+    def _load_sounds(self):
+        missing = []
+        for key, name in _SOUND_FILES.items():
+            snd = _load_sound(os.path.join(self._assets_dir, name))
+            self._sounds[key] = snd
+            if snd is None:
+                missing.append(name)
+        if missing:
+            # Loud once, then silent: the study can be piloted without audio,
+            # but nobody should discover afterwards that it ran without any.
+            print('[WARN] call_event: %d clip(s) missing from %s (%s). The event '
+                  'will run SILENTLY.' % (len(missing), self._assets_dir,
+                                          ', '.join(missing)))
+
+    def _play(self, key, loops=0):
+        snd = self._sounds.get(key)
+        if snd is None:
+            return None
+        try:
+            return snd.play(loops=loops)
+        except Exception:                                     # noqa: BLE001
+            return None
+
+    def _stop_ring(self):
+        if self._ring_channel is not None:
+            try:
+                self._ring_channel.stop()
+            except Exception:                                 # noqa: BLE001
+                pass
+            self._ring_channel = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    @property
+    def active(self):
+        """True while the panel is on screen and may consume input."""
+        return self.state in (RINGING, AWAIT_INPUT, COUNTDOWN, CONNECTED)
+
+    @property
+    def wants_audio_duck(self):
+        """Whether the caller should duck the ambience bed this frame."""
+        return self.active
+
+    def arm(self, now_ms, loa, window_idx=None):
+        """Schedule this window's call. False if nothing was armed.
+
+        ``loa`` of None means no decision was available -- the transport was
+        stale, or ProVoice had not produced one yet. We refuse rather than
+        substituting a level: a fabricated LoA is indistinguishable from a served
+        one afterwards. The caller logs the skip.
+        """
+        if not self.enabled or loa is None:
+            return False
+        try:
+            loa = int(loa)
+        except (TypeError, ValueError):
+            return False
+        if loa not in _LOA_ROUTE:
+            print('[WARN] call_event: LoA %r out of range 0-4; not arming.' % (loa,))
+            return False
+
+        self.loa = loa
+        self.window_idx = window_idx
+        self.state = ARMED
+        self._onset_ms = now_ms + self.onset_offset_ms
+        self._state_entered_ms = now_ms
+        self._response = None
+        self._response_ms = None
+        self._answered = False
+        self._pending_outcome = None
+        return True
+
+    def _enter(self, state, now_ms):
+        self.state = state
+        self._state_entered_ms = now_ms
+        if state == CONNECTED:
+            self._stop_ring()
+            self._answered = True
+            self._play('reply')
+
+    def _elapsed(self, now_ms):
+        return now_ms - self._state_entered_ms
+
+    def update(self, now_ms):
+        """Advance the machine. Returns the outcome dict once, on resolution.
+
+        EVERY resolution leaves through here, including the ones the driver
+        triggers from ``handle_event``. Returning the outcome from two different
+        methods would make it the caller's job to remember both, and the one
+        that got forgotten would be the decline -- silently unlogged.
+        """
+        pending = self._take_pending()
+        if pending is not None:
+            return pending
+        if self.state in (IDLE, DONE):
+            return None
+
+        if self.state == ARMED:
+            if now_ms >= self._onset_ms:
+                self._enter(RINGING, now_ms)
+                self._ring_channel = self._play('ring', loops=-1)
+                # LoA 0 is silent by definition; the rest speak at the lead-in.
+            return None
+
+        if self.state == RINGING:
+            if self._elapsed(now_ms) >= RING_LEAD_S * 1000.0:
+                if self.loa in self._sounds and self._sounds.get(self.loa):
+                    self._voice_channel = self._play(self.loa)
+                self._enter(_LOA_ROUTE[self.loa], now_ms)
+            return None
+
+        if self.state == AWAIT_INPUT:
+            # Cap measured from ONSET, not from state entry, so the driver's
+            # window to act does not silently differ between the rungs by the
+            # length of the assistant's utterance.
+            if now_ms - self._onset_ms >= self.cap_ms:
+                self._response = 'timeout'
+                self._response_ms = now_ms
+                self._resolve(now_ms, answered=False)
+                return self._take_pending()
+            return None
+
+        if self.state == COUNTDOWN:
+            if self._elapsed(now_ms) >= COUNTDOWN_S * 1000.0:
+                # Nobody vetoed: the action happens. This is the whole content
+                # of auto_with_veto and the reason the timeout means the
+                # opposite of what it means at LoA 2.
+                if self._response is None:
+                    self._response = 'timeout'
+                    self._response_ms = now_ms
+                self._enter(CONNECTED, now_ms)
+            return None
+
+        if self.state == CONNECTED:
+            if self._elapsed(now_ms) >= CONNECTED_HOLD_S * 1000.0:
+                self._resolve(now_ms, answered=True)
+                return self._take_pending()
+            return None
+
+        return None
+
+    def _resolve(self, now_ms, answered):
+        self._stop_ring()
+        self.state = DONE
+        self._answered = answered
+        self._pending_outcome = self.outcome(now_ms)
+        return self._pending_outcome
+
+    def _take_pending(self):
+        out, self._pending_outcome = self._pending_outcome, None
+        return out
+
+    def outcome(self, now_ms=None):
+        """The row for ``call_events.csv`` (docs/live_study_setup.md §9)."""
+        latency = None
+        if self._response_ms is not None:
+            latency = int(self._response_ms - self._onset_ms)
+        return {
+            'window_idx': self.window_idx,
+            'served_loa': self.loa,
+            'event_onset_ms': int(self._onset_ms),
+            'driver_response': self._response or 'none',
+            'response_latency_ms': latency,
+            'outcome': 'answered' if self._answered else 'not_answered',
+            'skipped_reason': '',
+        }
+
+    def stop(self):
+        """Release audio. Mirrors ``Ambience.stop()``; safe to call any time."""
+        self._stop_ring()
+        if self._voice_channel is not None:
+            try:
+                self._voice_channel.stop()
+            except Exception:                                 # noqa: BLE001
+                pass
+            self._voice_channel = None
+        self.state = IDLE
+
+    # -- input ---------------------------------------------------------------
+
+    def handle_event(self, event, now_ms=None):
+        """Consume one pygame event. Returns 'affirmative'/'negative' or None.
+
+        Only AWAIT_INPUT and COUNTDOWN are live, and COUNTDOWN accepts the
+        negative alone -- at LoA 3 there is no affirmative button, because doing
+        nothing already IS the affirmative.
+        """
+        if self.state not in (AWAIT_INPUT, COUNTDOWN):
+            return None
+
+        affirm = negative = False
+        if event.type == pygame.KEYDOWN:
+            affirm = event.key == CALL_KEY_AFFIRM
+            negative = event.key == CALL_KEY_NEGATIVE
+        elif event.type == pygame.JOYBUTTONDOWN:
+            affirm = event.button == CALL_WHEEL_BUTTON_AFFIRM
+            negative = event.button == CALL_WHEEL_BUTTON_NEGATIVE
+        else:
+            return None
+
+        # Same clock as update(). The drive loop passes pygame.time.get_ticks()
+        # to both, so the default matches -- but taking it implicitly made the
+        # response latency depend on a caller invariant that nothing enforced,
+        # and it is the one field the whole event exists to measure.
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
+
+        if self.state == COUNTDOWN:
+            if negative:
+                self._response = 'cancel'
+                self._response_ms = now_ms
+                self._resolve(now_ms, answered=False)
+                return 'negative'
+            return None
+
+        if affirm:
+            self._response = 'accept' if self.loa in (0, 1) else 'yes'
+            self._response_ms = now_ms
+            self._enter(CONNECTED, now_ms)
+            return 'affirmative'
+        if negative:
+            self._response = 'decline' if self.loa in (0, 1) else 'no'
+            self._response_ms = now_ms
+            self._resolve(now_ms, answered=False)
+            return 'negative'
+        return None
+
+    # -- rendering -----------------------------------------------------------
+
+    def render(self, display):
+        if not self.active or self._font_text is None:
+            return
+
+        assistant_owns = self.loa >= 2
+        border = COL_ASSISTANT if assistant_owns else COL_PHONE
+
+        # Backing plate. The speed readout's own (disabled) plate carries the
+        # reason in its comment: white text over a bright road surface is
+        # unreadable exactly when the driver is looking for it. A five-row panel
+        # needs it far more than three digits do.
+        plate = pygame.Surface(self.rect.size)
+        plate.set_alpha(PLATE_ALPHA)
+        plate.fill((0, 0, 0))
+        display.blit(plate, self.rect.topleft)
+
+        pygame.draw.rect(display, border, self.rect, 2)
+        if assistant_owns:
+            # Double border: the single strongest cue that this panel is not the
+            # driver's phone any more.
+            pygame.draw.rect(display, border, self.rect.inflate(-8, -8), 1)
+
+        x = self.rect.left + PANEL_PAD
+        y = self.rect.top + PANEL_PAD
+
+        if assistant_owns:
+            y = self._render_assistant(display, x, y)
+        else:
+            y = self._render_phone_card(display, x, y)
+
+        self._render_status_strip(display)
+
+    def _blit(self, display, font, text, colour, x, y):
+        display.blit(font.render(text, True, colour), (x, y))
+        return y + font.get_height() + 4
+
+    def _render_phone_card(self, display, x, y):
+        """LoA 0 and 1: the driver's own phone. The assistant only annotates."""
+        header = '■ INCOMING CALL'
+        if self.loa == 1:
+            header += '        ◆'          # assistant present, passive
+        y = self._blit(display, self._font_title, header, COL_WHITE, x, y)
+        y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, x, y)
+        y += 6
+
+        if self.loa == 1:
+            # The badge IS the suggestion. Marker (star) plus colour, never
+            # colour alone -- and it sits on the DRIVER's control, which is what
+            # distinguishes advising from taking over.
+            y = self._blit(display, self._font_text,
+                           '[A] Answer   ★ RECOMMENDED', COL_ASSISTANT, x, y)
+        else:
+            y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, x, y)
+        return self._blit(display, self._font_text, '[B] Decline', COL_WHITE, x, y)
+
+    def _render_assistant(self, display, x, y):
+        """LoA 2-4: the assistant's panel has replaced the phone card."""
+        y = self._blit(display, self._font_title, '◆ ASSISTANT',
+                       COL_ASSISTANT, x, y)
+
+        line = _ASSISTANT_LINE.get(self.loa)
+        if line:
+            spoken = line % self.caller_name
+            if self.loa == 3:
+                spoken = 'Call from %s. Answering in %d…' % (
+                    self.caller_name, self._countdown_remaining())
+            chunks = self._wrap(spoken, self._font_text,
+                                self.rect.width - 2 * PANEL_PAD)
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    chunk = '"' + chunk
+                if i == len(chunks) - 1:
+                    chunk = chunk + '"'
+                y = self._blit(display, self._font_text, chunk, COL_WHITE, x, y)
+
+        if self.state == COUNTDOWN:
+            y = self._render_countdown_bar(display, x, y + 4)
+            return self._blit(display, self._font_text, '[B] Cancel',
+                              COL_COUNTDOWN, x, y)
+        if self.loa == 2:
+            return self._blit(display, self._font_text, '[A] Yes        [B] No',
+                              COL_WHITE, x, y + 4)
+        return y
+
+    def _countdown_remaining(self):
+        left = COUNTDOWN_S - self._elapsed(pygame.time.get_ticks()) / 1000.0
+        return max(1, int(left) + 1)
+
+    def _render_countdown_bar(self, display, x, y):
+        """A draining bar, and the ONLY place in the five renderings one appears."""
+        frac = 1.0 - min(1.0, self._elapsed(pygame.time.get_ticks())
+                         / (COUNTDOWN_S * 1000.0))
+        full = self.rect.width - 2 * PANEL_PAD
+        pygame.draw.rect(display, COL_DIM, (x, y, full, 8), 1)
+        if frac > 0:
+            pygame.draw.rect(display, COL_COUNTDOWN,
+                             (x + 1, y + 1, max(0, int((full - 2) * frac)), 6))
+        return y + 16
+
+    def _render_status_strip(self, display):
+        """The phone, demoted. Present only once the assistant owns the panel."""
+        if self.loa < 2:
+            return
+        y = self.rect.bottom - PANEL_PAD - self._font_small.get_height()
+        pygame.draw.line(display, COL_DIM,
+                         (self.rect.left + PANEL_PAD, y - 6),
+                         (self.rect.right - PANEL_PAD, y - 6), 1)
+        if self.state == CONNECTED:
+            secs = int(self._elapsed(pygame.time.get_ticks()) / 1000.0)
+            text = '■ %s — connected     %02d:%02d' % (
+                self.caller_name, secs // 60, secs % 60)
+            colour = COL_CONNECTED
+        else:
+            text = '■ %s — ringing, on hold' % self.caller_name
+            colour = COL_DIM
+        display.blit(self._font_small.render(text, True, colour),
+                     (self.rect.left + PANEL_PAD, y))
+
+    @staticmethod
+    def _wrap(text, font, max_w):
+        words, lines, cur = text.split(), [], ''
+        for word in words:
+            trial = (cur + ' ' + word).strip()
+            if font.size(trial)[0] <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        return lines
+
+
+# --- Standalone harness ------------------------------------------------------
+#
+# Being a separate module is what lets the five renderings be exercised without
+# CARLA, without a second machine, and without a trained checkpoint. Press 0-4 to
+# arm that LoA, A/B to answer, ESC to quit.
+if __name__ == '__main__':
+    pygame.init()
+    try:
+        pygame.mixer.init()
+    except Exception:                                         # noqa: BLE001
+        print('[WARN] no audio device; running silently.')
+    DIM = (1280, 720)
+    screen = pygame.display.set_mode(DIM)
+    pygame.display.set_caption('call_event demo -- press 0-4, then A / B')
+    clock = pygame.time.Clock()
+    call = CallEvent(DIM, onset_offset_s=0.2)
+    font = pygame.font.Font(pygame.font.get_default_font(), 18)
+
+    running, last = True, None
+    while running:
+        now = pygame.time.get_ticks()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                running = False
+            elif ev.type == pygame.KEYDOWN and ev.unicode in '01234' and not call.active:
+                call.arm(now, int(ev.unicode), window_idx=1)
+            else:
+                call.handle_event(ev)
+
+        done = call.update(now)
+        if done:
+            last = done
+            print(done)
+
+        screen.fill((30, 34, 40))
+        # Stand-ins for the driving scene: the speed readout the panel shares a
+        # baseline with, so the placement can be judged (see §6.1).
+        screen.blit(font.render('120  km/h', True, (255, 255, 255)),
+                    (int(DIM[0] * 0.22), int(DIM[1] * 0.80) - 18))
+        call.render(screen)
+        if last:
+            screen.blit(font.render(str(last), True, (160, 160, 160)), (20, 20))
+        pygame.display.flip()
+        clock.tick(60)
+
+    call.stop()
+    pygame.quit()
