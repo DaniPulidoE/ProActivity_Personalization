@@ -599,22 +599,108 @@ class CallEvent(object):
 # --- Standalone harness ------------------------------------------------------
 #
 # Being a separate module is what lets the five renderings be exercised without
-# CARLA, without a second machine, and without a trained checkpoint. Press 0-4 to
-# arm that LoA, A/B to answer, ESC to quit.
-if __name__ == '__main__':
+# CARLA, without a second machine, and without a trained checkpoint.
+#
+#     uv run python src/drive/call_event.py [--fullscreen] [--speed-x-frac 0.20]
+#
+# Press 0-4 to arm that LoA, A/B to answer, ESC to quit.
+
+class _DemoSpeed(object):
+    """Stand-in for ``HUD._render_speed``, reproducing it EXACTLY.
+
+    The panel shares this readout's baseline (§6.1), so a stand-in that merely
+    looks speed-ish is worse than none: it would have the placement judged
+    against the wrong size and the wrong anchor. Every constant here is copied
+    from drive_improved.py and must be re-copied if that file changes --
+
+        speed_pt   = max(28, int(height * 0.055))     # 39 pt at 720p, 59 at 1080p
+        unit_pt    = max(12, speed_pt // 3)
+        x          = (width - block_w) // 3.5
+        y          = int(height * 0.8) - block_h
+
+    NOTE the three places that already disagree about where this lives:
+    the ``--speed`` help says "bottom-right corner", the ``_render_speed``
+    docstring says "Centered horizontally", and the code puts it ~29% from the
+    LEFT. Resolve that when applying §6.1 rather than adding a fourth.
+    """
+
+    def __init__(self, dim, x_frac=None):
+        width, height = dim
+        self.dim = dim
+        self.x_frac = x_frac
+        font_name = 'courier' if os.name == 'nt' else 'mono'
+        fonts = [x for x in pygame.font.get_fonts() if font_name in x]
+        default_font = 'ubuntumono'
+        mono = default_font if default_font in fonts else (fonts[0] if fonts else None)
+        mono = pygame.font.match_font(mono) if mono else None
+        speed_pt = max(28, int(height * 0.055))
+        self._font = pygame.font.Font(mono, speed_pt)
+        self._font_unit = pygame.font.Font(mono, max(12, speed_pt // 3))
+
+    def render(self, display, speed_kmh):
+        value = self._font.render('%d' % round(speed_kmh), True, (255, 255, 255))
+        unit = self._font_unit.render('km/h', True, (220, 220, 220))
+        pad = max(6, int(self.dim[0] * 0.006))
+        block_w = value.get_width() + pad + unit.get_width()
+        block_h = value.get_height()
+        if self.x_frac is None:
+            x = int((self.dim[0] - block_w) // 3.5)      # verbatim, drift and all
+        else:
+            x = int(self.dim[0] * self.x_frac)           # the §6.1 "moved left" trial
+        y = int(self.dim[1] * 0.8) - block_h
+        display.blit(value, (x, y))
+        display.blit(unit, (x + value.get_width() + pad,
+                            y + block_h - unit.get_height() - 2))
+        return pygame.Rect(x, y, block_w, block_h)
+
+
+def _demo():
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--fullscreen', action='store_true',
+                    help='Run at the desktop resolution. The panel is sized in '
+                         'FRACTIONS of the window, so this is the only way to '
+                         'see what the participant will actually see.')
+    ap.add_argument('--width', type=int, default=1280)
+    ap.add_argument('--height', type=int, default=720)
+    ap.add_argument('--speed-x-frac', dest='speed_x_frac', type=float, default=None,
+                    help='Override the speed readout x as a fraction of width, to '
+                         'try the "moved left" placement of docs section 6.1. '
+                         'reproduces drive_improved.py verbatim (~0.29).')
+    ap.add_argument('--no-speed', action='store_true',
+                    help='Hide the speed stand-in. Worth doing once: --speed is '
+                         'OFF by default in the drive UI, and if the study does '
+                         'not enable it the panel has no baseline to share.')
+    args = ap.parse_args()
+
     pygame.init()
     try:
         pygame.mixer.init()
     except Exception:                                         # noqa: BLE001
         print('[WARN] no audio device; running silently.')
-    DIM = (1280, 720)
-    screen = pygame.display.set_mode(DIM)
-    pygame.display.set_caption('call_event demo -- press 0-4, then A / B')
-    clock = pygame.time.Clock()
-    call = CallEvent(DIM, onset_offset_s=0.2)
-    font = pygame.font.Font(pygame.font.get_default_font(), 18)
 
-    running, last = True, None
+    if args.fullscreen:
+        info = pygame.display.Info()
+        dim = (info.current_w, info.current_h)
+        screen = pygame.display.set_mode(dim, pygame.FULLSCREEN)
+    else:
+        dim = (args.width, args.height)
+        screen = pygame.display.set_mode(dim)
+    pygame.display.set_caption('call_event demo -- 0-4 to arm, A / B to answer')
+
+    print('[demo] %dx%d  panel=%s  speed=%s'
+          % (dim[0], dim[1],
+             'x'.join(str(v) for v in (int(dim[0] * PANEL_WIDTH_FRAC),
+                                       int(dim[1] * PANEL_HEIGHT_FRAC))),
+             'hidden' if args.no_speed else 'shown'))
+
+    clock = pygame.time.Clock()
+    call = CallEvent(dim, onset_offset_s=0.2)
+    speedo = None if args.no_speed else _DemoSpeed(dim, args.speed_x_frac)
+    hint = pygame.font.Font(pygame.font.get_default_font(), 16)
+
+    running, last, speed = True, None, 120.0
     while running:
         now = pygame.time.get_ticks()
         for ev in pygame.event.get():
@@ -622,26 +708,35 @@ if __name__ == '__main__':
                 running = False
             elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 running = False
-            elif ev.type == pygame.KEYDOWN and ev.unicode in '01234' and not call.active:
+            elif (ev.type == pygame.KEYDOWN and ev.unicode in '01234'
+                  and not call.active):
                 call.arm(now, int(ev.unicode), window_idx=1)
             else:
-                call.handle_event(ev)
+                call.handle_event(ev, now_ms=now)
 
         done = call.update(now)
         if done:
             last = done
             print(done)
 
+        # Digits cycle 8 -> 128 so the block-width drift noted above is visible:
+        # the readout shifts as it crosses 10 and 100 km/h.
+        speed = 8 + (now // 40) % 120
+
         screen.fill((30, 34, 40))
-        # Stand-ins for the driving scene: the speed readout the panel shares a
-        # baseline with, so the placement can be judged (see §6.1).
-        screen.blit(font.render('120  km/h', True, (255, 255, 255)),
-                    (int(DIM[0] * 0.22), int(DIM[1] * 0.80) - 18))
+        if speedo is not None:
+            speedo.render(screen, speed)
         call.render(screen)
+        screen.blit(hint.render('0-4 arm   A/B answer   ESC quit', True,
+                                (120, 120, 120)), (20, 20))
         if last:
-            screen.blit(font.render(str(last), True, (160, 160, 160)), (20, 20))
+            screen.blit(hint.render(str(last), True, (160, 160, 160)), (20, 44))
         pygame.display.flip()
         clock.tick(60)
 
     call.stop()
     pygame.quit()
+
+
+if __name__ == '__main__':
+    _demo()
