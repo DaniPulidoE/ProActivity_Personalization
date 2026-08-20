@@ -807,9 +807,12 @@ class CallEvent(object):
     def _blit(self, display, font, text, colour, x, y):
         if OUTLINE_PX and self.chrome == 'none':
             halo = font.render(text, True, COL_OUTLINE)
+            # FOUR offsets, not eight. The diagonals add a corner-to-corner
+            # fringe that bleeds into the letterforms and closes the counters at
+            # 15-22 px, which is what made the text read muddy; the orthogonals
+            # alone break the glyph off the background just as well.
             r = OUTLINE_PX
-            for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r),
-                           (-r, -r), (r, -r), (-r, r), (r, r)):
+            for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r)):
                 display.blit(halo, (x + dx, y + dy))
         display.blit(font.render(text, True, colour), (x, y))
         return y + font.get_height() + 4
