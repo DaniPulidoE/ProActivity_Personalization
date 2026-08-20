@@ -100,14 +100,14 @@ PANEL_PAD_TOP = 22
 PANEL_PAD_LEFT = 22
 PANEL_ICON_GAP = 10
 
-# CHROME (default 'none'): 'panel' draws the translucent plate and border;
+# CHROME (default 'panel'): 'panel' draws the translucent plate and border;
 # 'none' puts the text straight onto the scene. Per-instance via the `chrome`
 # kwarg, so --call-chrome can flip it without editing this file. Text-only occludes far less of the road and matches
 # the speed readout, which has no plate either -- but it hands legibility over
 # to whatever the driver is passing, and this panel's body text is 15-18 pt
 # against the speed readout's 39 pt digits. So text-only is only viable WITH the
 # outline below, which is what the plate was standing in for.
-PANEL_CHROME = 'none'
+PANEL_CHROME = 'panel'
 # Dark halo behind every glyph and marker. ONLY in 'none' mode -- under the
 # plate it is redundant and reads as a heavy black stroke around the text.
 # 1 px is enough: the halo only has to break the glyph away from the scene, and
@@ -115,7 +115,12 @@ PANEL_CHROME = 'none'
 OUTLINE_PX = 1
 COL_OUTLINE = (0, 0, 0)
 
-PANEL_RADIUS = 10                # corner rounding
+# Corner rounding, in pixels. 'pill' is also accepted and gives fully oval ends
+# (radius = half the panel height), but at 149 px tall that curve reaches ~13 px
+# into the first and last text rows, leaving the separator, the countdown bar
+# and the status strip with almost no clearance. 22 is well clear of everything
+# while still reading as strongly rounded.
+PANEL_RADIUS = 22
 PANEL_BORDER_W = 1               # outline weight; 2 read as heavy at this size
 PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate used
 
@@ -150,14 +155,19 @@ COL_WHITE = (255, 255, 255)
 # that docs/live_study_setup.md 5.3 makes load-bearing.
 COL_PHONE = (232, 240, 250)
 COL_ASSISTANT = (232, 240, 250)
-# Accent for headers and markers -- the blue that carries the hierarchy now the
-# font is back to the drive UI's own (already-bold) face, so weight cannot.
-COL_ACCENT = (140, 200, 255)
+# Accent for headers and markers -- carries the hierarchy, since the drive UI's
+# face is already bold and weight cannot.
+#
+# Green measured at 3.15:1 against the panel over mid road, up from the previous
+# blue's 2.53:1. NOTE it is now near-identical to COL_CONNECTED below (1.00:1
+# between them), so green no longer distinguishes "the call is connected" from
+# ordinary emphasis -- change COL_CONNECTED if that distinction still matters.
+COL_ACCENT = (150, 235, 160)
 COL_DIM = (205, 220, 238)          # lifted off (140,140,140): too dark on blue
 # The "INCOMING CALL" header. Its own constant, not an alias of COL_ACCENT: the
 # two mean different things (a card title vs "the assistant owns this"), so the
 # LoA 0/1 vs 2 distinction can be sharpened up by changing this one alone.
-COL_CALL = (140, 200, 255)
+COL_CALL = (150, 235, 160)
 COL_CONNECTED = (120, 240, 150)
 COL_COUNTDOWN = (255, 170, 90)
 
@@ -777,22 +787,24 @@ class CallEvent(object):
         # reason in its comment: white text over a bright road surface is
         # unreadable exactly when the driver is looking for it. A five-row panel
         # needs it far more than three digits do.
+        radius = (self.rect.height // 2 if PANEL_RADIUS == 'pill'
+                  else int(PANEL_RADIUS))
         if self.chrome == 'panel':
             # SRCALPHA + a rounded draw, rather than fill + set_alpha: set_alpha
             # is a whole-surface value and would square the corners back off.
             plate = pygame.Surface(self.rect.size, pygame.SRCALPHA)
             pygame.draw.rect(plate, COL_PANEL_BG + (PLATE_ALPHA_BG,),
-                             plate.get_rect(), border_radius=PANEL_RADIUS)
+                             plate.get_rect(), border_radius=radius)
             display.blit(plate, self.rect.topleft)
 
             pygame.draw.rect(display, border, self.rect, PANEL_BORDER_W,
-                             border_radius=PANEL_RADIUS)
+                             border_radius=radius)
             if assistant_owns:
                 # Double border: the single strongest cue that this panel is not
                 # the driver's phone any more.
                 pygame.draw.rect(display, border, self.rect.inflate(-8, -8),
                                  PANEL_BORDER_W,
-                                 border_radius=max(2, PANEL_RADIUS - 4))
+                                 border_radius=max(2, radius - 4))
 
         x = self.rect.left + PANEL_PAD_LEFT
         y = self.rect.top + PANEL_PAD_TOP
