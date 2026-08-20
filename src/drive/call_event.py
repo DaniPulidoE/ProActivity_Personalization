@@ -356,6 +356,13 @@ class CallEvent(object):
             self._font_title = pygame.font.Font(face, 19)
             self._font_text = pygame.font.Font(face, 16)
             self._font_small = pygame.font.Font(face, 13)
+            # BOLD everywhere. Courier's regular weight is a thin, low-contrast
+            # stroke that reads as weak at 13-19 pt over a moving scene -- the
+            # speed readout gets away with it only because it is 39 pt. Set
+            # BEFORE _layout: emboldening widens every glyph, so _measure has to
+            # see the bold metrics or the panel is sized too small and wraps.
+            for _f in (self._font_title, self._font_text, self._font_small):
+                _f.set_bold(True)
         else:                        # standalone import, no display yet
             self._font_title = self._font_text = self._font_small = None
 
