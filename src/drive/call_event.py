@@ -249,20 +249,34 @@ def _default_assets_dir():
                           os.path.join(root, 'assets', 'calls'))
 
 
-def _speed_block_height(height):
-    """Glyph height of drive_improved's speed readout, for the given window.
+def _mono_face():
+    """The face drive_improved's HUD uses, or None for pygame's default.
 
-    Replicates HUD.__init__: ``speed_pt = max(28, int(height * 0.055))`` in the
-    mono face it picks. Copied rather than imported because importing
-    drive_improved from here would be a cycle -- so it has to be re-checked if
-    that sizing changes.
+    Replicates HUD.__init__'s lookup exactly: prefer ``ubuntumono``, else the
+    first installed family matching 'courier' (Windows) / 'mono'. This is the
+    face the SPEED READOUT is drawn in, which is the whole point -- the call
+    panel sits beside it and has to look like part of the same instrument.
+
+    Copied rather than imported: importing drive_improved from here would be a
+    cycle, so it has to be re-checked if that selection ever changes.
     """
     try:
         font_name = 'courier' if os.name == 'nt' else 'mono'
         fonts = [x for x in pygame.font.get_fonts() if font_name in x]
         mono = 'ubuntumono' if 'ubuntumono' in fonts else (fonts[0] if fonts else None)
-        mono = pygame.font.match_font(mono) if mono else None
-        return pygame.font.Font(mono, max(28, int(height * 0.055))).get_height()
+        return pygame.font.match_font(mono) if mono else None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _speed_block_height(height):
+    """Glyph height of drive_improved's speed readout, for the given window.
+
+    Replicates HUD.__init__: ``speed_pt = max(28, int(height * 0.055))``.
+    """
+    try:
+        return pygame.font.Font(_mono_face(),
+                                max(28, int(height * 0.055))).get_height()
     except Exception:                                         # noqa: BLE001
         return int(height * 0.062)          # what the formula yields in practice
 
@@ -329,14 +343,19 @@ class CallEvent(object):
         self._pending_outcome = None
 
         if pygame.font.get_init():
-            # The drive UI's own face: HUD and LoASelectionPopup both use
-            # pygame's default (freesansbold), so the panel matches the rest of
-            # the screen. It is already bold, which is why the hierarchy is
-            # carried by COLOUR here rather than by weight.
-            face = pygame.font.get_default_font()
-            self._font_title = pygame.font.Font(face, 22)
-            self._font_text = pygame.font.Font(face, 18)
-            self._font_small = pygame.font.Font(face, 15)
+            # THE SPEED READOUT'S FACE, not pygame's default. The panel sits
+            # beside the speed and has to read as the same instrument; the
+            # default (freesansbold) is what the LoA pop-up uses, but that is a
+            # full-screen modal, not something shown next to the digits.
+            #
+            # Mono is ~25 % wider per character than the proportional default,
+            # so the sizes are a step down from the 22/18/15 that face wanted --
+            # otherwise the measured width hits PANEL_MAX_WIDTH_FRAC and the
+            # assistant's line wraps.
+            face = _mono_face()
+            self._font_title = pygame.font.Font(face, 19)
+            self._font_text = pygame.font.Font(face, 16)
+            self._font_small = pygame.font.Font(face, 13)
         else:                        # standalone import, no display yet
             self._font_title = self._font_text = self._font_small = None
 
