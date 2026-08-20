@@ -49,8 +49,13 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import csv
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import pathlib
 from typing import Dict, List
 
@@ -190,6 +195,21 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=DEFAULT_ADAPT_STEPS)
     ap.add_argument("--lr", type=float, default=DEFAULT_ADAPT_LR)
     ap.add_argument("--pids", default="")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Shard the DRIVERS across this many worker processes. Unlike the "
+                         "population and ANIL sweeps, which parallelise by dispatching "
+                         "training subprocesses, this script does all its work in-process: "
+                         "a per-driver loop that loads a checkpoint, embeds once, then "
+                         "grinds the tau x K grid. Drivers are independent, so the parent "
+                         "re-invokes itself once per shard with --pids and concatenates the "
+                         "partial CSVs. Selection runs ONCE, in the parent, over the "
+                         "combined table -- never per shard, which would rank taus on a "
+                         "subset of drivers and defeat the blocking.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch intra-op threads per shard (0 = leave torch's default). "
+                         "Set in the child's ENVIRONMENT, since torch sizes its pool at "
+                         "import. Pair with --jobs so jobs x threads does not exceed the "
+                         "core count.")
     args = ap.parse_args()
 
     taus = [float(t) for t in args.taus.split(",") if t.strip()]
@@ -197,6 +217,64 @@ def main() -> None:
     ckpt_dir = pathlib.Path(args.ckpt_dir)
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.jobs > 1 and not os.environ.get("_L2SP_SHARD"):
+        want_pids = [x.strip() for x in args.pids.split(",") if x.strip()] or list(ALL_PIDS)
+        shards = [want_pids[i::args.jobs] for i in range(args.jobs)]
+        shards = [sh for sh in shards if sh]
+        print(f"[jobs] {len(want_pids)} driver(s) over {len(shards)} shard(s): "
+              + " | ".join(",".join(sh) for sh in shards), flush=True)
+        env = dict(os.environ, _L2SP_SHARD="1")
+        if args.threads_per_job > 0:
+            for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                      "NUMEXPR_NUM_THREADS"):
+                env[v] = str(args.threads_per_job)
+        base = [a for a in sys.argv[1:]]
+
+        def strip(flags):
+            """Drop a flag and its value from the parent's argv."""
+            out, skip = [], False
+            for a in base:
+                if skip:
+                    skip = False
+                    continue
+                if a in flags:
+                    skip = True
+                    continue
+                if any(a.startswith(f + "=") for f in flags):
+                    continue
+                out.append(a)
+            return out
+
+        with tempfile.TemporaryDirectory() as td:
+            def run(i_sh):
+                i, sh = i_sh
+                od = pathlib.Path(td) / f"shard{i}"
+                cmd = ([sys.executable, "-m", "ProVoice.training_scripts.sweep_l2sp_tau"]
+                       + strip({"--pids", "--outdir", "--jobs", "--threads-per-job"})
+                       + ["--pids", ",".join(sh), "--outdir", str(od), "--jobs", "1"])
+                r = subprocess.run(cmd, env=env)
+                return i, od / "l2sp_tau_sweep.csv", r.returncode
+
+            frames, failed = [], 0
+            with cf.ThreadPoolExecutor(max_workers=len(shards)) as ex:
+                for i, csvp, rc in ex.map(run, list(enumerate(shards))):
+                    if rc != 0 or not csvp.exists():
+                        print(f"[jobs] shard {i} FAILED (exit {rc})")
+                        failed += 1
+                        continue
+                    frames.append(pd.read_csv(csvp, dtype={"pid": str}))
+            if failed or not frames:
+                raise SystemExit(f"{failed} shard(s) failed; not writing a partial table")
+            allr = pd.concat(frames, ignore_index=True).sort_values(["pid", "tau", "k"])
+            outdir.mkdir(parents=True, exist_ok=True)
+            allr.to_csv(outdir / "l2sp_tau_sweep.csv", index=False)
+            print(f"[jobs] merged {len(allr)} rows from {len(frames)} shard(s) -> "
+                  f"{outdir / 'l2sp_tau_sweep.csv'}")
+        # Selection over the COMBINED table, in the parent only.
+        summarize(allr, sorted(allr["tau"].unique()), args.k_cap, outdir,
+                  args.val_frac, int(args.embed_fcd), args.steps, args.lr)
+        return
 
     if args.resummarize:
         csvp = outdir / "l2sp_tau_sweep.csv"
