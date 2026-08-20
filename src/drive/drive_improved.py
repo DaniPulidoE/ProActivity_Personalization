@@ -3206,24 +3206,6 @@ def game_loop(args):
         call_preview = (CallEvent((args.width, args.height),
                                   chrome=args.call_chrome)
                         if (args.call_preview or study_on) else None)
-        if study_on:
-            cfg = dict(SHORT_TRIAL if args.short_trial else FULL_TRIAL)
-            study = StudySession(
-                LoASource('random' if args.random_loa else 'bridge',
-                          status_path=status_path, session_id=session_id,
-                          seed=args.study_seed),
-                log_path=os.path.join(os.getcwd(), 'data', 'call_events.csv'),
-                seed=args.study_seed, session_id=session_id,
-                participantid=getattr(args, 'participantid', ''),
-                block_idx=args.block_idx, k_condition=args.k_condition, **cfg)
-            print('[study] block %s condition %r: %d calls over %.0f min, '
-                  '~%.0f s apart (jitter +/-%.0f s), LoA from %s.'
-                  % (args.block_idx or '?', args.k_condition or '?',
-                     cfg['n_calls'], cfg['duration_s'] / 60.0,
-                     cfg['interval_s'], cfg['jitter_s'], study.source.mode))
-            if args.random_loa:
-                print('[study] WARNING --random-loa: the LoA is drawn LOCALLY, '
-                      'not served by a model. Not a study configuration.')
         if call_preview is not None:
             print('[call-preview] press 0-4 to stage a call at that LoA, '
                   'A / B to answer. Chrome=%s, panel %dx%d at (%d, %d). '
@@ -3276,6 +3258,28 @@ def game_loop(args):
         status_path = getattr(args, 'provoice_status_file', None) or None
         if status_path:
             status_path = os.path.abspath(status_path)
+        # AFTER session_id and status_path: the LoA source is scoped to this
+        # session and reads that file, so building it any earlier -- next to
+        # call_preview, where it started -- raised UnboundLocalError on both.
+        if study_on:
+            cfg = dict(SHORT_TRIAL if args.short_trial else FULL_TRIAL)
+            study = StudySession(
+                LoASource('random' if args.random_loa else 'bridge',
+                          status_path=status_path, session_id=session_id,
+                          seed=args.study_seed),
+                log_path=os.path.join(os.getcwd(), 'data', 'call_events.csv'),
+                seed=args.study_seed, session_id=session_id,
+                participantid=getattr(args, 'participantid', ''),
+                block_idx=args.block_idx, k_condition=args.k_condition, **cfg)
+            print('[study] block %s condition %r: %d calls over %.0f min, '
+                  '~%.0f s apart (jitter +/-%.0f s), LoA from %s.'
+                  % (args.block_idx or '?', args.k_condition or '?',
+                     cfg['n_calls'], cfg['duration_s'] / 60.0,
+                     cfg['interval_s'], cfg['jitter_s'], study.source.mode))
+            if args.random_loa:
+                print('[study] WARNING --random-loa: the LoA is drawn LOCALLY, '
+                      'not served by a model. Not a study configuration.')
+
         provoice_watcher = ProVoiceReadyWatcher(session_id, args.popup_wait_timeout,
                                                 status_path=status_path)
         end_watcher = ProVoiceEndWatcher(session_id, status_path)
@@ -4041,6 +4045,33 @@ def main():
              % (CONDITION_SUN_HOLD_MINUTES, CONDITION_PEAK_PRECIPITATION,
                 CONDITION_RAMP_MINUTES))
     args = argparser.parse_args()
+
+    # --- study mode normalisation ------------------------------------------
+    #
+    # A study block measures the CALLS. The 20 s Level-of-Proactivity pop-up is
+    # the data-collection instrument and has no place here: it would freeze the
+    # scene every 20 seconds, interrupt calls mid-interaction, and ask the
+    # driver to label windows nobody is going to use. Forced off rather than
+    # left to the experimenter to remember, because forgetting it does not fail
+    # -- it quietly produces a block that measures something else.
+    if args.short_trial:
+        args.study = True
+    if args.study:
+        if args.test_popup:
+            argparser.error('--test-popup and --study contradict each other: '
+                            'one is nothing but labelling pop-ups, the other '
+                            'suppresses them to measure calls instead.')
+        if args.random_function:
+            argparser.error('--random-function only affects the labelling '
+                            'pop-up, which --study turns off. Drop it.')
+        if not args.no_popup:
+            args.no_popup = True
+            print('[study] labelling pop-ups disabled for this block '
+                  '(--no-popup implied): the block measures calls, and a '
+                  'pop-up every 20 s would freeze the scene on top of them.')
+    if args.random_loa and not args.study:
+        argparser.error('--random-loa only has an effect on a study block. Add '
+                        '--study (or --short-trial), or drop it.')
 
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '
