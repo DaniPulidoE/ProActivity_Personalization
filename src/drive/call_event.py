@@ -95,6 +95,12 @@ COL_WHITE = (255, 255, 255)
 COL_PHONE = (200, 200, 200)        # neutral: this card belongs to the driver
 COL_ASSISTANT = (140, 200, 255)    # the blue drive_improved uses for context
 COL_DIM = (140, 140, 140)
+# The "INCOMING CALL" header on the driver's own phone card. Same value as
+# COL_ASSISTANT today but a SEPARATE constant, because the two mean different
+# things: this one is just the card's title, that one says the assistant owns
+# the panel. Change this alone if the LoA 0/1 vs 2 distinction ever needs
+# sharpening back up.
+COL_CALL = (140, 200, 255)
 COL_CONNECTED = (120, 240, 150)
 COL_COUNTDOWN = (255, 170, 90)
 
@@ -152,6 +158,8 @@ _ASSISTANT_LINE = {
     0: None,
     1: 'Call from %s.',
     2: 'Call from %s. Want me to answer?',
+    # LoA 3's on-screen text is built per frame by _panel_line (it carries the
+    # live digit); this entry documents what loa3_line.wav says.
     3: 'Call from %s. Answering in 3… 2… 1…',
     4: 'Call from %s. Answering now.',
 }
@@ -691,7 +699,7 @@ class CallEvent(object):
         tx = x + self.icon_size + PANEL_ICON_GAP
         header = 'INCOMING CALL'
         head_y = y
-        y = self._blit(display, self._font_title, header, COL_WHITE, tx, y)
+        y = self._blit(display, self._font_title, header, COL_CALL, tx, y)
         if self.loa == 1:
             # Assistant present but passive: it annotates the driver's card
             # rather than owning it.
@@ -735,12 +743,8 @@ class CallEvent(object):
         y = self._blit(display, self._font_title, 'ASSISTANT', COL_ASSISTANT,
                        x + self.icon_size * 1.05, y)
 
-        line = _ASSISTANT_LINE.get(self.loa)
-        if line:
-            spoken = line % self.caller_name
-            if self.loa == 3:
-                spoken = 'Call from %s. Answering in %d…' % (
-                    self.caller_name, self._countdown_remaining())
+        spoken = self._panel_line()
+        if spoken:
             chunks = self._wrap(spoken, self._font_text,
                                 self.rect.width - 2 * PANEL_PAD)
             for i, chunk in enumerate(chunks):
@@ -759,9 +763,35 @@ class CallEvent(object):
                               COL_WHITE, x, y + 4)
         return y
 
+    def _panel_line(self):
+        """What the assistant panel says, given the LoA AND the current state.
+
+        Keyed on state, not on LoA alone. Keying on LoA alone meant the LoA 3
+        countdown text was drawn in every state, and since ``_countdown_remaining``
+        measures from whatever state was last entered, it counted down during the
+        ring lead-in, jumped back to 3 when COUNTDOWN was actually entered, and
+        then counted down a third time from CONNECTED.
+        """
+        if self.state == RINGING:
+            # The assistant has not spoken yet -- its clip plays on leaving this
+            # state -- so the panel shows only who is calling.
+            return 'Call from %s.' % self.caller_name
+        if self.state == COUNTDOWN:
+            return 'Call from %s. Answering in %d…' % (
+                self.caller_name, self._countdown_remaining())
+        if self.state == CONNECTED:
+            return 'Call from %s. Answering now.' % self.caller_name
+        line = _ASSISTANT_LINE.get(self.loa)
+        return (line % self.caller_name) if line else None
+
     def _countdown_remaining(self):
+        """3, 2, 1 -- one second each, from the start of COUNTDOWN.
+
+        ceil, not int()+1: at exactly t=1.0 s the latter gives 3 again, so the
+        first digit held for two seconds and the last for none.
+        """
         left = COUNTDOWN_S - self._elapsed(self._now_ms) / 1000.0
-        return max(1, min(int(COUNTDOWN_S), int(left) + 1))
+        return max(1, min(int(COUNTDOWN_S), int(math.ceil(left))))
 
     def _render_countdown_bar(self, display, x, y):
         """A draining bar, and the ONLY place in the five renderings one appears."""
