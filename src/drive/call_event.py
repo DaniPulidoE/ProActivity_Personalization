@@ -100,13 +100,14 @@ PANEL_PAD_TOP = 22
 PANEL_PAD_LEFT = 22
 PANEL_ICON_GAP = 10
 
-# CHROME: 'panel' draws the translucent plate and border; 'none' puts the text
-# straight onto the scene. Text-only occludes far less of the road and matches
+# CHROME (default 'none'): 'panel' draws the translucent plate and border;
+# 'none' puts the text straight onto the scene. Per-instance via the `chrome`
+# kwarg, so --call-chrome can flip it without editing this file. Text-only occludes far less of the road and matches
 # the speed readout, which has no plate either -- but it hands legibility over
 # to whatever the driver is passing, and this panel's body text is 15-18 pt
 # against the speed readout's 39 pt digits. So text-only is only viable WITH the
 # outline below, which is what the plate was standing in for.
-PANEL_CHROME = 'panel'
+PANEL_CHROME = 'none'
 # Dark halo behind every glyph and marker. ONLY in 'none' mode -- under the
 # plate it is redundant and reads as a heavy black stroke around the text.
 # 1 px is enough: the halo only has to break the glyph away from the scene, and
@@ -149,11 +150,14 @@ COL_WHITE = (255, 255, 255)
 # that docs/live_study_setup.md 5.3 makes load-bearing.
 COL_PHONE = (232, 240, 250)
 COL_ASSISTANT = (232, 240, 250)
+# Accent for headers and markers -- the blue that carries the hierarchy now the
+# font is back to the drive UI's own (already-bold) face, so weight cannot.
+COL_ACCENT = (140, 200, 255)
 COL_DIM = (205, 220, 238)          # lifted off (140,140,140): too dark on blue
-# Was a blue; on a blue panel the hierarchy is carried by WEIGHT instead --
-# headers are bold, body text is regular. Kept as its own constant so the
-# LoA 0/1 vs 2 distinction can be sharpened back up with colour if needed.
-COL_CALL = (255, 255, 255)
+# The "INCOMING CALL" header. Its own constant, not an alias of COL_ACCENT: the
+# two mean different things (a card title vs "the assistant owns this"), so the
+# LoA 0/1 vs 2 distinction can be sharpened up by changing this one alone.
+COL_CALL = (140, 200, 255)
 COL_CONNECTED = (120, 240, 150)
 COL_COUNTDOWN = (255, 170, 90)
 
@@ -245,26 +249,6 @@ def _default_assets_dir():
                           os.path.join(root, 'assets', 'calls'))
 
 
-def _regular_face():
-    """A REGULAR-weight font path, or None for pygame's default.
-
-    pygame's default is ``freesansbold.ttf`` -- already bold -- so without this
-    every string is heavy and "bold header, plain body" cannot be expressed.
-    The candidates are picked for being genuine regular faces: note that on
-    Windows ``arial`` resolves to Arial *Narrow* and ``segoeui``/``calibri`` to
-    their *Light* cuts, none of which is what is wanted. Falling back to None
-    degrades to the old all-bold look rather than failing.
-    """
-    for name in ('tahoma', 'verdana', 'dejavusans', 'liberationsans'):
-        try:
-            path = pygame.font.match_font(name)
-        except Exception:                                     # noqa: BLE001
-            path = None
-        if path and 'ARIALN' not in path.upper():
-            return path
-    return None
-
-
 def _speed_block_height(height):
     """Glyph height of drive_improved's speed readout, for the given window.
 
@@ -326,8 +310,9 @@ class CallEvent(object):
 
     def __init__(self, dim, assets_dir=None, caller_name='Mark',
                  onset_offset_s=DEFAULT_ONSET_OFFSET_S, cap_s=DEFAULT_CAP_S,
-                 enabled=True):
+                 enabled=True, chrome=None):
         self.dim = dim
+        self.chrome = chrome or PANEL_CHROME
         self.enabled = enabled
         self.caller_name = caller_name
         self.onset_offset_ms = float(onset_offset_s) * 1000.0
@@ -344,15 +329,14 @@ class CallEvent(object):
         self._pending_outcome = None
 
         if pygame.font.get_init():
-            face = _regular_face()
+            # The drive UI's own face: HUD and LoASelectionPopup both use
+            # pygame's default (freesansbold), so the panel matches the rest of
+            # the screen. It is already bold, which is why the hierarchy is
+            # carried by COLOUR here rather than by weight.
+            face = pygame.font.get_default_font()
             self._font_title = pygame.font.Font(face, 22)
             self._font_text = pygame.font.Font(face, 18)
             self._font_small = pygame.font.Font(face, 15)
-            # Headers bold, body regular -- ONE family in two weights, not two
-            # typefaces. pygame's default face is freesansbold, i.e. already
-            # bold, so a regular face has to be found for the contrast to exist
-            # at all; set_bold then synthesises the heavy weight from it.
-            self._font_title.set_bold(True)
         else:                        # standalone import, no display yet
             self._font_title = self._font_text = self._font_small = None
 
@@ -506,7 +490,7 @@ class CallEvent(object):
         Latin-1 has to be DRAWN here, not typed.
         """
         r = size * 0.34
-        if OUTLINE_PX and PANEL_CHROME == 'none':
+        if OUTLINE_PX and self.chrome == 'none':
             o = r + OUTLINE_PX
             pygame.draw.polygon(display, COL_OUTLINE, [
                 (cx, cy - o), (cx + o, cy), (cx, cy + o), (cx - o, cy)])
@@ -522,7 +506,7 @@ class CallEvent(object):
                 a = math.radians(-90 + k * 36)
                 out.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
             return out
-        if OUTLINE_PX and PANEL_CHROME == 'none':
+        if OUTLINE_PX and self.chrome == 'none':
             pygame.draw.polygon(display, COL_OUTLINE, _pts(OUTLINE_PX))
         pygame.draw.polygon(display, colour, _pts(0))
 
@@ -773,7 +757,7 @@ class CallEvent(object):
         # reason in its comment: white text over a bright road surface is
         # unreadable exactly when the driver is looking for it. A five-row panel
         # needs it far more than three digits do.
-        if PANEL_CHROME == 'panel':
+        if self.chrome == 'panel':
             # SRCALPHA + a rounded draw, rather than fill + set_alpha: set_alpha
             # is a whole-surface value and would square the corners back off.
             plate = pygame.Surface(self.rect.size, pygame.SRCALPHA)
@@ -801,7 +785,7 @@ class CallEvent(object):
         self._render_status_strip(display)
 
     def _blit(self, display, font, text, colour, x, y):
-        if OUTLINE_PX and PANEL_CHROME == 'none':
+        if OUTLINE_PX and self.chrome == 'none':
             halo = font.render(text, True, COL_OUTLINE)
             r = OUTLINE_PX
             for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r),
@@ -827,7 +811,7 @@ class CallEvent(object):
                                tx + self._font_title.size(header)[0]
                                + self.icon_size * 0.7,
                                head_y + self._font_title.get_height() / 2,
-                               self.icon_size, COL_WHITE)
+                               self.icon_size, COL_ACCENT)
         y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, tx, y)
         y += 6
 
@@ -841,10 +825,10 @@ class CallEvent(object):
             label = '[A] Answer         RECOMMENDED'
             gap_at = self._font_text.size('[A] Answer   ')[0]
             y_mid = y + self._font_text.get_height() / 2
-            self._blit(display, self._font_text, label, COL_WHITE, tx, y)
+            self._blit(display, self._font_text, label, COL_ACCENT, tx, y)
             self._draw_star(display, tx + gap_at + self._font_text.get_height() * 0.3,
                             y_mid, self._font_text.get_height() * 0.95,
-                            COL_WHITE)
+                            COL_ACCENT)
             y += self._font_text.get_height() + 4
         else:
             y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, tx, y)
@@ -859,8 +843,8 @@ class CallEvent(object):
         x = x + self.icon_size + PANEL_ICON_GAP
         self._draw_diamond(display, x + self.icon_size * 0.35,
                            y + self._font_title.get_height() / 2,
-                           self.icon_size, COL_WHITE)
-        y = self._blit(display, self._font_title, 'ASSISTANT', COL_WHITE,
+                           self.icon_size, COL_ACCENT)
+        y = self._blit(display, self._font_title, 'ASSISTANT', COL_ACCENT,
                        x + self.icon_size * 1.05, y)
 
         spoken = self._panel_line()
@@ -922,7 +906,7 @@ class CallEvent(object):
         # the bar out through the border and over the road.
         bx = self.rect.left + PANEL_PAD_LEFT
         full = self.rect.width - PANEL_PAD_LEFT - PANEL_PAD
-        if OUTLINE_PX and PANEL_CHROME == 'none':
+        if OUTLINE_PX and self.chrome == 'none':
             pygame.draw.rect(display, COL_OUTLINE,
                              (bx - 1, y - 1, full + 2, 10), 0)
         pygame.draw.rect(display, COL_DIM, (bx, y, full, 8), 1)

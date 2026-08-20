@@ -3198,13 +3198,16 @@ def game_loop(args):
         # fullscreen has already overwritten with the desktop resolution above,
         # so the panel lands where it will in the study rather than where a
         # stale 1280x720 would put it.
-        call_preview = (CallEvent((args.width, args.height))
+        call_preview = (CallEvent((args.width, args.height),
+                                  chrome=args.call_chrome)
                         if args.call_preview else None)
         if call_preview is not None:
             print('[call-preview] press 0-4 to stage a call at that LoA, '
-                  'A / B to answer. Panel %dx%d at (%d, %d). Nothing is logged.'
-                  % (call_preview.rect.w, call_preview.rect.h,
-                     call_preview.rect.x, call_preview.rect.y))
+                  'A / B to answer. Chrome=%s, panel %dx%d at (%d, %d). '
+                  'Nothing is logged.'
+                  % (call_preview.chrome, call_preview.rect.w,
+                     call_preview.rect.h, call_preview.rect.x,
+                     call_preview.rect.y))
         world = World(sim_world, hud, traffic_manager, args)
         controller = KeyboardControl(world, args.autopilot, args.control,
                                      use_wheel=not args.no_wheel)
@@ -3824,6 +3827,16 @@ def main():
              'legibility can be judged before any of it is wired into the study '
              'loop. Nothing is logged and no decision is read -- the LoA comes '
              'from the key press, not from ProVoice. NOT for participant runs.')
+    argparser.add_argument(
+        '--call-chrome', dest='call_chrome', choices=('none', 'panel'),
+        default='none',
+        help="How the call pop-up is drawn under --call-preview. 'none' "
+             '(default) puts the text straight on the scene with a dark halo, '
+             'occluding less of the road and matching the speed readout, which '
+             "has no backing plate either. 'panel' draws a translucent blue "
+             'plate and border behind it, which is more legible over bright '
+             'tarmac but covers more of the view. Hold this FIXED across all '
+             'participants and conditions.')
     argparser.add_argument(
         '--speed', action='store_true',
         help='Show the vehicle speed in km/h low on screen and left of centre '
