@@ -100,6 +100,20 @@ PANEL_PAD_TOP = 22
 PANEL_PAD_LEFT = 22
 PANEL_ICON_GAP = 10
 
+# CHROME: 'panel' draws the translucent plate and border; 'none' puts the text
+# straight onto the scene. Text-only occludes far less of the road and matches
+# the speed readout, which has no plate either -- but it hands legibility over
+# to whatever the driver is passing, and this panel's body text is 15-18 pt
+# against the speed readout's 39 pt digits. So text-only is only viable WITH the
+# outline below, which is what the plate was standing in for.
+PANEL_CHROME = 'panel'
+# Dark halo behind every glyph and marker. ONLY in 'none' mode -- under the
+# plate it is redundant and reads as a heavy black stroke around the text.
+# 1 px is enough: the halo only has to break the glyph away from the scene, and
+# 2 px starts to look like an outline typeface.
+OUTLINE_PX = 1
+COL_OUTLINE = (0, 0, 0)
+
 PANEL_RADIUS = 10                # corner rounding
 PANEL_BORDER_W = 1               # outline weight; 2 read as heavy at this size
 PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate used
@@ -492,17 +506,25 @@ class CallEvent(object):
         Latin-1 has to be DRAWN here, not typed.
         """
         r = size * 0.34
+        if OUTLINE_PX and PANEL_CHROME == 'none':
+            o = r + OUTLINE_PX
+            pygame.draw.polygon(display, COL_OUTLINE, [
+                (cx, cy - o), (cx + o, cy), (cx, cy + o), (cx - o, cy)])
         pygame.draw.polygon(display, colour, [
             (cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)])
 
     def _draw_star(self, display, cx, cy, size, colour):
         """The recommendation marker (was U+2605; see _draw_diamond)."""
-        outer, inner, pts = size * 0.50, size * 0.22, []
-        for k in range(10):
-            rad = outer if k % 2 == 0 else inner
-            a = math.radians(-90 + k * 36)
-            pts.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
-        pygame.draw.polygon(display, colour, pts)
+        def _pts(grow):
+            out = []
+            for k in range(10):
+                rad = (size * 0.50 if k % 2 == 0 else size * 0.22) + grow
+                a = math.radians(-90 + k * 36)
+                out.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+            return out
+        if OUTLINE_PX and PANEL_CHROME == 'none':
+            pygame.draw.polygon(display, COL_OUTLINE, _pts(OUTLINE_PX))
+        pygame.draw.polygon(display, colour, _pts(0))
 
     # -- audio ---------------------------------------------------------------
 
@@ -751,21 +773,22 @@ class CallEvent(object):
         # reason in its comment: white text over a bright road surface is
         # unreadable exactly when the driver is looking for it. A five-row panel
         # needs it far more than three digits do.
-        # SRCALPHA + a rounded draw, rather than fill + set_alpha: set_alpha is a
-        # whole-surface value and would square the corners back off.
-        plate = pygame.Surface(self.rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(plate, COL_PANEL_BG + (PLATE_ALPHA_BG,), plate.get_rect(),
-                         border_radius=PANEL_RADIUS)
-        display.blit(plate, self.rect.topleft)
+        if PANEL_CHROME == 'panel':
+            # SRCALPHA + a rounded draw, rather than fill + set_alpha: set_alpha
+            # is a whole-surface value and would square the corners back off.
+            plate = pygame.Surface(self.rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(plate, COL_PANEL_BG + (PLATE_ALPHA_BG,),
+                             plate.get_rect(), border_radius=PANEL_RADIUS)
+            display.blit(plate, self.rect.topleft)
 
-        pygame.draw.rect(display, border, self.rect, PANEL_BORDER_W,
-                         border_radius=PANEL_RADIUS)
-        if assistant_owns:
-            # Double border: the single strongest cue that this panel is not the
-            # driver's phone any more.
-            pygame.draw.rect(display, border, self.rect.inflate(-8, -8),
-                             PANEL_BORDER_W,
-                             border_radius=max(2, PANEL_RADIUS - 4))
+            pygame.draw.rect(display, border, self.rect, PANEL_BORDER_W,
+                             border_radius=PANEL_RADIUS)
+            if assistant_owns:
+                # Double border: the single strongest cue that this panel is not
+                # the driver's phone any more.
+                pygame.draw.rect(display, border, self.rect.inflate(-8, -8),
+                                 PANEL_BORDER_W,
+                                 border_radius=max(2, PANEL_RADIUS - 4))
 
         x = self.rect.left + PANEL_PAD_LEFT
         y = self.rect.top + PANEL_PAD_TOP
@@ -778,6 +801,12 @@ class CallEvent(object):
         self._render_status_strip(display)
 
     def _blit(self, display, font, text, colour, x, y):
+        if OUTLINE_PX and PANEL_CHROME == 'none':
+            halo = font.render(text, True, COL_OUTLINE)
+            r = OUTLINE_PX
+            for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r),
+                           (-r, -r), (r, -r), (-r, r), (r, r)):
+                display.blit(halo, (x + dx, y + dy))
         display.blit(font.render(text, True, colour), (x, y))
         return y + font.get_height() + 4
 
@@ -893,6 +922,9 @@ class CallEvent(object):
         # the bar out through the border and over the road.
         bx = self.rect.left + PANEL_PAD_LEFT
         full = self.rect.width - PANEL_PAD_LEFT - PANEL_PAD
+        if OUTLINE_PX and PANEL_CHROME == 'none':
+            pygame.draw.rect(display, COL_OUTLINE,
+                             (bx - 1, y - 1, full + 2, 10), 0)
         pygame.draw.rect(display, COL_DIM, (bx, y, full, 8), 1)
         if frac > 0:
             pygame.draw.rect(display, COL_COUNTDOWN,
