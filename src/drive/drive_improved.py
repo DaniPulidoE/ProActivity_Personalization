@@ -157,12 +157,14 @@ except ImportError:
 try:
     from .ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
     from .call_event import CallEvent
+    from .study_session import StudySession, LoASource, FULL_TRIAL, SHORT_TRIAL
 except ImportError:
     # Launched as a plain script path rather than -m src.drive.drive_improved,
     # so there is no package context for a relative import.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from ambience import Ambience, configure_mixer, DEFAULT_AMBIENT_GAIN
     from call_event import CallEvent
+    from study_session import StudySession, LoASource, FULL_TRIAL, SHORT_TRIAL
 
 OBJECT_TO_COLOR = [
     (255, 255, 255),
@@ -3133,6 +3135,8 @@ def game_loop(args):
     # touches it, and an exception before the try body assigns it would turn a
     # real error into a NameError that hides it.
     call_preview = None
+    study = None
+    study_ended = False
     original_settings = None
 
     try:
@@ -3198,9 +3202,28 @@ def game_loop(args):
         # fullscreen has already overwritten with the desktop resolution above,
         # so the panel lands where it will in the study rather than where a
         # stale 1280x720 would put it.
+        study_on = bool(args.study or args.short_trial)
         call_preview = (CallEvent((args.width, args.height),
                                   chrome=args.call_chrome)
-                        if args.call_preview else None)
+                        if (args.call_preview or study_on) else None)
+        if study_on:
+            cfg = dict(SHORT_TRIAL if args.short_trial else FULL_TRIAL)
+            study = StudySession(
+                LoASource('random' if args.random_loa else 'bridge',
+                          status_path=status_path, session_id=session_id,
+                          seed=args.study_seed),
+                log_path=os.path.join(os.getcwd(), 'data', 'call_events.csv'),
+                seed=args.study_seed, session_id=session_id,
+                participantid=getattr(args, 'participantid', ''),
+                block_idx=args.block_idx, k_condition=args.k_condition, **cfg)
+            print('[study] block %s condition %r: %d calls over %.0f min, '
+                  '~%.0f s apart (jitter +/-%.0f s), LoA from %s.'
+                  % (args.block_idx or '?', args.k_condition or '?',
+                     cfg['n_calls'], cfg['duration_s'] / 60.0,
+                     cfg['interval_s'], cfg['jitter_s'], study.source.mode))
+            if args.random_loa:
+                print('[study] WARNING --random-loa: the LoA is drawn LOCALLY, '
+                      'not served by a model. Not a study configuration.')
         if call_preview is not None:
             print('[call-preview] press 0-4 to stage a call at that LoA, '
                   'A / B to answer. Chrome=%s, panel %dx%d at (%d, %d). '
@@ -3620,15 +3643,54 @@ def game_loop(args):
             # already tunes for frame rate.
             if call_preview is not None:
                 for event in events:
-                    if (event.type == pygame.KEYDOWN and event.unicode in '01234'
+                    # The 0-4 keys stage a call by hand. Preview only: in a
+                    # study block the LoA comes from the model, and a
+                    # participant who found this key could manufacture one.
+                    if (args.call_preview and not study_on
+                            and event.type == pygame.KEYDOWN
+                            and event.unicode in '01234'
                             and not call_preview.active):
-                        call_preview.arm(now_ms, int(event.unicode),
-                                         window_idx=0)
+                        call_preview.arm(now_ms, int(event.unicode), 0)
                     else:
                         call_preview.handle_event(event, now_ms=now_ms)
+
+                if study is not None and study.started_ms is None:
+                    # Started on the first DRIVING tick, not at process launch:
+                    # the clock must not run through the start screen, or the
+                    # first call lands before the participant has moved.
+                    study.start(now_ms)
+                    print('[study] block started.')
+
+                if study is not None and not study_ended:
+                    due = study.update(now_ms, world.hud.speed_kmh,
+                                       loa_popup.active, call_preview.active,
+                                       _read_status_file)
+                    if due is not None:
+                        loa, call_idx = due
+                        call_preview.arm(now_ms, loa, call_idx)
+                        print('[study] call %d/%d armed at LoA %d (%.0f s in).'
+                              % (call_idx, study.n_calls, loa,
+                                 study.elapsed_s(now_ms)))
+
                 finished = call_preview.update(now_ms)
                 if finished:
-                    print('[call-preview] %s' % finished)
+                    if study is not None:
+                        study.note_outcome(finished, now_ms)
+                        print('[study] call %s -> %s (%s)'
+                              % (finished.get('window_idx'),
+                                 finished.get('driver_response'),
+                                 finished.get('outcome')))
+                    else:
+                        print('[call-preview] %s' % finished)
+
+                if (study is not None and not study_ended
+                        and study.finished(now_ms)):
+                    study_ended = True
+                    print('[study] block complete: %s' % study.summary())
+                    end_overlay = SessionEndedOverlay(
+                        args.width, args.height,
+                        'block complete (%s)' % study.summary())
+                    _set_world_frozen(world, True)
 
             # Duck under the call the same way the LoA popup ducks: its audio has
             # to be heard over the engine bed, and in the study the driver is
@@ -3669,6 +3731,8 @@ def game_loop(args):
         if world is not None:
             world.destroy()
 
+        if study is not None and not study_ended:
+            print('[study] block ended early: %s' % study.summary())
         if call_preview is not None:
             call_preview.stop()
         if ambience is not None:
@@ -3827,6 +3891,47 @@ def main():
              'legibility can be judged before any of it is wired into the study '
              'loop. Nothing is logged and no decision is read -- the LoA comes '
              'from the key press, not from ProVoice. NOT for participant runs.')
+    argparser.add_argument(
+        '--study', action='store_true',
+        help='Run ONE block of the live follow-up study: %d min of free '
+             'driving with %d incoming calls at ~%d s spacing, each handled at '
+             'the Level of Autonomy the model predicted. One invocation is one '
+             'block, i.e. one K condition -- three blocks means three runs, '
+             'with the served checkpoint swapped on the ProVoice side between '
+             'them. Writes data/call_events.csv.'
+             % (FULL_TRIAL['duration_s'] / 60, FULL_TRIAL['n_calls'],
+                FULL_TRIAL['interval_s']))
+    argparser.add_argument(
+        '--short-trial', dest='short_trial', action='store_true',
+        help='Same as --study but %d calls in %d min (~%d s apart), to walk the '
+             'whole path -- arming, motion gate, rendering, input, logging -- '
+             'in two minutes instead of ten. Implies --study. NOT a study '
+             'configuration; every row is still stamped with its real spacing.'
+             % (SHORT_TRIAL['n_calls'], SHORT_TRIAL['duration_s'] / 60,
+                SHORT_TRIAL['interval_s']))
+    argparser.add_argument(
+        '--random-loa', dest='random_loa', action='store_true',
+        help='Draw the LoA locally instead of reading it from the ProVoice '
+             'bridge, so the drive half can be tested with nothing else '
+             'running. Deals a SHUFFLED PERMUTATION of 0-4, so a five-call '
+             'block exercises every rendering exactly once -- five independent '
+             'draws would leave a rung untested about half the time. NOT a '
+             'study configuration: every row it writes is stamped '
+             "loa_source='random' so it cannot be mistaken for served data.")
+    argparser.add_argument(
+        '--study-seed', dest='study_seed', type=int, default=None,
+        help='Seed for the call jitter and, under --random-loa, the LoA deal. '
+             'Fixing it makes a trial run reproducible; leave it unset for '
+             'participants so the jitter differs between blocks.')
+    argparser.add_argument(
+        '--k-condition', dest='k_condition', default='',
+        help='Which K condition this block serves (e.g. k000, k010, k030). '
+             'Recorded in every call_events.csv row -- it is the independent '
+             'variable, and nothing else in the drive process knows it.')
+    argparser.add_argument(
+        '--block-idx', dest='block_idx', default='',
+        help='Position of this block in the participant sequence (1, 2 or 3). '
+             'Recorded per row; needed to model order effects.')
     argparser.add_argument(
         '--call-chrome', dest='call_chrome', choices=('none', 'panel'),
         default='none',
