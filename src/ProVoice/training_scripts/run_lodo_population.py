@@ -161,6 +161,14 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=None,
+                    help="Model input window. Falls back to the value recorded in "
+                         "--selected. THIS IS A DATA CONTRACT, not a hyperparameter: it "
+                         "sets context_length (window x resample_hz), so a checkpoint "
+                         "built at one value cannot be adapted or served at another. It "
+                         "was previously not passed at all, leaving the trainer on its "
+                         "own default and silently producing 10 s checkpoints for a sweep "
+                         "that may have selected 20 s.")
     ap.add_argument("--pids", default="", help="Comma-separated subset of test drivers to run.")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Reuse a fold's checkpoint if it is already on disk (resume).")
@@ -174,6 +182,15 @@ def main() -> None:
     dropout = args.dropout if args.dropout is not None else sel.get("dropout")
     lr = args.lr if args.lr is not None else sel.get("lr")
     epochs = args.epochs if args.epochs is not None else sel.get("epochs")
+    window_seconds = (args.window_seconds if args.window_seconds is not None
+                      else sel.get("window_seconds"))
+    if window_seconds is None:
+        raise SystemExit(
+            "No --window-seconds and none recorded in --selected. Refusing to fall back "
+            "to the trainer's default: the resulting checkpoints would silently carry a "
+            "context_length the rest of the pipeline does not expect.")
+    print(f"[arch] window_seconds={window_seconds:g} "
+          f"(context_length is derived from it)")
     if dropout is None or lr is None or epochs is None:
         raise SystemExit(
             "Need dropout, lr and epochs (E*). Run sweep_population_hparams first, or pass "
@@ -235,6 +252,7 @@ def main() -> None:
                 cmd = [sys.executable, "-m", "ProVoice.models.train_XLSTM",
                        "--in", str(sub), "--out", str(ckpt), "--loss", "corn",
                        "--no-val", "--epochs", str(epochs),
+                       "--window-seconds", str(window_seconds),
                        "--dropout", str(dropout), "--lr", str(lr), "--seed", str(args.seed)]
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode != 0:
