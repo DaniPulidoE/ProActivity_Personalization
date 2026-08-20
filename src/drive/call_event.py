@@ -114,7 +114,19 @@ PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate use
 # body text stops being legible over a moving road. (60,120,180) measures 4.9:1
 # against white -- push it lighter than this and the text has to go dark.
 COL_PANEL_BG = (60, 120, 180)
-PLATE_ALPHA_BG = 235               # near-opaque: the road must not show through
+# SEMI-TRANSPARENT, so the road reads through the panel. The cost is that the
+# effective background is now whatever is behind it, and white-text contrast
+# moves with the scene. Measured for (60,120,180) over four backdrops:
+#
+#   alpha   dark tarmac   mid road   bright tarmac   pale sky
+#     180      5.72:1       4.48:1       3.71:1       3.19:1
+#     190      5.6 :1       4.50:1       3.8 :1       3.3 :1
+#     235      4.89:1       4.59:1       4.37:1       4.18:1
+#
+# 190 keeps every backdrop above the 3:1 large/bold threshold and mid road at
+# the 4.5:1 body threshold, while still letting a quarter of the scene through.
+# Going much lower puts pale backdrops under 3:1 and the text starts to swim.
+PLATE_ALPHA_BG = 190
 
 COL_WHITE = (255, 255, 255)
 # Borders no longer carry the driver/assistant distinction by HUE -- everything
