@@ -57,6 +57,11 @@ import math
 import os
 
 import pygame
+
+try:
+    import numpy as _np
+except ImportError:                    # only the synthesised ring needs it
+    _np = None
 from pygame.locals import K_a, K_b
 
 
@@ -289,6 +294,64 @@ def _speed_block_height(height):
                                 max(28, int(height * 0.055))).get_height()
     except Exception:                                         # noqa: BLE001
         return int(height * 0.062)          # what the formula yields in practice
+
+
+# --- Synthesised ring --------------------------------------------------------
+#
+# The classic bell: two sine tones beating against each other, gated on and off
+# in a cadence. 440 + 480 Hz and 2 s on / 4 s off is the North American
+# standard, and it is what everyone hears as "a phone ringing" regardless of
+# what their own handset does.
+#
+# Synthesised rather than shipped so the interaction is testable before anyone
+# records or licences audio -- and it is deterministic, which a study needs:
+# the same waveform in every condition, every block, every participant. A
+# ring.wav dropped into assets/calls/ overrides it.
+RING_TONES_HZ = (440.0, 480.0)
+RING_ON_S = 2.0
+RING_OFF_S = 2.0        # shortened from the telephony 4 s: the call has ~8 s
+RING_GAIN = 0.28        # to resolve, so two rings must fit inside it
+RING_EDGE_S = 0.02      # attack/release, or the gate clicks
+
+
+def synth_ring(rate=44100, channels=2):
+    """One full ring cadence as an int16 array, or None without numpy.
+
+    Exactly one on+off cycle, so ``play(loops=-1)`` seams without a gap or a
+    discontinuity: both tone periods and the gate start and end at zero.
+    """
+    if _np is None:
+        return None
+    n = int(rate * (RING_ON_S + RING_OFF_S))
+    t = _np.arange(n, dtype=_np.float64) / float(rate)
+    tone = sum(_np.sin(2.0 * _np.pi * f * t) for f in RING_TONES_HZ)
+    tone /= len(RING_TONES_HZ)
+
+    gate = _np.zeros(n)
+    on = int(rate * RING_ON_S)
+    gate[:on] = 1.0
+    edge = max(1, int(rate * RING_EDGE_S))
+    ramp = _np.linspace(0.0, 1.0, edge)
+    gate[:edge] *= ramp
+    gate[on - edge:on] *= ramp[::-1]
+
+    buf = _np.rint(tone * gate * RING_GAIN * 32767.0).astype(_np.int16)
+    if channels == 2:
+        buf = _np.column_stack([buf, buf])
+    return _np.ascontiguousarray(buf)
+
+
+def _make_ring_sound():
+    """A Sound for the synthesised ring, or None."""
+    if _np is None or not pygame.mixer.get_init():
+        return None
+    try:
+        rate, _size, channels = pygame.mixer.get_init()
+        arr = synth_ring(rate, abs(channels))
+        return pygame.sndarray.make_sound(arr) if arr is not None else None
+    except Exception as exc:                                  # noqa: BLE001
+        print('[WARN] call_event: could not synthesise the ring (%s).' % exc)
+        return None
 
 
 def _load_icon(path):
@@ -546,6 +609,10 @@ class CallEvent(object):
         missing = []
         for key, name in _SOUND_FILES.items():
             snd = _load_sound(os.path.join(self._assets_dir, name))
+            if snd is None and key == 'ring':
+                snd = _make_ring_sound()
+                if snd is not None:
+                    print('[call_event] no %s; using the synthesised ring.' % name)
             self._sounds[key] = snd
             if snd is None:
                 missing.append(name)
