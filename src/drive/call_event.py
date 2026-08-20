@@ -343,26 +343,20 @@ class CallEvent(object):
         self._pending_outcome = None
 
         if pygame.font.get_init():
-            # THE SPEED READOUT'S FACE, not pygame's default. The panel sits
-            # beside the speed and has to read as the same instrument; the
-            # default (freesansbold) is what the LoA pop-up uses, but that is a
-            # full-screen modal, not something shown next to the digits.
+            # The HUD NOTIFICATION face -- what "Waiting for ProVoice to start
+            # logging..." is drawn in. HUD.__init__ builds it as
+            # ``pygame.font.Font(pygame.font.get_default_font(), 20)`` and hands
+            # it to FadingText; the speed readout is the odd one out, being the
+            # only HUD element in mono.
             #
-            # Mono is ~25 % wider per character than the proportional default,
-            # so the sizes are a step down from the 22/18/15 that face wanted --
-            # otherwise the measured width hits PANEL_MAX_WIDTH_FRAC and the
-            # assistant's line wraps.
-            face = _mono_face()
-            self._font_title = pygame.font.Font(face, 19)
-            self._font_text = pygame.font.Font(face, 16)
-            self._font_small = pygame.font.Font(face, 13)
-            # BOLD everywhere. Courier's regular weight is a thin, low-contrast
-            # stroke that reads as weak at 13-19 pt over a moving scene -- the
-            # speed readout gets away with it only because it is 39 pt. Set
-            # BEFORE _layout: emboldening widens every glyph, so _measure has to
-            # see the bold metrics or the panel is sized too small and wraps.
-            for _f in (self._font_title, self._font_text, self._font_small):
-                _f.set_bold(True)
+            # It is freesansbold, i.e. ALREADY bold, so no set_bold call: adding
+            # one would synthetically embolden an already-heavy face. That is
+            # also why the hierarchy here is carried by COLOUR rather than by
+            # weight -- there is only the one weight available.
+            face = pygame.font.get_default_font()
+            self._font_title = pygame.font.Font(face, 22)
+            self._font_text = pygame.font.Font(face, 18)
+            self._font_small = pygame.font.Font(face, 15)
         else:                        # standalone import, no display yet
             self._font_title = self._font_text = self._font_small = None
 
