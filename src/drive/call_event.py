@@ -78,12 +78,30 @@ from pygame.locals import K_a, K_b
 # The clamps are guard rails, not the layout: they stop a pathological font or a
 # very long caller name from producing a panel that spans the windscreen.
 PANEL_LEFT_FRAC = 0.35
-PANEL_BOTTOM_FRAC = 0.82
 PANEL_MIN_WIDTH_FRAC = 0.16
 PANEL_MAX_WIDTH_FRAC = 0.34
 
-PANEL_PAD = 14
+# VERTICAL ANCHOR: the panel is CENTRED on the speed readout rather than sharing
+# its baseline, so growing the top margin below opens the box symmetrically
+# instead of pushing its head toward the horizon.
+#
+# drive_improved's HUD._render_speed puts the digits' BOTTOM edge at
+# int(height * 0.8), so the readout's midline is that minus half a glyph. The
+# glyph height is derived here from the same formula rather than hard-coded, so
+# the two stay aligned at 720p and fullscreen alike -- see _speed_block_height.
+SPEED_BASELINE_FRAC = 0.80
+PANEL_CENTER_NUDGE_PX = 0        # tuning knob; + moves the panel down
+
+# Inner margins. Top and left are deliberately larger than bottom and right:
+# the content hangs from the top-left corner, so that is where the box reads as
+# cramped, and the trailing edges already have the measured slack.
+PANEL_PAD = 14                   # bottom and right
+PANEL_PAD_TOP = 22
+PANEL_PAD_LEFT = 22
 PANEL_ICON_GAP = 10
+
+PANEL_RADIUS = 10                # corner rounding
+PANEL_BORDER_W = 1               # outline weight; 2 read as heavy at this size
 PLATE_ALPHA = 110          # same value the speed readout's (disabled) plate used
 
 
@@ -190,6 +208,24 @@ def _default_assets_dir():
     root = os.path.abspath(os.path.join(here, '..', '..'))
     return os.environ.get('PROVOICE_CALL_ASSETS_DIR',
                           os.path.join(root, 'assets', 'calls'))
+
+
+def _speed_block_height(height):
+    """Glyph height of drive_improved's speed readout, for the given window.
+
+    Replicates HUD.__init__: ``speed_pt = max(28, int(height * 0.055))`` in the
+    mono face it picks. Copied rather than imported because importing
+    drive_improved from here would be a cycle -- so it has to be re-checked if
+    that sizing changes.
+    """
+    try:
+        font_name = 'courier' if os.name == 'nt' else 'mono'
+        fonts = [x for x in pygame.font.get_fonts() if font_name in x]
+        mono = 'ubuntumono' if 'ubuntumono' in fonts else (fonts[0] if fonts else None)
+        mono = pygame.font.match_font(mono) if mono else None
+        return pygame.font.Font(mono, max(28, int(height * 0.055))).get_height()
+    except Exception:                                         # noqa: BLE001
+        return int(height * 0.062)          # what the formula yields in practice
 
 
 def _load_icon(path):
@@ -314,17 +350,20 @@ class CallEvent(object):
                                int(width * PANEL_MIN_WIDTH_FRAC), 0)
 
         content = self._measure() + self.icon_size + PANEL_ICON_GAP
-        w = int(min(max(content + 2 * PANEL_PAD, width * PANEL_MIN_WIDTH_FRAC),
+        w = int(min(max(content + PANEL_PAD_LEFT + PANEL_PAD,
+                        width * PANEL_MIN_WIDTH_FRAC),
                     width * PANEL_MAX_WIDTH_FRAC))
 
         # Tallest rendering is LoA 3: header, one spoken line, the countdown
         # bar, the cancel row, then the separator and status strip.
         th, xh, sh = (self._font_title.get_height(), self._font_text.get_height(),
                       self._font_small.get_height())
-        h = (2 * PANEL_PAD + (th + 4) + 2 * (xh + 4) + 16 + 6 + sh + 6)
+        h = (PANEL_PAD_TOP + PANEL_PAD + (th + 4) + 2 * (xh + 4) + 16 + 6 + sh + 6)
 
-        return pygame.Rect(int(width * PANEL_LEFT_FRAC),
-                           int(height * PANEL_BOTTOM_FRAC) - h, w, h)
+        speed_mid = (height * SPEED_BASELINE_FRAC
+                     - _speed_block_height(height) / 2.0)
+        top = int(speed_mid - h / 2.0) + PANEL_CENTER_NUDGE_PX
+        return pygame.Rect(int(width * PANEL_LEFT_FRAC), top, w, h)
 
     def _icon(self, size):
         """The icon scaled to `size`, cached. smoothscale resamples the full
@@ -665,19 +704,24 @@ class CallEvent(object):
         # reason in its comment: white text over a bright road surface is
         # unreadable exactly when the driver is looking for it. A five-row panel
         # needs it far more than three digits do.
-        plate = pygame.Surface(self.rect.size)
-        plate.set_alpha(PLATE_ALPHA)
-        plate.fill((0, 0, 0))
+        # SRCALPHA + a rounded draw, rather than fill + set_alpha: set_alpha is a
+        # whole-surface value and would square the corners back off.
+        plate = pygame.Surface(self.rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(plate, (0, 0, 0, PLATE_ALPHA), plate.get_rect(),
+                         border_radius=PANEL_RADIUS)
         display.blit(plate, self.rect.topleft)
 
-        pygame.draw.rect(display, border, self.rect, 2)
+        pygame.draw.rect(display, border, self.rect, PANEL_BORDER_W,
+                         border_radius=PANEL_RADIUS)
         if assistant_owns:
             # Double border: the single strongest cue that this panel is not the
             # driver's phone any more.
-            pygame.draw.rect(display, border, self.rect.inflate(-8, -8), 1)
+            pygame.draw.rect(display, border, self.rect.inflate(-8, -8),
+                             PANEL_BORDER_W,
+                             border_radius=max(2, PANEL_RADIUS - 4))
 
-        x = self.rect.left + PANEL_PAD
-        y = self.rect.top + PANEL_PAD
+        x = self.rect.left + PANEL_PAD_LEFT
+        y = self.rect.top + PANEL_PAD_TOP
 
         if assistant_owns:
             y = self._render_assistant(display, x, y)
@@ -746,7 +790,7 @@ class CallEvent(object):
         spoken = self._panel_line()
         if spoken:
             chunks = self._wrap(spoken, self._font_text,
-                                self.rect.width - 2 * PANEL_PAD)
+                                self.rect.width - PANEL_PAD_LEFT - PANEL_PAD)
             for i, chunk in enumerate(chunks):
                 if i == 0:
                     chunk = '"' + chunk
@@ -800,8 +844,8 @@ class CallEvent(object):
         # (c) Span the PANEL's inner width, taken from the rect -- the caller's
         # x has already been shifted right past the icon, so using it here ran
         # the bar out through the border and over the road.
-        bx = self.rect.left + PANEL_PAD
-        full = self.rect.width - 2 * PANEL_PAD
+        bx = self.rect.left + PANEL_PAD_LEFT
+        full = self.rect.width - PANEL_PAD_LEFT - PANEL_PAD
         pygame.draw.rect(display, COL_DIM, (bx, y, full, 8), 1)
         if frac > 0:
             pygame.draw.rect(display, COL_COUNTDOWN,
@@ -814,7 +858,7 @@ class CallEvent(object):
             return
         y = self.rect.bottom - PANEL_PAD - self._font_small.get_height()
         pygame.draw.line(display, COL_DIM,
-                         (self.rect.left + PANEL_PAD, y - 6),
+                         (self.rect.left + PANEL_PAD_LEFT, y - 6),
                          (self.rect.right - PANEL_PAD, y - 6), 1)
         if self.state == CONNECTED:
             secs = max(0, int(self._elapsed(self._now_ms) / 1000.0))
@@ -828,7 +872,7 @@ class CallEvent(object):
         # silhouette and reads as a smudge; the header already carries it, and
         # the strip's job is the caller's state, which is words.
         display.blit(self._font_small.render(text, True, colour),
-                     (self.rect.left + PANEL_PAD, y))
+                     (self.rect.left + PANEL_PAD_LEFT, y))
 
     @staticmethod
     def _wrap(text, font, max_w):
