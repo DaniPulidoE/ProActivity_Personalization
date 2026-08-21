@@ -1099,7 +1099,7 @@ _PROVOICE_PRESETS = {
     # conditions, and nothing in the data would say so afterwards.
     "experiment_study_satisfaction_provoice_remote": {"study_bridge": True,
                                                       "webcam": True,
-                                                      "modeltype": "xlstm",
+                                                      "modeltype": "state",
                                                       "state_model": "xlstm",
                                                       "functionname": STUDY_FUNCTIONNAME},
 }
@@ -2123,7 +2123,13 @@ def main():
         # The personalization lives in the xLSTM head. 'combined' would blend it
         # with the static-FCD XGBoost at w_fcd, diluting the one thing the study
         # manipulates.
-        args.modeltype = "xlstm"
+        # "state" + "xlstm", NOT modeltype="xlstm" -- that is not a valid
+        # modeltype and used to fall through to `combined`, where the fusion is
+        # 0.7*FCD + 0.3*state. FCD is STATIC per function and peaks at ~0.92, so
+        # 0.7*0.92 = 0.645 exceeds the 0.30 the state half can contribute at
+        # most: the xLSTM could not move the served LoA under ANY input, and the
+        # study's independent variable had no path to the output at all.
+        args.modeltype = "state"
         args.state_model = "xlstm"
         # The staged event is a phone call, so that is the function whose FCD
         # vector the model must be given. Left at DEFAULT_FUNCTIONNAME ("Adjust

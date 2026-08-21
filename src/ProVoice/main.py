@@ -244,7 +244,14 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--functionname", default="Adjust seat positioning")
     p.add_argument("--emotion", "--affect", dest="emotion", default="")
     p.add_argument("--modeltype", default="combined",
-                   help="fcd | state | combined | collection")
+                   choices=("fcd", "state", "combined", "collection"),
+                   help="fcd | state | combined | collection. NOTE 'xlstm' is "
+                        "NOT one of them: the xLSTM is a STATE model, so serving "
+                        "it alone is --modeltype state --state-model xlstm. "
+                        "Constrained because it was not: --modeltype xlstm was "
+                        "accepted silently, fell through to 'combined', and a "
+                        "run that asked for the xLSTM alone was served "
+                        "0.7*FCD + 0.3*xLSTM instead (2026-08-21).")
     p.add_argument("--state-model", "--statemodel", dest="state_model", default="xlstm",
                    help="classic | xlstm")
     p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.7)
