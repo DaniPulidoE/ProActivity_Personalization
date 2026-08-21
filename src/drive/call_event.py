@@ -151,7 +151,7 @@ COL_PANEL_BG = (60, 120, 180)
 # 190 keeps every backdrop above the 3:1 large/bold threshold and mid road at
 # the 4.5:1 body threshold, while still letting a quarter of the scene through.
 # Going much lower puts pale backdrops under 3:1 and the text starts to swim.
-PLATE_ALPHA_BG = 190
+PLATE_ALPHA_BG = 150
 
 COL_WHITE = (255, 255, 255)
 # Borders no longer carry the driver/assistant distinction by HUE -- everything
@@ -212,6 +212,12 @@ DEFAULT_CAP_S = 8.0            # ringing -> forced timeout, for the input rungs
 RING_LEAD_S = 1.2              # ring alone before the assistant speaks or acts
 COUNTDOWN_S = 3.0              # LoA 3 only
 CONNECTED_HOLD_S = 3.0         # caller's canned reply, then auto hang-up
+# Silence between the assistant finishing its line and the caller starting.
+# Without it the two overlap -- at LoA 4 the assistant says "Answering now" and
+# the caller speaks over the top of it, because the route enters CONNECTED on
+# the same tick the line begins. A short beat also reads as the call actually
+# connecting rather than the assistant talking to itself.
+POST_SPEECH_GAP_S = 0.35
 
 
 # --- States -----------------------------------------------------------------
@@ -684,6 +690,8 @@ class CallEvent(object):
         self._response_ms = None
         self._answered = False
         self._pending_outcome = None
+        self._voice_ends_ms = 0
+        self._reply_started_ms = None
         return True
 
     def _enter(self, state, now_ms):
@@ -692,7 +700,8 @@ class CallEvent(object):
         if state == CONNECTED:
             self._stop_ring()
             self._answered = True
-            self._play('reply')
+            # The caller's reply is NOT played here -- see the CONNECTED branch
+            # of update(). It waits for the assistant to stop speaking.
 
     def _elapsed(self, now_ms):
         return now_ms - self._state_entered_ms
@@ -725,8 +734,13 @@ class CallEvent(object):
 
         if self.state == RINGING:
             if self._elapsed(now_ms) >= RING_LEAD_S * 1000.0:
-                if self.loa in self._sounds and self._sounds.get(self.loa):
+                line = self._sounds.get(self.loa)
+                if line is not None:
                     self._voice_channel = self._play(self.loa)
+                    # Predicted end, not Channel.get_busy(): this has to behave
+                    # identically with no audio device, where get_busy() is
+                    # never True and the gap would collapse to nothing.
+                    self._voice_ends_ms = now_ms + line.get_length() * 1000.0
                 self._enter(_LOA_ROUTE[self.loa], now_ms)
             return None
 
@@ -753,7 +767,18 @@ class CallEvent(object):
             return None
 
         if self.state == CONNECTED:
-            if self._elapsed(now_ms) >= CONNECTED_HOLD_S * 1000.0:
+            if self._reply_started_ms is None:
+                # Hold the caller until the assistant has finished its line plus
+                # a beat. At LoA 4 the two would otherwise start on the same
+                # tick; at LoA 0/1 a driver who accepts instantly would talk
+                # over the announcement the same way.
+                if now_ms >= self._voice_ends_ms + POST_SPEECH_GAP_S * 1000.0:
+                    self._play('reply')
+                    self._reply_started_ms = now_ms
+                return None
+            # Measured from the REPLY, not from connecting: otherwise the hold
+            # can expire while the caller is still speaking.
+            if (now_ms - self._reply_started_ms) >= CONNECTED_HOLD_S * 1000.0:
                 self._resolve(now_ms, answered=True)
                 return self._take_pending()
             return None
