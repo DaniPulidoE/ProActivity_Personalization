@@ -216,6 +216,31 @@ TM_PORT = 9000
 STUDY_TRAFFIC_SEED = 42
 
 # =========================
+# SATISFACTION STUDY (--study-satisfaction)
+# =========================
+#
+# One invocation is ONE BLOCK: 10 minutes of free driving with 5 incoming calls,
+# served by ONE model. Three blocks per participant means three runs, with
+# --condition changed between them. Design record: docs/live_study_setup.md.
+#
+# The condition is the study's independent variable and it arrives as a
+# FILENAME -- nothing else about the two processes differs between blocks.
+STUDY_MODEL_DIR = os.path.join("trained_models", "user_study")
+STUDY_MODEL_TEMPLATE = "xlstm_p{pid}_k{condition}.pt"
+STUDY_CONDITIONS = {
+    0: "population model (no personalization)",
+    1: "low label count",
+    2: "high label count",
+}
+
+
+def study_model_path(participantid, condition):
+    """The checkpoint this (participant, condition) block must serve."""
+    return os.path.join(
+        STUDY_MODEL_DIR,
+        STUDY_MODEL_TEMPLATE.format(pid=participantid, condition=condition))
+
+# =========================
 # TRAFFIC SCENARIO PLAN (data collection)
 # =========================
 #
@@ -849,6 +874,14 @@ def build_drive_cmd(session, args):
         *(["--provoice-status-file", args.status_file] if args.remote else []),
         *(["--popup-immediate"] if args.test else []),
         *(["--speed"] if args.speed else []),
+        # ONE BLOCK of the satisfaction study: 10 min, 5 calls at ~2 min with
+        # jitter, LoA read from the bridge. Drive forces --no-popup itself
+        # under --study -- the 20 s labelling prompt is the data-collection
+        # instrument and would freeze the scene on top of the calls.
+        *(["--study",
+           "--k-condition", f"k{args.condition}",
+           "--block-idx", str(args.block_idx),
+           ] if args.study_satisfaction else []),
         *(["--render-scale", str(args.render_scale)]
           if args.render_scale != 1.0 else []),
         # Forwarded ONLY when the operator typed them, so the default lives in
@@ -969,6 +1002,12 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
         # has not necessarily released by the time ProVoice tries to open the
         # same device -- exactly the failure the restart delay below exists for.
         *(["--webcam"] if args.webcam else []),
+        # The condition, as a filename. Everything else about this command line
+        # is identical across the three blocks.
+        *([f"--xlstm-model={study_model_path(args.participantid, args.condition)}",
+           "--study-bridge",
+           f"--study-checkpoint-id={os.path.basename(study_model_path(args.participantid, args.condition))}",
+           ] if args.study_satisfaction else []),
     ]
 
 
@@ -1447,6 +1486,35 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--participantid", default="001")
+    parser.add_argument("--study-satisfaction", dest="study_satisfaction",
+                        action="store_true",
+                        help="Run ONE BLOCK of the satisfaction study: 10 min "
+                             "of free driving with 5 incoming calls at ~2 min "
+                             "(jittered), served by the model for "
+                             "--participantid and --condition. Both are "
+                             "REQUIRED. Three blocks per participant means "
+                             "three runs with --condition changed between "
+                             "them; counterbalance the order across "
+                             "participants. Forces the study traffic scenario "
+                             "and --modeltype xlstm.")
+    parser.add_argument("--condition", type=int, choices=(0, 1, 2), default=None,
+                        help="Which model this block serves: 0 = population "
+                             "(no personalization), 1 = low label count, 2 = "
+                             "high label count. Picks "
+                             "trained_models/user_study/xlstm_p<pid>_k<n>.pt "
+                             "and is recorded in every call_events.csv row.")
+    parser.add_argument("--block-idx", dest="block_idx", type=int,
+                        choices=(1, 2, 3), default=None,
+                        help="Position of this block in THIS participant's "
+                             "session: 1st, 2nd or 3rd. NOT the same thing as "
+                             "--condition, which says which model is served -- "
+                             "the order is counterbalanced, so the two differ "
+                             "for most participants. Required with "
+                             "--study-satisfaction, because it is what "
+                             "separates the K effect from order effects "
+                             "(carryover, fatigue, and the contrast a driver "
+                             "feels meeting the unpersonalized block after a "
+                             "personalized one).")
     parser.add_argument("--environment", default="city")
     parser.add_argument("--secondary-task", default="none")
     # Default deferred to DEFAULT_FUNCTIONNAME below: left as None here so
@@ -1929,6 +1997,66 @@ def main():
     # Expanded first, so every check and warning below judges the flags the
     # preset stands for rather than the preset itself.
     apply_experiment_presets(parser, args)
+
+    # --- satisfaction study -------------------------------------------------
+    #
+    # Validated here, before anything is spawned. Every one of these failures is
+    # silent at run time: a missing --condition would serve last block's model,
+    # a wrong scenario would put this participant on traffic they have already
+    # driven, and a missing checkpoint would have ProVoice fall back and serve
+    # five calls from something that is not the condition's model at all --
+    # which in the data looks exactly like the model performing badly.
+    if args.study_satisfaction:
+        if args.condition is None:
+            parser.error("--study-satisfaction needs --condition {0,1,2}: it "
+                         "selects the model this block serves, and it is the "
+                         "study's independent variable.")
+        if not (args.participantid or "").strip():
+            parser.error("--study-satisfaction needs --participantid: the "
+                         "served model is per participant.")
+        if args.block_idx is None:
+            parser.error("--study-satisfaction needs --block-idx {1,2,3}: the "
+                         "position of this block in THIS participant's "
+                         "session. It is not --condition -- the order is "
+                         "counterbalanced, so which model is served and when "
+                         "it is served are different facts, and only the pair "
+                         "separates the K effect from order effects. Blank in "
+                         "the log is unrecoverable once the sessions are "
+                         "done.")
+        model = study_model_path(args.participantid, args.condition)
+        if not os.path.exists(model):
+            parser.error(
+                "no model for participant %s condition %d.\n  expected: %s\n"
+                "  Blocks are served from %s; the file is built by the offline "
+                "pipeline and must be copied to this machine before the "
+                "session."
+                % (args.participantid, args.condition, model, STUDY_MODEL_DIR))
+        # The study scenario is fixed for every participant and every block --
+        # it is excluded from TRAFFIC_SEED_PLAN precisely so nobody meets it
+        # during collection, which is what also makes it a generalization test.
+        if args.traffic_seed is None:
+            args.traffic_seed = STUDY_TRAFFIC_SEED
+        elif int(args.traffic_seed) != STUDY_TRAFFIC_SEED:
+            parser.error("--study-satisfaction fixes the traffic scenario at "
+                         "%d for every participant; --traffic-seed %s would "
+                         "make this block incomparable with the others."
+                         % (STUDY_TRAFFIC_SEED, args.traffic_seed))
+        # The personalization lives in the xLSTM head. 'combined' would blend it
+        # with the static-FCD XGBoost at w_fcd, diluting the one thing the study
+        # manipulates.
+        args.modeltype = "xlstm"
+        args.state_model = "xlstm"
+        # Labelling prompts off (Drive forces this too), speed readout on: the
+        # call panel is laid out against it, and it must not vary by block.
+        args.no_popup = True
+        args.random_function = False
+        args.speed = True
+        print("[study] participant %s, condition %d (%s)"
+              % (args.participantid, args.condition,
+                 STUDY_CONDITIONS[args.condition]))
+        print("[study] serving %s" % model)
+        print("[study] block %s, traffic scenario %d, 10 min, 5 calls"
+              % (args.block_idx, STUDY_TRAFFIC_SEED))
     # Left as None until now so a preset can tell "nobody said" from an
     # explicit --remote-bind and only fill in the former.
     if args.remote_bind is None:

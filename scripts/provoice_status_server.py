@@ -66,7 +66,13 @@ from vehicle_state_file_bridge import install_graceful_stop  # noqa: E402
 # accepted would look exactly like a signal that never arrived.
 EVENT_STARTED = "collection_started"
 EVENT_ENDED = "provoice_ended"
-KNOWN_EVENTS = (EVENT_STARTED, EVENT_ENDED)
+# The live study's LoA feed. Unlike the two lifecycle signals this one REPEATS
+# -- once per decision, at the engine's own rate -- and LAST wins rather than
+# first. It carries the served level plus the frame timestamp it was computed
+# from, which is what lets a call be joined back to the window of driver state
+# behind the prediction.
+EVENT_DECISION = "decision"
+KNOWN_EVENTS = (EVENT_STARTED, EVENT_ENDED, EVENT_DECISION)
 
 # Body cap. These payloads are ~200 bytes; the limit stops a stray large POST
 # from being read into memory before it can be rejected.
@@ -95,6 +101,18 @@ class SessionStatus:
             "updated_ts": None,
             "updated_iso": None,
             "events": 0,
+            # --- live study LoA feed (EVENT_DECISION) ---------------------
+            "latest_loa": None,
+            "latest_loa_frame_ts": None,      # ProVoice's clock: the FRAME
+            # This machine's clock, stamped on ARRIVAL. Drive runs here too, so
+            # it can subtract this from its own time() to get a true age. The
+            # alternative -- having ProVoice send an age -- measures only the
+            # queueing delay, because the drive reads the value up to two
+            # minutes later; and differencing latest_loa_frame_ts against a
+            # local clock would read the machines' skew as staleness.
+            "latest_loa_recv_ts": None,
+            "checkpoint_id": None,
+            "decisions": 0,
         }
 
     def snapshot(self) -> dict:
@@ -119,6 +137,19 @@ class SessionStatus:
                 if st["collection_started_ts"] is None:
                     st["collection_started_ts"] = round(now, 3)
                     st["collection_started_iso"] = _now_iso()
+            elif event == EVENT_DECISION:
+                loa = payload.get("loa")
+                try:
+                    loa = int(loa)
+                except (TypeError, ValueError):
+                    loa = None
+                if loa is not None and 0 <= loa <= 4:
+                    st["latest_loa"] = loa
+                    st["latest_loa_frame_ts"] = payload.get("frame_ts") or None
+                    st["latest_loa_recv_ts"] = round(now, 3)
+                    if payload.get("checkpoint_id"):
+                        st["checkpoint_id"] = payload["checkpoint_id"]
+                    st["decisions"] += 1
             elif event == EVENT_ENDED:
                 if st["ended_ts"] is None:
                     st["ended_ts"] = round(now, 3)

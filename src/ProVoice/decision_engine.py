@@ -273,6 +273,20 @@ class StateXLSTMLoAStrategy(BaseStrategy):
                 # turns either head type into a 5-class PMF. Old checkpoints
                 # lack the key -> softmax.
                 self.head_type = str(arch.get("head_type", "softmax"))
+                # State what was actually loaded. The head's WIDTH is the only
+                # thing that distinguishes an FCD-augmented checkpoint from a
+                # plain one -- forward() switches on it, no flag is stored, and
+                # both load without complaint. So a narrow checkpoint served by
+                # mistake in place of an --embed-fcd one is silent: it runs, it
+                # predicts, and nothing says the task block is missing. One line
+                # at load time is what makes that visible in a session log.
+                width = self.model.head.in_features
+                print(f"[xlstm] loaded {os.path.basename(model_path)}: "
+                      f"head {width}-dim "
+                      f"({'z+FCD, AUGMENTED' if self.model.head_uses_fcd() else 'z only, plain'}), "
+                      f"embedding_dim={self.model.embedding_dim}, "
+                      f"head_type={self.head_type}, "
+                      f"context_length={self.context_length}")
                 self.ok = True
         except Exception as e:
             print(f"Error loading state model: {e}")

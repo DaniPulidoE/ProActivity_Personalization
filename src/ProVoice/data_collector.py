@@ -220,6 +220,11 @@ class DataCollector:
         self._capture_thread: Optional[threading.Thread] = None
         self._face_box_thread: Optional[threading.Thread] = None
         self._decision_thread: Optional[threading.Thread] = None
+        # Optional sink for each decision, set by main.py under --study-bridge.
+        # Called on the DECISION THREAD with (action, frame_ts), so whatever is
+        # attached must return immediately -- see ProVoice/study_bridge.py, which
+        # drops into a slot and lets its own thread do the sending.
+        self.on_decision = None
         self.rppg_estimator = None
         self.cap = None
 
@@ -2080,6 +2085,15 @@ class DataCollector:
                                     if value not in (None, ''):
                                         action_for_log.setdefault(key, value)
                                 self.logger.log_processed(action_for_log)
+
+                        if self.on_decision is not None and isinstance(action, dict):
+                            try:
+                                self.on_decision(action.get('LoA'), ts)
+                            except Exception as exc:  # noqa: BLE001
+                                # A publishing fault must never cost a decision:
+                                # this thread's job is inference and logging, and
+                                # the bridge is an accessory to both.
+                                print(f"[DataCollector] on_decision failed: {exc}")
 
                         if self.actuator and action is not None:
                             with self._phase('decide.actuate'):

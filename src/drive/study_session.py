@@ -38,6 +38,7 @@ with its ``loa_source``, so it can never be mistaken for a served prediction.
 
 import csv
 import datetime
+import time
 import os
 import random
 
@@ -138,9 +139,16 @@ class LoASource(object):
         if loa < 0 or loa > 4:
             return None, 'loa_out_of_range'
 
-        age = record.get('latest_loa_age_ms')
+        # Age is computed HERE, from the arrival time the status server stamped
+        # in ITS clock -- and that server runs on this machine, so the two
+        # clocks are the same one. An age sent by ProVoice would measure only
+        # its queueing delay (the drive reads the value up to two minutes
+        # later), and differencing latest_loa_frame_ts against a local clock
+        # would read the two machines' skew as staleness.
+        recv = record.get('latest_loa_recv_ts')
         try:
-            self.last_age_ms = int(age) if age is not None else None
+            self.last_age_ms = (int((time.time() - float(recv)) * 1000.0)
+                                if recv is not None else None)
         except (TypeError, ValueError):
             self.last_age_ms = None
         # Freshness, not just presence: a ProVoice stall would otherwise serve a

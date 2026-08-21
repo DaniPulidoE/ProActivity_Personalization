@@ -12,6 +12,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from ProVoice.study_bridge import DecisionBridge
+
+# Served xLSTM checkpoint when --xlstm-model is not given.
+DEFAULT_XLSTM_MODEL = "trained_models/state_xlstm.pt"
+
 # ── CPU thread budget ────────────────────────────────────────────────────────
 # Must run BEFORE numpy/torch/cv2 are imported: the OpenMP/MKL runtimes size
 # their thread pools once, at load time, and ignore these variables afterwards.
@@ -279,6 +284,29 @@ def _build_parser() -> ap.ArgumentParser:
                         "Like --vehicle-state-url it means THIS process makes no "
                         "CARLA calls at all, but it reads a file instead of a "
                         "socket, keeping the network stack out of the loop.")
+    p.add_argument("--xlstm-model", dest="xlstm_model",
+                   default=DEFAULT_XLSTM_MODEL,
+                   help="Path to the xLSTM checkpoint to SERVE (default: "
+                        "%(default)s). The live study points this at a "
+                        "per-participant, per-condition head under "
+                        "trained_models/user_study/, which is the only thing "
+                        "that differs between its three blocks -- so this is "
+                        "the study's independent variable, arriving as a "
+                        "filename.")
+    p.add_argument("--study-bridge", dest="study_bridge", action="store_true",
+                   help="Publish every LoA decision to the CARLA machine over "
+                        "the status bridge, for the live follow-up study. The "
+                        "drive process reads the latest one at the instant a "
+                        "call fires; it loads no model of its own. Needs a "
+                        "reachable --status-url (implied by --remote). Off by "
+                        "default: outside the study nothing reads this feed, "
+                        "and it is 4 POSTs a second for the whole session.")
+    p.add_argument("--study-checkpoint-id", dest="study_checkpoint_id", default="",
+                   help="Identifier of the served head, recorded with every "
+                        "published decision and written into the drive's "
+                        "call_events.csv. Use the checkpoint filename, e.g. "
+                        "p001_l2sp_tau0.05_k010 -- it is what ties a call back "
+                        "to the exact model that produced its LoA.")
     p.add_argument("--status-url", dest="status_url", default=None,
                    help="Reverse bridge on the CARLA machine "
                         "(scripts/provoice_status_server.py): this process posts "
@@ -734,6 +762,15 @@ def main():
     emotion = args.emotion
     modeltype = args.modeltype.lower()  # fcd | state | combined | collection
     state_model = args.state_model.lower()
+    # Resolved here, once, so both StateXLSTM construction sites below and the
+    # study bridge's checkpoint id all name the SAME file.
+    xlstm_model_path = getattr(args, "xlstm_model", None) or DEFAULT_XLSTM_MODEL
+    if state_model == "xlstm" and not os.path.exists(xlstm_model_path):
+        # Loud and early. The strategy would otherwise construct with ok=False
+        # and every decision would silently fall back, which in a study block
+        # means five calls served from something that is not the condition's
+        # model -- indistinguishable in the data from the model performing badly.
+        print(f"[main] WARNING xLSTM checkpoint NOT FOUND: {xlstm_model_path}")
     w_fcd = args.w_fcd
     # Everything the operator supplied HERE, before any fallback. PV_SESSION_ID
     # counts as supplied: on this machine only start_experiment.py sets it, and
@@ -864,14 +901,14 @@ def main():
         try:
             if state_model == "xlstm":
                 state_engine = StateXLSTMLoAStrategy(
-                    model_path="trained_models/state_xlstm.pt",
+                    model_path=xlstm_model_path,
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
                     window_seconds=window_seconds,
                 )
-                print(f"[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt (window={state_engine.window_seconds}s)")
+                print(f"[main] xLSTM served from {xlstm_model_path} (window={state_engine.window_seconds}s)")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
@@ -901,7 +938,7 @@ def main():
         try:
             if state_model == "xlstm":
                 state_engine = StateXLSTMLoAStrategy(
-                    model_path="trained_models/state_xlstm.pt",
+                    model_path=xlstm_model_path,
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
@@ -1049,6 +1086,25 @@ def main():
         traffic_seed=traffic_seed,
     )
 
+    # Live-study LoA feed. Attached to the collector's decision hook rather than
+    # called from anywhere in main: the decision thread is the only place that
+    # knows both the served level and the FRAME timestamp it was computed from,
+    # and that pairing is the whole point of the feed.
+    decision_bridge = None
+    if getattr(args, "study_bridge", False):
+        if not status_url:
+            print("[study-bridge] --study-bridge given but no status URL is "
+                  "reachable; decisions will NOT be published. The drive side "
+                  "will log every call as skipped (no_status_file).")
+        else:
+            decision_bridge = DecisionBridge(
+                status_url, session_id=session_id, participantid=participantid,
+                checkpoint_id=getattr(args, "study_checkpoint_id", ""))
+            if decision_bridge.start():
+                data_collector.on_decision = decision_bridge.publish
+            else:
+                decision_bridge = None
+
     dashboard.data_collector = data_collector
     dashboard.actuator = actuator
 
@@ -1156,6 +1212,8 @@ def main():
         # (0xC0000005 and friends) -- nothing in this process can -- so the
         # other machine also keeps its manual stop.
         if status_url:
+            if decision_bridge is not None:
+                decision_bridge.stop()
             post_status_event(
                 status_url, "provoice_ended", session_id, participantid,
                 reason=("calibration complete" if args.calibration_only

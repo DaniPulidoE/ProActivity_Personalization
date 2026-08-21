@@ -62,7 +62,7 @@ try:
     import numpy as _np
 except ImportError:                    # only the synthesised ring needs it
     _np = None
-from pygame.locals import K_a, K_b
+from pygame.locals import K_j, K_k
 
 
 # --- Geometry ---------------------------------------------------------------
@@ -179,18 +179,37 @@ COL_COUNTDOWN = (255, 170, 90)
 
 # --- Input ------------------------------------------------------------------
 #
-# MUST stay in sync with drive_improved.py's wheel mapping. Button 7 is QUIT,
-# honoured everywhere in the drive UI -- never bind it here.
+# THE WHEEL IS THE CONTROL; the keyboard is the experimenter's fallback.
 #
-# [A] is ALWAYS the affirmative (Answer / Yes) and [B] ALWAYS the negative
-# (Decline / No / Cancel), at every LoA. If ACCEPT and YES were different
-# physical buttons, a motor confound would ride along with the condition.
-CALL_WHEEL_BUTTON_AFFIRM = 6
-CALL_WHEEL_BUTTON_NEGATIVE = 5
+# The rig is a G25, whose paddle shifters are literally left and right --
+# drive_improved binds button 5 as "left paddle -> lower LoA" and 4 as "right
+# paddle -> higher LoA". Using the two PADDLES rather than a paddle and a front
+# button gives two symmetric controls the driver can find without looking, and
+# leaves button 6 (the pop-up's CONFIRM) and button 7 (QUIT, honoured
+# everywhere) untouched.
+#
+# RIGHT is ALWAYS the affirmative (Answer / Yes) and LEFT always the negative
+# (Decline / No / Cancel), at every LoA. If they swapped between levels, a motor
+# confound would ride along with the condition.
+CALL_WHEEL_BUTTON_AFFIRM = 4       # right paddle
+CALL_WHEEL_BUTTON_NEGATIVE = 5     # left paddle
 
-CALL_KEY_AFFIRM = K_a
-CALL_KEY_NEGATIVE = K_b
+# Keyboard fallback. NOT the mnemonic letters: K_l is lights, K_r is recording,
+# and K_a/K_b -- which this used to use -- are steer-left and an existing
+# toggle, so answering a call also steered the car. Of the free letters, j and k
+# are adjacent on the home row with j on the left, which preserves the same
+# left/right relationship the paddles have.
+CALL_KEY_AFFIRM = K_k              # right-hand key
+CALL_KEY_NEGATIVE = K_j            # left-hand key
 
+INPUT_WHEEL = 'wheel'
+INPUT_KEYBOARD = 'keyboard'
+# What the on-screen button prompts read, per input mode. The label has to name
+# the control the driver is actually holding.
+_PROMPT = {
+    INPUT_WHEEL: ('[R]', '[L]'),
+    INPUT_KEYBOARD: ('[K]', '[J]'),
+}
 
 # --- Timing -----------------------------------------------------------------
 #
@@ -423,9 +442,11 @@ class CallEvent(object):
 
     def __init__(self, dim, assets_dir=None, caller_name='Mark',
                  onset_offset_s=DEFAULT_ONSET_OFFSET_S, cap_s=DEFAULT_CAP_S,
-                 enabled=True, chrome=None):
+                 enabled=True, chrome=None, input_mode=INPUT_WHEEL):
         self.dim = dim
         self.chrome = chrome or PANEL_CHROME
+        self.input_mode = (input_mode if input_mode in _PROMPT else INPUT_WHEEL)
+        self.yes_key, self.no_key = _PROMPT[self.input_mode]
         self.enabled = enabled
         self.caller_name = caller_name
         self.onset_offset_ms = float(onset_offset_s) * 1000.0
@@ -488,10 +509,10 @@ class CallEvent(object):
             return 0
         cands = [(self._font_title, 'ASSISTANT'),
                  (self._font_title, 'INCOMING CALL'),
-                 (self._font_text, '[A] Answer         RECOMMENDED'),
-                 (self._font_text, '[A] Yes        [B] No'),
-                 (self._font_text, '[B] Decline'),
-                 (self._font_text, '[B] Cancel'),
+                 (self._font_text, '%s Answer         RECOMMENDED' % self.yes_key),
+                 (self._font_text, '%s No        %s Yes' % (self.no_key, self.yes_key)),
+                 (self._font_text, '%s Decline' % self.no_key),
+                 (self._font_text, '%s Cancel' % self.no_key),
                  (self._font_text, self.caller_name),
                  (self._font_small, '%s — ringing, on hold' % self.caller_name),
                  (self._font_small, '%s — connected     00:00' % self.caller_name)]
@@ -996,8 +1017,8 @@ class CallEvent(object):
             # Text first, then the star into the gap the spaces reserve --
             # measuring the FULL string up to the badge is what keeps the glyph
             # off the R. Drawing it from a guessed offset put it on top.
-            label = '[A] Answer         RECOMMENDED'
-            gap_at = self._font_text.size('[A] Answer   ')[0]
+            label = '%s Answer         RECOMMENDED' % self.yes_key
+            gap_at = self._font_text.size('%s Answer   ' % self.yes_key)[0]
             y_mid = y + self._font_text.get_height() / 2
             self._blit(display, self._font_text, label, COL_ACCENT, tx, y)
             self._draw_star(display, tx + gap_at + self._font_text.get_height() * 0.3,
@@ -1005,8 +1026,10 @@ class CallEvent(object):
                             COL_ACCENT)
             y += self._font_text.get_height() + 4
         else:
-            y = self._blit(display, self._font_text, '[A] Answer', COL_WHITE, tx, y)
-        return self._blit(display, self._font_text, '[B] Decline', COL_WHITE, tx, y)
+            y = self._blit(display, self._font_text, '%s Answer' % self.yes_key,
+                           COL_WHITE, tx, y)
+        return self._blit(display, self._font_text, '%s Decline' % self.no_key,
+                          COL_WHITE, tx, y)
 
     def _render_assistant(self, display, x, y):
         """LoA 2-4: the assistant's panel has replaced the phone card."""
@@ -1034,10 +1057,13 @@ class CallEvent(object):
 
         if self.state == COUNTDOWN:
             y = self._render_countdown_bar(display, x, y + 4)
-            return self._blit(display, self._font_text, '[B] Cancel',
-                              COL_COUNTDOWN, x, y)
+            return self._blit(display, self._font_text,
+                              '%s Cancel' % self.no_key, COL_COUNTDOWN, x, y)
         if self.loa == 2:
-            return self._blit(display, self._font_text, '[A] Yes        [B] No',
+            # Negative on the LEFT, affirmative on the RIGHT, so the option's
+            # position on screen matches the paddle that selects it.
+            return self._blit(display, self._font_text,
+                              '%s No        %s Yes' % (self.no_key, self.yes_key),
                               COL_WHITE, x, y + 4)
         return y
 

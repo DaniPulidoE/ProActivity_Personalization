@@ -3203,9 +3203,6 @@ def game_loop(args):
         # so the panel lands where it will in the study rather than where a
         # stale 1280x720 would put it.
         study_on = bool(args.study or args.short_trial)
-        call_preview = (CallEvent((args.width, args.height),
-                                  chrome=args.call_chrome)
-                        if (args.call_preview or study_on) else None)
         if call_preview is not None:
             print('[call-preview] press 0-4 to stage a call at that LoA, '
                   'A / B to answer. Chrome=%s, panel %dx%d at (%d, %d). '
@@ -3218,6 +3215,14 @@ def game_loop(args):
                                      use_wheel=not args.no_wheel)
         # Only advertise wheel controls in the popup if a wheel is actually bound.
         popup_input = _resolve_popup_input(args, controller.has_wheel)
+        # Same wheel-vs-keyboard resolution the label pop-up uses, so the call
+        # panel names the control the driver is actually holding.
+        call_preview = (CallEvent((args.width, args.height),
+                                  chrome=args.call_chrome,
+                                  input_mode=('wheel'
+                                              if popup_input == POPUP_INPUT_WHEEL
+                                              else 'keyboard'))
+                        if (args.call_preview or study_on) else None)
         loa_popup = LoASelectionPopup(
             args.width, args.height,
             interval_seconds=TEST_POPUP_INTERVAL_S if args.test_popup else 20,
