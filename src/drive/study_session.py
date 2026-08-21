@@ -39,9 +39,25 @@ import os
 import random
 
 
+# THREE CLOCKS, and they are not interchangeable -- hence three columns rather
+# than one ambiguous `timestamp`:
+#
+#   loa_frame_ts    PROVOICE machine. The frame the decision was computed FROM,
+#                   exactly as decisions.csv stamps it. This is the one that
+#                   identifies the ~10 s window of driver state behind the
+#                   prediction, so it is what joins a call to raw_data.jsonl.
+#   call_onset_ts   DRIVE machine. Wall clock when the phone actually rang.
+#                   Locates the call in the session and in any recording.
+#   logged_ts       DRIVE machine. When the row was written, i.e. when the
+#                   interaction RESOLVED. Useful only for ordering rows.
+#
+# The two machines have separate wall clocks, so do NOT difference loa_frame_ts
+# against call_onset_ts to get staleness -- skew would show up as age. That is
+# what loa_age_ms is for: computed on the sender, in its own clock.
 CALL_EVENT_COLUMNS = (
-    'timestamp', 'session_id', 'participantid', 'block_idx', 'k_condition',
-    'call_idx', 'loa_source', 'served_loa', 'loa_age_ms', 'checkpoint_id',
+    'logged_ts', 'call_onset_ts', 'loa_frame_ts', 'loa_age_ms',
+    'session_id', 'participantid', 'block_idx', 'k_condition',
+    'call_idx', 'loa_source', 'served_loa', 'checkpoint_id',
     'event_onset_ms', 'speed_kmh_at_onset', 'driver_response', 'input_mode',
     'response_latency_ms', 'outcome', 'skipped_reason',
 )
@@ -82,6 +98,7 @@ class LoASource(object):
         self._rng = random.Random(seed)
         self._deck = []
         self.last_age_ms = None
+        self.last_frame_ts = ''
         self.last_checkpoint = ''
 
     def _deal(self):
@@ -93,6 +110,7 @@ class LoASource(object):
     def next_loa(self, read_status):
         """(loa, reason). `loa` None means do not arm; `reason` says why."""
         self.last_age_ms = None
+        self.last_frame_ts = ''
         self.last_checkpoint = ''
         if self.mode == 'random':
             return self._deal(), ''
@@ -123,6 +141,11 @@ class LoASource(object):
         if (self.max_age_ms is not None and self.last_age_ms is not None
                 and self.last_age_ms > self.max_age_ms):
             return None, 'decision_stale'
+        # The frame the decision was computed from -- the whole point of
+        # logging it is being able to recover the window that produced the
+        # prediction. Absent is not fatal (the call still fires), but it costs
+        # that recovery, so it is worth noticing in the data.
+        self.last_frame_ts = str(record.get('latest_loa_frame_ts') or '')
         self.last_checkpoint = str(record.get('checkpoint_id') or '')
         return loa, ''
 
@@ -247,7 +270,10 @@ class StudySession(object):
             'call_idx': self.call_idx,
             'served_loa': loa,
             'loa_age_ms': self.source.last_age_ms,
+            'loa_frame_ts': self.source.last_frame_ts,
             'checkpoint_id': self.source.last_checkpoint,
+            'call_onset_ts': datetime.datetime.now().isoformat(
+                timespec='milliseconds'),
             'speed_kmh_at_onset': round(speed_kmh, 1) if speed_kmh is not None else '',
         }
         self._schedule(now_ms)
@@ -283,7 +309,7 @@ class StudySession(object):
             return
         full = {k: '' for k in CALL_EVENT_COLUMNS}
         full.update({
-            'timestamp': datetime.datetime.now().isoformat(timespec='milliseconds'),
+            'logged_ts': datetime.datetime.now().isoformat(timespec='milliseconds'),
             'session_id': self.session_id,
             'participantid': self.participantid,
             'block_idx': self.block_idx,

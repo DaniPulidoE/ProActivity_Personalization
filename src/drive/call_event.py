@@ -194,10 +194,20 @@ CALL_KEY_NEGATIVE = K_b
 
 # --- Timing -----------------------------------------------------------------
 #
-# Onset is FIXED relative to window start and identical across conditions; only
-# the resolution time varies. That asymmetry is intrinsic (autonomy is partly a
-# claim about interaction time) but the onset must not add to it.
-DEFAULT_ONSET_OFFSET_S = 5.0   # from arm() to the phone ringing
+# ZERO delay from arm() to the ring, and it must stay that way.
+#
+# This was 5.0 s, from the superseded design where the call fired at a fixed
+# offset into a choreographed 20 s window. Under free driving the SCHEDULE owns
+# when a call happens (study_session), so the offset bought nothing and cost
+# staleness: the served LoA is read at arm time, so every second here is a
+# second of the driver's state going out of date before they see the result.
+# It also defeated the freshness check, which is applied at READ time -- a
+# decision could pass at 250 ms old and ring 5 s stale.
+#
+# Only the RESOLUTION time varies between conditions, which is intrinsic
+# (autonomy is partly a claim about interaction time). The onset must not add
+# to it.
+DEFAULT_ONSET_OFFSET_S = 0.0   # from arm() to the phone ringing
 DEFAULT_CAP_S = 8.0            # ringing -> forced timeout, for the input rungs
 RING_LEAD_S = 1.2              # ring alone before the assistant speaks or acts
 COUNTDOWN_S = 3.0              # LoA 3 only
@@ -646,11 +656,6 @@ class CallEvent(object):
     def active(self):
         """True while the panel is on screen and may consume input."""
         return self.state in (RINGING, AWAIT_INPUT, COUNTDOWN, CONNECTED)
-
-    @property
-    def wants_audio_duck(self):
-        """Whether the caller should duck the ambience bed this frame."""
-        return self.active
 
     def arm(self, now_ms, loa, window_idx=None):
         """Schedule this window's call. False if nothing was armed.

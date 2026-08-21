@@ -3266,7 +3266,9 @@ def game_loop(args):
             study = StudySession(
                 LoASource('random' if args.random_loa else 'bridge',
                           status_path=status_path, session_id=session_id,
-                          seed=args.study_seed),
+                          seed=args.study_seed,
+                          max_age_ms=(args.loa_max_age * 1000.0
+                                      if args.loa_max_age > 0 else None)),
                 log_path=os.path.join(os.getcwd(), 'data', 'call_events.csv'),
                 seed=args.study_seed, session_id=session_id,
                 participantid=getattr(args, 'participantid', ''),
@@ -3276,6 +3278,13 @@ def game_loop(args):
                   % (args.block_idx or '?', args.k_condition or '?',
                      cfg['n_calls'], cfg['duration_s'] / 60.0,
                      cfg['interval_s'], cfg['jitter_s'], study.source.mode))
+            if not args.random_loa:
+                print('[study] a served LoA older than %.1f s will be refused '
+                      '(--loa-max-age).' % args.loa_max_age
+                      if args.loa_max_age > 0 else
+                      '[study] WARNING staleness check DISABLED '
+                      '(--loa-max-age 0): a stalled ProVoice will be served '
+                      'silently.')
             if args.random_loa:
                 print('[study] WARNING --random-loa: the LoA is drawn LOCALLY, '
                       'not served by a model. Not a study configuration.')
@@ -3696,10 +3705,14 @@ def game_loop(args):
                         'block complete (%s)' % study.summary())
                     _set_world_frozen(world, True)
 
-            # Duck under the call the same way the LoA popup ducks: its audio has
-            # to be heard over the engine bed, and in the study the driver is
-            # answering it while still moving.
-            ambience.set_ducked(call_preview is not None and call_preview.active)
+            # NOT ducked for a call. set_ducked(True) fades the bed to SILENCE
+            # (_duck_target = 0.0), which is right for the LoA popup because
+            # that freezes the scene -- but a call happens while the car is
+            # moving, so cutting the engine would be both unrealistic and a cue
+            # that something is about to happen. The ring and the assistant play
+            # OVER the bed; if they are hard to hear, raise RING_GAIN in
+            # call_event.py or lower --ambient-gain, do not silence the car.
+            ambience.set_ducked(False)
             ambience.update(world.hud.speed_kmh,
                             throttle=getattr(
                                 getattr(controller, '_control', None),
@@ -3922,6 +3935,17 @@ def main():
              'draws would leave a rung untested about half the time. NOT a '
              'study configuration: every row it writes is stamped '
              "loa_source='random' so it cannot be mistaken for served data.")
+    argparser.add_argument(
+        '--loa-max-age', dest='loa_max_age', type=float, default=3.0,
+        help='Refuse a served LoA older than this many seconds and log the '
+             'call as skipped (default: %(default)s). STALENESS IS THE SILENT '
+             'FAILURE HERE: if ProVoice stalls, the camera drops or the bridge '
+             'stops writing, nothing errors -- the status file simply stops '
+             'changing and every call in the block gets served the same dead '
+             'value, which is indistinguishable from a model that confidently '
+             'predicts one level. A healthy decision is a few hundred ms old, '
+             'so 3 s is loose enough for any reasonable push rate and tight '
+             'enough to catch a stall. 0 disables the check.')
     argparser.add_argument(
         '--study-seed', dest='study_seed', type=int, default=None,
         help='Seed for the call jitter and, under --random-loa, the LoA deal. '
