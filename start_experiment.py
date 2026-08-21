@@ -1002,12 +1002,19 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
         # has not necessarily released by the time ProVoice tries to open the
         # same device -- exactly the failure the restart delay below exists for.
         *(["--webcam"] if args.webcam else []),
-        # The condition, as a filename. Everything else about this command line
-        # is identical across the three blocks.
+        # Publish every decision back over the link. Set by BOTH study presets:
+        # the CARLA side needs it in the command line it prints for the other
+        # machine, the ProVoice side needs it for the run it starts here.
+        *(["--study-bridge"]
+          if (getattr(args, "study_bridge", False)
+              or getattr(args, "study_satisfaction", False)) else []),
+        # The condition, as a filename -- and ONLY when this launcher is the one
+        # that chose it. On the ProVoice machine it is not: the path arrives at
+        # BRIDGE/session, and passing this machine's guess would give ProVoice
+        # two sources for the one fact the study manipulates.
         *([f"--xlstm-model={study_model_path(args.participantid, args.condition)}",
-           "--study-bridge",
            f"--study-checkpoint-id={os.path.basename(study_model_path(args.participantid, args.condition))}",
-           ] if args.study_satisfaction else []),
+           ] if getattr(args, "study_satisfaction", False) else []),
     ]
 
 
@@ -1042,6 +1049,13 @@ _CARLA_PRESETS = {
         "remote": True, "data_collection": True, "random_function": True,
         "fullscreen": True,
         "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},
+    # ONE BLOCK of the satisfaction study, CARLA side. Everything the study
+    # needs beyond this -- xlstm modeltype, the fixed scenario, --speed,
+    # pop-ups off -- is set by the --study-satisfaction validation, so this
+    # preset only says "that study, over the link".
+    "experiment_study_satisfaction_carla_remote": {
+        "remote": True, "study_satisfaction": True, "fullscreen": True,
+        "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},
 }
 
 _PROVOICE_PRESETS = {
@@ -1062,6 +1076,17 @@ _PROVOICE_PRESETS = {
     "experiment_data_collection_provoice_remote": {"data_collection": True,
                                                    "webcam": True,
                                                    "data_collection_timeout": 900.0},
+    # Satisfaction study, ProVoice side. NOT --data-collection: this half must
+    # actually run the model, which is the whole point of the block.
+    #
+    # It is given NO participant, NO condition and NO model path. All three
+    # arrive over the link at /session, chosen once on the CARLA machine --
+    # retyping them here is precisely how the two ends end up running different
+    # conditions, and nothing in the data would say so afterwards.
+    "experiment_study_satisfaction_provoice_remote": {"study_bridge": True,
+                                                      "webcam": True,
+                                                      "modeltype": "xlstm",
+                                                      "state_model": "xlstm"},
 }
 
 
@@ -1138,13 +1163,30 @@ def apply_experiment_presets(parser, args) -> None:
 
     applied = []
     for flag, value in overrides.items():
-        if (isinstance(value, (str, int, float)) and not isinstance(value, bool)
-                and getattr(args, flag) is not None):
+        # getattr with a DEFAULT: preset-only keys (study_bridge) have no
+        # argparse declaration, and the previous form only survived that because
+        # the isinstance guard short-circuited first.
+        is_value = (isinstance(value, (str, int, float))
+                    and not isinstance(value, bool))
+        current = getattr(args, flag, None)
+        typed = (is_value and current is not None
+                 and current != parser.get_default(flag))
+        if typed:
             # A VALUE the operator typed beats the preset's. Switches cannot
             # collide this way -- a preset only ever turns one on, and the
             # operator asking for the same thing is not a disagreement -- but
             # an address or a timeout is a real choice, and overriding it for
             # one run must not need the source edited.
+            #
+            # "Typed" means DIFFERENT FROM THE ARGPARSE DEFAULT, not merely
+            # not-None. The older test worked only for flags defaulting to None:
+            # --modeltype defaults to "combined", so a preset could never set it
+            # and the satisfaction study's ProVoice half silently ran the
+            # combined strategy -- blending the personalized head with the FCD
+            # XGBoost, which is the one thing that study must not do. The
+            # residual ambiguity (an operator typing exactly the default) is
+            # unavoidable without a sentinel default, and harmless: the preset
+            # then wins, which is what they would have got anyway.
             print("[PRESET] keeping --%s=%s from the command line (preset "
                   "would have used %s)"
                   % (flag.replace("_", "-"), getattr(args, flag), value))
@@ -1991,6 +2033,26 @@ def main():
                               "Same id handling as the calibration preset, and "
                               "the same --webcam, which is what keeps the two "
                               "phases on ONE camera.")
+    presets.add_argument("--study-satisfaction-carla-remote",
+                         dest="experiment_study_satisfaction_carla_remote",
+                         action="store_true",
+                         help="Satisfaction study, CARLA machine: one 10 min "
+                              "block with 5 calls, over the link. "
+                              "= --study-satisfaction --remote --fullscreen. "
+                              "Give --participantid, --condition and "
+                              "--block-idx HERE -- this machine chooses the "
+                              "served model and publishes it, so the ProVoice "
+                              "side is told rather than asked.")
+    presets.add_argument("--study-satisfaction-provoice-remote",
+                         dest="experiment_study_satisfaction_provoice_remote",
+                         nargs="?", const="", default=None, metavar="BRIDGE",
+                         help="Satisfaction study, ProVoice machine: start "
+                              "ProVoice ALONE against BRIDGE and publish every "
+                              "decision back over the link. Takes NO "
+                              "--participantid, --condition or model path: all "
+                              "three are read from BRIDGE/session, which is "
+                              "what stops the two halves running different "
+                              "conditions. Implies --webcam.")
 
     args = parser.parse_args()
 
@@ -2460,6 +2522,12 @@ def main():
                 # And the address of the reverse bridge, so the whole pairing
                 # follows from the ONE url the ProVoice machine is given.
                 *(["--status-url", status_url] if status_url else []),
+                # The satisfaction study's served checkpoint. Chosen HERE, from
+                # --participantid and --condition, and published so the ProVoice
+                # machine serves the same file without anyone retyping it.
+                *(["--xlstm-model",
+                   study_model_path(args.participantid, args.condition)]
+                  if args.study_satisfaction else []),
             ]
             pm.start(server_cmd, "VEHICLE_SERVER", restart=True)
             # It connects to CARLA and caches the map before the first sample

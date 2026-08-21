@@ -468,6 +468,12 @@ def main() -> None:
                              "/session so ProVoice learns where to post its "
                              "started/ended signals. One address is typed on the "
                              "ProVoice machine, not two.")
+    parser.add_argument("--xlstm-model", dest="xlstm_model", default="",
+                        help="xLSTM checkpoint the ProVoice machine should "
+                             "SERVE, published at /session. Used by the "
+                             "satisfaction study, where the served model is "
+                             "the independent variable and is chosen on this "
+                             "machine.")
     parser.add_argument("--traffic-seed", dest="traffic_seed", type=int,
                         default=None,
                         help="Traffic scenario this session is running, published "
@@ -512,6 +518,13 @@ def main() -> None:
         # Not `or None`: 0 is a valid seed and would be erased by the idiom the
         # three strings above use.
         "traffic_seed": args.traffic_seed,
+        # The satisfaction study's served checkpoint. Published for exactly the
+        # reason the ids are: it is decided on THIS machine (from
+        # --participantid and --condition) and the ProVoice machine must serve
+        # the same file. Retyping it there is how the two ends end up running
+        # different models for a block, which is invisible afterwards -- the
+        # data just looks like that condition performed differently.
+        "xlstm_model": args.xlstm_model or None,
     }
 
     httpd = BridgeServer((args.bind, args.port), Handler, sampler, stats, session)

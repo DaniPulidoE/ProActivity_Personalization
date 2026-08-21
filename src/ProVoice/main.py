@@ -468,6 +468,7 @@ def fetch_bridge_session(url: str, timeout: float = 10.0,
                 "session_id": (info.get("session_id") or None),
                 "participantid": (info.get("participantid") or None),
                 "status_url": (info.get("status_url") or None),
+                "xlstm_model": (info.get("xlstm_model") or None),
                 # Which traffic scenario the CARLA machine is running. Same
                 # channel and same reason as the ids: the value exists only on
                 # that machine, and a human retyping it into this terminal is
@@ -764,13 +765,9 @@ def main():
     state_model = args.state_model.lower()
     # Resolved here, once, so both StateXLSTM construction sites below and the
     # study bridge's checkpoint id all name the SAME file.
+    # Provisional: under --remote the bridge may replace this below, so the
+    # existence check waits until the path is settled.
     xlstm_model_path = getattr(args, "xlstm_model", None) or DEFAULT_XLSTM_MODEL
-    if state_model == "xlstm" and not os.path.exists(xlstm_model_path):
-        # Loud and early. The strategy would otherwise construct with ok=False
-        # and every decision would silently fall back, which in a study block
-        # means five calls served from something that is not the condition's
-        # model -- indistinguishable in the data from the model performing badly.
-        print(f"[main] WARNING xLSTM checkpoint NOT FOUND: {xlstm_model_path}")
     w_fcd = args.w_fcd
     # Everything the operator supplied HERE, before any fallback. PV_SESSION_ID
     # counts as supplied: on this machine only start_experiment.py sets it, and
@@ -817,6 +814,28 @@ def main():
         if not status_url and (bridge or {}).get("status_url"):
             status_url = bridge["status_url"]
             print(f"[status] adopting status_url={status_url!r} from the bridge.")
+        # Same treatment for the study's served checkpoint: adopted from the
+        # bridge unless the operator named one. The CARLA machine chose it from
+        # --participantid and --condition, and it is the ONLY thing that differs
+        # between the three blocks -- so having this end pick its own would mean
+        # the two halves running different conditions with nothing to show for
+        # it afterwards.
+        if (bridge or {}).get("xlstm_model"):
+            if args.xlstm_model and args.xlstm_model != DEFAULT_XLSTM_MODEL:
+                if args.xlstm_model != bridge["xlstm_model"]:
+                    print(f"[main] WARNING xLSTM model MISMATCH: this machine "
+                          f"was told {args.xlstm_model!r}, the bridge publishes "
+                          f"{bridge['xlstm_model']!r}. Keeping the explicit one "
+                          f"-- but one of the two ends is running the wrong "
+                          f"condition.")
+            else:
+                xlstm_model_path = bridge["xlstm_model"]
+                print(f"[main] adopting xlstm_model={xlstm_model_path!r} "
+                      f"from the bridge.")
+                if not os.path.exists(xlstm_model_path):
+                    print(f"[main] WARNING that checkpoint does NOT EXIST on "
+                          f"this machine. It is named by the CARLA machine but "
+                          f"must be present HERE -- copy it before the session.")
         # Probed here rather than trusted: an address that only fails at
         # shutdown fails at the one moment nothing can be done about it.
         if args.status_url:
@@ -863,6 +882,17 @@ def main():
     strategy = None
     fcd_engine = None
     state_engine = None
+
+    # ONE existence check, now that the explicit flag, the default AND the
+    # bridge have all had their say. Without it the strategy constructs with
+    # ok=False and every decision silently falls back -- which in a study block
+    # means five calls served by something that is not the condition's model,
+    # and in the data that is indistinguishable from the model performing badly.
+    if (state_model == "xlstm" and not args.data_collection
+            and modeltype in ("state", "combined")
+            and not os.path.exists(xlstm_model_path)):
+        print(f"[main] WARNING xLSTM checkpoint NOT FOUND: {xlstm_model_path} "
+              f"-- every decision will fall back.")
 
     # --- Data collection: no inference, so no model is loaded at all ---
     # DataCollector only starts its decision worker when it has an engine, so
