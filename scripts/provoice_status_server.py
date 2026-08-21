@@ -72,7 +72,12 @@ EVENT_ENDED = "provoice_ended"
 # from, which is what lets a call be joined back to the window of driver state
 # behind the prediction.
 EVENT_DECISION = "decision"
-KNOWN_EVENTS = (EVENT_STARTED, EVENT_ENDED, EVENT_DECISION)
+# Drive telling ProVoice the block is over. It travels back in the RESPONSE to
+# ProVoice's own decision POSTs -- no new channel and no polling, because
+# ProVoice is already talking to this server four times a second, so it learns
+# within ~250 ms of the last call resolving.
+EVENT_DRIVE_ENDED = "drive_ended"
+KNOWN_EVENTS = (EVENT_STARTED, EVENT_ENDED, EVENT_DECISION, EVENT_DRIVE_ENDED)
 
 # Body cap. These payloads are ~200 bytes; the limit stops a stray large POST
 # from being read into memory before it can be rejected.
@@ -113,6 +118,10 @@ class SessionStatus:
             "latest_loa_recv_ts": None,
             "checkpoint_id": None,
             "decisions": 0,
+            # --- Drive -> ProVoice shutdown (EVENT_DRIVE_ENDED) ------------
+            "drive_ended_ts": None,
+            "drive_ended_iso": None,
+            "drive_ended_reason": None,
         }
 
     def snapshot(self) -> dict:
@@ -150,6 +159,14 @@ class SessionStatus:
                     if payload.get("checkpoint_id"):
                         st["checkpoint_id"] = payload["checkpoint_id"]
                     st["decisions"] += 1
+            elif event == EVENT_DRIVE_ENDED:
+                # FIRST wins, like collection_started: the block ended once, and
+                # a resend (a retry, an operator closing the window afterwards)
+                # must not move the mark.
+                if st["drive_ended_ts"] is None:
+                    st["drive_ended_ts"] = round(now, 3)
+                    st["drive_ended_iso"] = _now_iso()
+                    st["drive_ended_reason"] = payload.get("reason") or ""
             elif event == EVENT_ENDED:
                 if st["ended_ts"] is None:
                     st["ended_ts"] = round(now, 3)
@@ -262,9 +279,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         state = self.server.status.record(event, payload)
-        print(f"[status] {event}"
-              + (f" (reason: {payload['reason']})" if payload.get("reason") else "")
-              + f" -> {self.server.status.out_path}", flush=True)
+        # Decisions arrive at the engine's rate (4 Hz) and would otherwise
+        # produce four identical lines a second for the whole session. The
+        # count is in /health and in the published record; the FIRST one is
+        # worth announcing, because it is the proof the feed came up at all.
+        if event != EVENT_DECISION or state.get("decisions") == 1:
+            print(f"[status] {event}"
+                  + (f" #{state['decisions']}" if event == EVENT_DECISION else "")
+                  + (f" (reason: {payload['reason']})" if payload.get("reason") else "")
+                  + f" -> {self.server.status.out_path}", flush=True)
         self._respond(200, {"ok": True, "event": event, "status": state})
 
     def do_GET(self):

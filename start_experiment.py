@@ -225,6 +225,13 @@ STUDY_TRAFFIC_SEED = 42
 #
 # The condition is the study's independent variable and it arrives as a
 # FILENAME -- nothing else about the two processes differs between blocks.
+# The ONE function the study stages. It must match fcd_config.py exactly -- a
+# paraphrase resolves to UNKNOWN_FUNCTION_KEY and is scored with a neutral
+# all-3s FCD vector, which for an FCD-driven decision means no task context at
+# all. It is also in drive_improved's RANDOM_FUNCTION_POOL, so the population
+# model was trained on labels for it.
+STUDY_FUNCTIONNAME = "Respond to a phone call"
+
 STUDY_MODEL_DIR = os.path.join("trained_models", "user_study")
 STUDY_MODEL_TEMPLATE = "xlstm_p{pid}_k{condition}.pt"
 STUDY_CONDITIONS = {
@@ -832,7 +839,7 @@ def write_session_id(root: Path) -> str:
 # COMMAND BUILDERS (FIXED)
 # =========================
 
-def build_drive_cmd(session, args):
+def build_drive_cmd(session, args, status_url=None):
     return [
         sys.executable,
         "-m",
@@ -872,6 +879,12 @@ def build_drive_cmd(session, args):
         # for the start, this launcher for the end), and pointing it at a
         # status file nothing writes would just add a file to ignore.
         *(["--provoice-status-file", args.status_file] if args.remote else []),
+        # The same bridge, as an ADDRESS this time: the file is how Drive READS
+        # ProVoice's signals, this is how it SENDS the one signal that goes the
+        # other way -- "the study block is over, stop too".
+        *(["--provoice-status-url", status_url]
+          if (args.remote and getattr(args, "study_satisfaction", False)
+              and status_url) else []),
         *(["--popup-immediate"] if args.test else []),
         *(["--speed"] if args.speed else []),
         # ONE BLOCK of the satisfaction study: 10 min, 5 calls at ~2 min with
@@ -1055,6 +1068,7 @@ _CARLA_PRESETS = {
     # preset only says "that study, over the link".
     "experiment_study_satisfaction_carla_remote": {
         "remote": True, "study_satisfaction": True, "fullscreen": True,
+        "functionname": STUDY_FUNCTIONNAME,
         "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},
 }
 
@@ -1086,7 +1100,8 @@ _PROVOICE_PRESETS = {
     "experiment_study_satisfaction_provoice_remote": {"study_bridge": True,
                                                       "webcam": True,
                                                       "modeltype": "xlstm",
-                                                      "state_model": "xlstm"},
+                                                      "state_model": "xlstm",
+                                                      "functionname": STUDY_FUNCTIONNAME},
 }
 
 
@@ -2110,6 +2125,18 @@ def main():
         # manipulates.
         args.modeltype = "xlstm"
         args.state_model = "xlstm"
+        # The staged event is a phone call, so that is the function whose FCD
+        # vector the model must be given. Left at DEFAULT_FUNCTIONNAME ("Adjust
+        # seat positioning") the decision is computed from the WRONG task's
+        # context -- and since FCD is static per function, that is a constant
+        # 12-dim input rather than a subtle error. Observed on 2026-08-21.
+        if args.functionname in (None, DEFAULT_FUNCTIONNAME):
+            args.functionname = STUDY_FUNCTIONNAME
+        elif args.functionname != STUDY_FUNCTIONNAME:
+            print("[study] WARNING --functionname=%r, not %r. The staged event "
+                  "is a phone call; the served LoA will be computed from "
+                  "another task's FCD."
+                  % (args.functionname, STUDY_FUNCTIONNAME))
         # Labelling prompts off (Drive forces this too), speed readout on: the
         # call panel is laid out against it, and it must not vary by block.
         args.no_popup = True
@@ -2449,7 +2476,7 @@ def main():
         # the last run would satisfy the wait below immediately.
         clear_vehicle_id(root)
 
-        drive_cmd = build_drive_cmd(session, args)
+        drive_cmd = build_drive_cmd(session, args, status_url)
         drive_proc = pm.start(drive_cmd, "DRIVE")
 
         # Wait for the vehicle to actually exist instead of guessing at a sleep.

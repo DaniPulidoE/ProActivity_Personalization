@@ -52,11 +52,17 @@ class DecisionBridge(object):
     """Fire-and-forget publisher for the served LoA."""
 
     def __init__(self, status_url, session_id="", participantid="",
-                 checkpoint_id=""):
+                 checkpoint_id="", on_drive_ended=None):
         self.status_url = (status_url or "").rstrip("/")
         self.session_id = session_id or ""
         self.participantid = participantid or ""
         self.checkpoint_id = checkpoint_id or ""
+        # Called ONCE, from the sender thread, when the CARLA machine reports
+        # the block is over. The signal rides back in the response to our own
+        # decision POSTs, so it costs no extra request and arrives within one
+        # decision period.
+        self.on_drive_ended = on_drive_ended
+        self.drive_ended = False
 
         parts = urllib.parse.urlsplit(self.status_url)
         self._host = parts.hostname
@@ -153,6 +159,25 @@ class DecisionBridge(object):
                 pass
             self._conn = None
 
+    def _check_drive_ended(self, raw):
+        """Notice the CARLA machine reporting the block over. Never raises."""
+        if self.drive_ended:
+            return
+        try:
+            state = (json.loads(raw) or {}).get("status") or {}
+        except Exception:                                     # noqa: BLE001
+            return
+        if state.get("drive_ended_ts") is None:
+            return
+        self.drive_ended = True
+        print("[study-bridge] Drive reports the block is over (%s). Shutting "
+              "down." % (state.get("drive_ended_reason") or "no reason given"))
+        if self.on_drive_ended is not None:
+            try:
+                self.on_drive_ended()
+            except Exception as exc:                          # noqa: BLE001
+                print("[study-bridge] shutdown callback failed: %s" % exc)
+
     def _send(self, payload):
         body = json.dumps(payload).encode("utf-8")
         for attempt in (1, 2):
@@ -165,9 +190,10 @@ class DecisionBridge(object):
                     "Connection": "keep-alive",
                 })
                 resp = self._conn.getresponse()
-                resp.read()
+                raw = resp.read()
                 if resp.status == 200:
                     self.sent += 1
+                    self._check_drive_ended(raw)
                     return True
                 # A 409 means the server is scoped to another session. Retrying
                 # cannot fix that and it matters: two sessions are live and one

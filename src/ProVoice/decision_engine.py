@@ -405,12 +405,27 @@ class CombinedFusionStrategy(BaseStrategy):
         self.expected_shift = expected_shift
         self.quantile_tau = quantile_tau
 
+    def _warn_degraded(self, reason):
+        """Say it ONCE per distinct reason, on the console, as it happens.
+
+        decisions.csv is read after the session; a block that ran without the
+        state model cannot be recovered by then. At 4 Hz an unthrottled warning
+        would also bury everything else in the log.
+        """
+        if reason in self._degraded_seen:
+            return
+        self._degraded_seen.add(reason)
+        print("[decision] DEGRADED: %s. Every decision from here is missing "
+              "half the model." % reason)
+
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
         fn = state.get("functionname", "")
         try:
             of = self.fcd_strategy.decide(state)
         except Exception as e:
             of = _loa0_result(f"Fusion FCD error: {e}", fn)
+        if not hasattr(self, "_degraded_seen"):
+            self._degraded_seen = set()
         try:
             os_ = self.state_strategy.decide(state)
         except Exception as e:
@@ -421,10 +436,37 @@ class CombinedFusionStrategy(BaseStrategy):
         # trained xLSTM checkpoint -> fall back to the FCD model alone.)
         if of_fb and os_fb:
             return _loa0_result("Fusion: both FCD and state unavailable", fn)
+        # A HALF-DEAD FUSION IS STILL A FALLBACK, and must say so in the
+        # top-level columns.
+        #
+        # These two branches used to spread `of` / `os_` unchanged, and those
+        # carry "fallback": False -- so a run in which the state model fell back
+        # on EVERY tick wrote fallback=False, fallback_reason="" to all of
+        # decisions.csv, with the truth buried in the nested `sub` JSON. That is
+        # how a session that served zero model predictions looked clean: seen
+        # 2026-08-21, where a missing state_xlstm.pt left the FCD XGBoost
+        # deciding alone on a static per-function vector, and the served LoA was
+        # therefore constant for the whole run.
+        #
+        # `fallback` here means "this decision is not what the configuration
+        # asked for", not "LoA 0" -- the LoA is still the surviving model's, and
+        # `sub` still holds both halves.
         if os_fb:
-            return {**of, "message": (str(of.get("message", "")) + " (state unavailable; FCD-only)").strip(), "sub": {"fcd": of, "state": os_}}
+            reason = ("state unavailable (%s); FCD-only"
+                      % (os_.get("fallback_reason") or "no reason given"))
+            self._warn_degraded(reason)
+            return {**of,
+                    "message": (str(of.get("message", "")) + " (state unavailable; FCD-only)").strip(),
+                    "fallback": True, "fallback_reason": reason,
+                    "sub": {"fcd": of, "state": os_}}
         if of_fb:
-            return {**os_, "message": (str(os_.get("message", "")) + " (FCD unavailable; state-only)").strip(), "sub": {"fcd": of, "state": os_}}
+            reason = ("FCD unavailable (%s); state-only"
+                      % (of.get("fallback_reason") or "no reason given"))
+            self._warn_degraded(reason)
+            return {**os_,
+                    "message": (str(os_.get("message", "")) + " (FCD unavailable; state-only)").strip(),
+                    "fallback": True, "fallback_reason": reason,
+                    "sub": {"fcd": of, "state": os_}}
         pf = of.get("probs", [0.2]*5); ps = os_.get("probs", [0.2]*5)
         probs = [self.w_fcd*pf[i] + self.w_state*ps[i] for i in range(5)]
         S = sum(probs); probs = [p / S if S>0 else 0.2 for p in probs]

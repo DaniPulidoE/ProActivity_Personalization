@@ -1127,9 +1127,21 @@ def main():
                   "reachable; decisions will NOT be published. The drive side "
                   "will log every call as skipped (no_status_file).")
         else:
+            def _drive_ended():
+                # Same shutdown the --data-collection timeout performs. The
+                # study's block length is decided by DRIVE (it owns the call
+                # schedule and the 10 min clock), so this side must be told
+                # rather than run a timer of its own -- two independent timers
+                # would drift, and the one that fired first would truncate the
+                # other's data.
+                print("[main] Drive ended the block; stopping.")
+                data_collector.stop()
+                server.should_exit = True
+
             decision_bridge = DecisionBridge(
                 status_url, session_id=session_id, participantid=participantid,
-                checkpoint_id=getattr(args, "study_checkpoint_id", ""))
+                checkpoint_id=getattr(args, "study_checkpoint_id", ""),
+                on_drive_ended=_drive_ended)
             if decision_bridge.start():
                 data_collector.on_decision = decision_bridge.publish
             else:

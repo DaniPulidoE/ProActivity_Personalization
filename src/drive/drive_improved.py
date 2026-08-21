@@ -93,6 +93,8 @@ import collections
 import csv
 import datetime
 import json
+import time
+import urllib.request
 import logging
 import math
 import os
@@ -768,6 +770,40 @@ def _read_status_file(path):
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def _post_drive_ended(status_url, session_id, participantid, reason=""):
+    """Tell ProVoice the block is over, so it stops with us.
+
+    ONE request at the end of a block, so urllib is right here -- the
+    connection-reuse machinery on the ProVoice side exists for its 4 Hz decision
+    feed, not for this.
+
+    Failure is logged and swallowed. Drive's job is the participant's block, and
+    it must not hang on a shutdown courtesy; the visible cost is a ProVoice that
+    has to be stopped by hand, which is what happened before this existed.
+    """
+    if not status_url:
+        return False
+    endpoint = status_url.rstrip("/") + "/event"
+    body = json.dumps({
+        "event": "drive_ended",
+        "session_id": session_id or "",
+        "participantid": participantid or "",
+        "reason": reason or "study block complete",
+        "ts": time.time(),
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(endpoint, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            resp.read()
+            print("[study] told ProVoice the block is over (%s)." % endpoint)
+            return True
+    except Exception as exc:                                  # noqa: BLE001
+        print("[study] could NOT tell ProVoice the block is over (%s: %s). "
+              "Stop it by hand." % (type(exc).__name__, exc))
+        return False
 
 
 def _status_event_ts(path, session_id, key):
@@ -3083,7 +3119,18 @@ def _should_wait_for_provoice(args):
     Only a run that actually records labels alongside ProVoice has anything to
     gain: --test-popup teaches the control with no ProVoice process at all and
     would wait forever, and --no-popup opens no windows to protect.
+
+    A STUDY BLOCK waits too, despite forcing --no-popup. It has no labelling
+    windows to protect, but it has something stronger: every call is served by
+    ProVoice, so a block whose clock started first would burn its first minutes
+    -- and its first calls -- against a model that is not answering yet, and
+    log them as skipped. --random-loa / --test-calls are the exception, since
+    those generate the LoA locally and need no ProVoice at all.
     """
+    if getattr(args, "study", False) or getattr(args, "short_trial", False):
+        if getattr(args, "random_loa", False) or getattr(args, "test_calls", False):
+            return False
+        return args.popup_wait_timeout > 0
     return (not args.no_popup and not args.test_popup
             and args.popup_wait_timeout > 0)
 
@@ -3674,12 +3721,18 @@ def game_loop(args):
                     else:
                         call_preview.handle_event(event, now_ms=now_ms)
 
-                if study is not None and study.started_ms is None:
-                    # Started on the first DRIVING tick, not at process launch:
-                    # the clock must not run through the start screen, or the
-                    # first call lands before the participant has moved.
+                if (study is not None and study.started_ms is None
+                        and popups_armed):
+                    # Gated on `popups_armed`, which is really "the session
+                    # clock has started" -- it is set by the ProVoice-ready path
+                    # above even when there are no pop-ups to arm. So the 10
+                    # minutes begin when ProVoice is logging, exactly as the
+                    # label windows do in a collection run, rather than at the
+                    # first driving tick. Without this the block would spend its
+                    # opening minutes serving calls from a model that has not
+                    # started answering, and log them as skipped.
                     study.start(now_ms)
-                    print('[study] block started.')
+                    print('[study] ProVoice is up; block clock starts now.')
 
                 if study is not None and not study_ended:
                     due = study.update(now_ms, world.hud.speed_kmh,
@@ -3707,6 +3760,13 @@ def game_loop(args):
                         and study.finished(now_ms)):
                     study_ended = True
                     print('[study] block complete: %s' % study.summary())
+                    # ProVoice has no clock of its own for this: DRIVE owns the
+                    # call schedule and the block length, so the other machine
+                    # has to be told. Two independent timers would drift and the
+                    # first to fire would truncate the other's data.
+                    _post_drive_ended(args.provoice_status_url, session_id,
+                                      getattr(args, 'participantid', ''),
+                                      study.summary())
                     end_overlay = SessionEndedOverlay(
                         args.width, args.height,
                         'block complete (%s)' % study.summary())
@@ -3974,6 +4034,13 @@ def main():
         '--block-idx', dest='block_idx', default='',
         help='Position of this block in the participant sequence (1, 2 or 3). '
              'Recorded per row; needed to model order effects.')
+    argparser.add_argument(
+        '--provoice-status-url', dest='provoice_status_url', default='',
+        help='Address of the reverse status bridge, used to tell ProVoice on '
+             'the other machine that a --study block has finished so it stops '
+             'too. Set by start_experiment.py under --remote; without it a '
+             'remote ProVoice keeps recording after the drive ends and has to '
+             'be stopped by hand.')
     argparser.add_argument(
         '--call-chrome', dest='call_chrome', choices=('none', 'panel'),
         default='none',
