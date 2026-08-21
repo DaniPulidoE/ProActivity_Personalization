@@ -223,11 +223,6 @@ POST_SPEECH_GAP_S = 0.35
 # this the caller's first syllable lands on the same frame the panel flips to
 # "connected", which reads as the system talking rather than a person.
 PICKUP_GAP_S = 0.6
-# How long the panel shows only "Call from X." before the rest of the sentence
-# is appended, so the text arrives with the speech instead of all at once.
-# Defaults to the measured length of the LoA 1 clip, which is that exact
-# sentence in that exact voice; falls back to this when there is no audio.
-CLAUSE_DELAY_FALLBACK_S = 0.8
 
 
 # --- States -----------------------------------------------------------------
@@ -724,7 +719,6 @@ class CallEvent(object):
         self._answered = False
         self._pending_outcome = None
         self._voice_ends_ms = 0
-        self._voice_started_ms = 0
         self._reply_started_ms = None
         return True
 
@@ -775,7 +769,6 @@ class CallEvent(object):
                     # Predicted end, not Channel.get_busy(): this has to behave
                     # identically with no audio device, where get_busy() is
                     # never True and the gap would collapse to nothing.
-                    self._voice_started_ms = now_ms
                     self._voice_ends_ms = now_ms + line.get_length() * 1000.0
                 self._enter(_LOA_ROUTE[self.loa], now_ms)
             return None
@@ -1048,12 +1041,6 @@ class CallEvent(object):
                               COL_WHITE, x, y + 4)
         return y
 
-    def _clause_delay_ms(self):
-        first = self._sounds.get(1)          # "Call from X." on its own
-        if first is not None:
-            return first.get_length() * 1000.0
-        return CLAUSE_DELAY_FALLBACK_S * 1000.0
-
     def _panel_line(self):
         """What the assistant panel says, given the LoA AND the current state.
 
@@ -1063,20 +1050,20 @@ class CallEvent(object):
         ring lead-in, jumped back to 3 when COUNTDOWN was actually entered, and
         then counted down a third time from CONNECTED.
         """
-        head = 'Call from %s.' % self.caller_name
         if self.state == RINGING:
             # The assistant has not spoken yet -- its clip plays on leaving this
-            # state -- so the panel shows only who is calling.
-            return head
-        # Every assistant line opens with "Call from X.", so the rest is
-        # APPENDED once that clause has been spoken rather than appearing whole.
-        # The text then arrives with the voice instead of ahead of it.
-        if (self._now_ms - self._voice_started_ms) < self._clause_delay_ms():
-            return head
+            # state -- so the panel shows only who is calling. From there the
+            # line appears WHOLE: revealing it clause by clause in step with the
+            # speech was tried and read as the panel stuttering.
+            return 'Call from %s.' % self.caller_name
         if self.state == COUNTDOWN:
             return 'Call from %s. Answering in %d…' % (
                 self.caller_name, self._countdown_remaining())
-        if self.state == CONNECTED:
+        if self.state in (ANSWERING, CONNECTED):
+            # ANSWERING belongs here too. Without it LoA 3 fell through to the
+            # _ASSISTANT_LINE default and briefly displayed its raw template,
+            # "Answering in 3... 2... 1...", which is a record of what the wav
+            # says and was never meant to be drawn.
             return 'Call from %s. Answering now.' % self.caller_name
         line = _ASSISTANT_LINE.get(self.loa)
         return (line % self.caller_name) if line else None
