@@ -2086,23 +2086,25 @@ def main():
                          "the log is unrecoverable once the sessions are "
                          "done.")
         model = study_model_path(args.participantid, args.condition)
-        if not os.path.exists(model):
+        # THE MODEL DOES NOT LIVE ON THIS MACHINE under --remote, and Drive
+        # never opens a checkpoint at all -- it reads a served LoA off the
+        # bridge. This machine only NAMES the file (it is the one that knows
+        # --participantid and --condition) and publishes that name at /session;
+        # the ProVoice machine loads it, and warns there if it is absent.
+        # Requiring it here would demand the checkpoint on the one machine that
+        # has no use for it.
+        if not args.remote and not os.path.exists(model):
             parser.error(
                 "no model for participant %s condition %d.\n  expected: %s\n"
                 "  Blocks are served from %s; the file is built by the offline "
-                "pipeline and must be copied to this machine before the "
-                "session."
+                "pipeline and must be present on the machine that runs "
+                "ProVoice."
                 % (args.participantid, args.condition, model, STUDY_MODEL_DIR))
-        # The study scenario is fixed for every participant and every block --
-        # it is excluded from TRAFFIC_SEED_PLAN precisely so nobody meets it
-        # during collection, which is what also makes it a generalization test.
-        if args.traffic_seed is None:
-            args.traffic_seed = STUDY_TRAFFIC_SEED
-        elif int(args.traffic_seed) != STUDY_TRAFFIC_SEED:
-            parser.error("--study-satisfaction fixes the traffic scenario at "
-                         "%d for every participant; --traffic-seed %s would "
-                         "make this block incomparable with the others."
-                         % (STUDY_TRAFFIC_SEED, args.traffic_seed))
+        # The scenario is NOT set here. resolve_traffic_seed() already pins
+        # every non---data-collection run to STUDY_TRAFFIC_SEED and already
+        # rejects an explicit --traffic-seed on one, so assigning it here only
+        # made this run look like it had been overridden by hand -- which that
+        # very check then refused.
         # The personalization lives in the xLSTM head. 'combined' would blend it
         # with the static-FCD XGBoost at w_fcd, diluting the one thing the study
         # manipulates.
@@ -2116,7 +2118,9 @@ def main():
         print("[study] participant %s, condition %d (%s)"
               % (args.participantid, args.condition,
                  STUDY_CONDITIONS[args.condition]))
-        print("[study] serving %s" % model)
+        print("[study] serving %s%s"
+              % (model, "  (must exist on the ProVoice machine; this one only "
+                        "publishes the name)" if args.remote else ""))
         print("[study] block %s, traffic scenario %d, 10 min, 5 calls"
               % (args.block_idx, STUDY_TRAFFIC_SEED))
     # Left as None until now so a preset can tell "nobody said" from an
