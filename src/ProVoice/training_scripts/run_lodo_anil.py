@@ -52,8 +52,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import csv
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -108,6 +110,19 @@ def main() -> None:
     ap.add_argument("--outer-opt", dest="outer_opt", default="nadam")
     ap.add_argument("--episode-start", dest="episode_start", default="any")
     ap.add_argument("--pids", default="", help="Subset of test drivers to run.")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Folds to meta-train concurrently. Each fold is a fully "
+                         "independent subprocess: it reads its own pop_heldout_<pid>.pt "
+                         "and writes its own anil_heldout_<pid>.pt, and unlike the "
+                         "hyperparameter sweep there is no shared warm-start phase to "
+                         "serialise first. Pair with --threads-per-job so jobs x threads "
+                         "does not exceed the core count; this model does not scale inside "
+                         "a process, so throughput comes from count rather than width.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch intra-op threads per fold (0 = leave torch's default). Set "
+                         "in the child's ENVIRONMENT, since torch sizes its pool at import. "
+                         "KEEP IT FIXED across a run: thread count changes float reduction "
+                         "order, and these checkpoints are compared against each other.")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Reuse a fold's meta-init if it is already on disk (resume).")
     args = ap.parse_args()
@@ -147,7 +162,9 @@ def main() -> None:
     ckpt_dir = pathlib.Path(args.ckpt_dir); ckpt_dir.mkdir(parents=True, exist_ok=True)
     outdir = pathlib.Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
 
-    results = []
+    # PHASE 1 -- validate every fold serially and build the task list. Cheap, and it
+    # means a missing warm start or a bad fold is reported before any GPU time is spent.
+    results, tasks = [], []
     for test_pid, train_pids in lodo_folds():
         if test_pid not in present or (want and test_pid not in want):
             continue
@@ -168,15 +185,28 @@ def main() -> None:
                             "init": init.name, "out": out.name, "minutes": 0.0,
                             "reused": True})
             continue
+        tasks.append((test_pid, train_pids, init, out))
 
-        print(f"[fold {test_pid}] meta-training on {len(train_pids)} drivers "
-              f"({m_star} meta-epochs, no meta-validation)", flush=True)
+    env = dict(os.environ)
+    if args.threads_per_job > 0:
+        for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS"):
+            env[v] = str(args.threads_per_job)
+    n_jobs = max(1, min(args.jobs, len(tasks))) if tasks else 1
+    if tasks:
+        print(f"[run] {len(tasks)} fold(s) x {m_star} meta-epochs; {n_jobs} concurrent x "
+              + (f"{args.threads_per_job} torch thread(s) each" if args.threads_per_job
+                 else "torch default threads"), flush=True)
+
+    def run_fold(task):
+        """One LODO fold. Returns (record, stderr_tail) -- record is None on failure."""
+        test_pid, train_pids, init, out = task
         t0 = time.time()
         with tempfile.TemporaryDirectory() as td:
-            sub = pathlib.Path(td) / "train.jsonl"
-            n = write_subset_streaming(src, train_pids, sub)
+            sub_ = pathlib.Path(td) / "train.jsonl"
+            n = write_subset_streaming(src, train_pids, sub_)
             cmd = [sys.executable, "-m", "ProVoice.models.xlstm_maml",
-                   "--in", str(sub), "--init", str(init), "--out", str(out),
+                   "--in", str(sub_), "--init", str(init), "--out", str(out),
                    # --no-meta-val, EXPLICITLY. Omitting --val-pids does NOT mean
                    # "no meta-validation" -- xlstm_maml reads an absent value as
                    # "choose for me" and holds out ~20 % of the drivers at random,
@@ -200,17 +230,37 @@ def main() -> None:
             # plain and an augmented arm cannot be produced by the same command.
             if args.embed_fcd:
                 cmd += ["--embed-fcd"]
-            proc = subprocess.run(cmd)
-            if proc.returncode != 0:
-                raise SystemExit(f"fold {test_pid} meta-training failed (exit {proc.returncode})")
+            # Output is captured so concurrent folds do not interleave their logs;
+            # on failure the tail is printed by the collector.
+            proc = subprocess.run(cmd, env=env, capture_output=(n_jobs > 1), text=True)
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:])
+            return None, f"fold {test_pid} exit {proc.returncode}\n{tail}"
         dt = (time.time() - t0) / 60.0
-        print(f"  {n} rows, {dt:.1f} min -> {out}")
-        results.append({"pid": test_pid, "n_train_drivers": len(train_pids),
-                        "init": init.name, "out": out.name, "minutes": round(dt, 2),
-                        "reused": False})
+        return ({"pid": test_pid, "n_train_drivers": len(train_pids),
+                 "init": init.name, "out": out.name, "minutes": round(dt, 2),
+                 "reused": False}, f"[fold {test_pid}] {n} rows, {dt:.1f} min -> {out.name}")
+
+    # PHASE 2 -- meta-train. Only this thread appends to `results`, so no lock is needed.
+    failures = []
+    if tasks:
+        with cf.ThreadPoolExecutor(max_workers=n_jobs) as ex:
+            for rec, msg in ex.map(run_fold, tasks):
+                if rec is None:
+                    failures.append(msg)
+                    print(f"[FAIL] {msg}", flush=True)
+                else:
+                    results.append(rec)
+                    print(msg, flush=True)
+    if failures:
+        # Hard-fail as before, but only after every fold has had its turn: at fold 10
+        # of 12, aborting would discard the nine that succeeded.
+        raise SystemExit(f"{len(failures)} fold(s) failed; the LODO set is incomplete "
+                         f"and must not be compared against the L2-SP arm")
 
     if not results:
         raise SystemExit("no folds ran")
+    results.sort(key=lambda r: r["pid"])   # threads finish out of order
     out_csv = outdir / "lodo_anil.csv"
     with out_csv.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
