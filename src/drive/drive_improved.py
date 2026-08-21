@@ -3264,7 +3264,8 @@ def game_loop(args):
         if study_on:
             cfg = dict(SHORT_TRIAL if args.short_trial else FULL_TRIAL)
             study = StudySession(
-                LoASource('random' if args.random_loa else 'bridge',
+                LoASource(('sequence' if args.test_calls else
+                           'random' if args.random_loa else 'bridge'),
                           status_path=status_path, session_id=session_id,
                           seed=args.study_seed,
                           max_age_ms=(args.loa_max_age * 1000.0
@@ -3285,9 +3286,10 @@ def game_loop(args):
                       '[study] WARNING staleness check DISABLED '
                       '(--loa-max-age 0): a stalled ProVoice will be served '
                       'silently.')
-            if args.random_loa:
-                print('[study] WARNING --random-loa: the LoA is drawn LOCALLY, '
-                      'not served by a model. Not a study configuration.')
+            if args.random_loa or args.test_calls:
+                print('[study] WARNING the LoA is generated LOCALLY (%s), not '
+                      'served by a model. Not a study configuration.'
+                      % study.source.mode)
 
         provoice_watcher = ProVoiceReadyWatcher(session_id, args.popup_wait_timeout,
                                                 status_path=status_path)
@@ -3936,6 +3938,13 @@ def main():
              'study configuration: every row it writes is stamped '
              "loa_source='random' so it cannot be mistaken for served data.")
     argparser.add_argument(
+        '--test-calls', dest='test_calls', action='store_true',
+        help='Like --random-loa but walks the five levels IN ORDER (0, 1, 2, 3, '
+             '4) instead of shuffling them, so a reviewer knows which rung is '
+             'coming and can watch for one specific thing. Pairs with '
+             '--short-trial, which is exactly five calls. Implies --study; NOT '
+             'a study configuration.')
+    argparser.add_argument(
         '--loa-max-age', dest='loa_max_age', type=float, default=3.0,
         help='Refuse a served LoA older than this many seconds and log the '
              'call as skipped (default: %(default)s). STALENESS IS THE SILENT '
@@ -4078,8 +4087,12 @@ def main():
     # driver to label windows nobody is going to use. Forced off rather than
     # left to the experimenter to remember, because forgetting it does not fail
     # -- it quietly produces a block that measures something else.
-    if args.short_trial:
+    if args.short_trial or args.test_calls:
         args.study = True
+    if args.test_calls and args.random_loa:
+        argparser.error('--test-calls and --random-loa both replace the served '
+                        'LoA and contradict each other: one walks 0-4 in order, '
+                        'the other shuffles. Pick one.')
     if args.study:
         if args.test_popup:
             argparser.error('--test-popup and --study contradict each other: '
@@ -4093,9 +4106,10 @@ def main():
             print('[study] labelling pop-ups disabled for this block '
                   '(--no-popup implied): the block measures calls, and a '
                   'pop-up every 20 s would freeze the scene on top of them.')
-    if args.random_loa and not args.study:
-        argparser.error('--random-loa only has an effect on a study block. Add '
-                        '--study (or --short-trial), or drop it.')
+    if (args.random_loa or args.test_calls) and not args.study:
+        argparser.error('--random-loa / --test-calls only have an effect on a '
+                        'study block. Add --study (or --short-trial), or drop '
+                        'them.')
 
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '

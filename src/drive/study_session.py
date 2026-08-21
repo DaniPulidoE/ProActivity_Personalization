@@ -24,13 +24,16 @@ Two sources are supported:
 ``bridge``  read ``latest_loa`` from the ProVoice status file, session-scoped.
             This is the study configuration.
 ``random``  draw locally, for testing the drive half without ProVoice running
-            at all. NOT a study configuration -- every row it writes is stamped
-            ``loa_source='random'`` so it can never be mistaken for served data.
+            at all. Deals a SHUFFLED PERMUTATION of 0..4, so a five-call block
+            exercises every rendering exactly once -- five iid draws would leave
+            a rung untested about half the time, which is the opposite of what a
+            trial run is for.
+``sequence`` 0, 1, 2, 3, 4 in order. Same coverage as ``random`` but
+            predictable, so a reviewer knows which rung is coming and can watch
+            for one specific thing.
 
-The random source deals a SHUFFLED PERMUTATION of 0..4 rather than sampling
-independently, so a five-call block exercises every rendering exactly once. Five
-iid draws would leave a rung untested about half the time, which is the opposite
-of what a trial run is for.
+NEITHER local source is a study configuration. Every row they write is stamped
+with its ``loa_source``, so it can never be mistaken for a served prediction.
 """
 
 import csv
@@ -97,11 +100,16 @@ class LoASource(object):
         self.max_age_ms = max_age_ms
         self._rng = random.Random(seed)
         self._deck = []
+        self._seq = 0
         self.last_age_ms = None
         self.last_frame_ts = ''
         self.last_checkpoint = ''
 
     def _deal(self):
+        if self.mode == 'sequence':
+            loa = self._seq % 5
+            self._seq += 1
+            return loa
         if not self._deck:
             self._deck = [0, 1, 2, 3, 4]
             self._rng.shuffle(self._deck)
@@ -112,7 +120,7 @@ class LoASource(object):
         self.last_age_ms = None
         self.last_frame_ts = ''
         self.last_checkpoint = ''
-        if self.mode == 'random':
+        if self.mode in ('random', 'sequence'):
             return self._deal(), ''
 
         record = read_status(self.status_path)

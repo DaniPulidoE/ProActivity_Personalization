@@ -218,6 +218,16 @@ CONNECTED_HOLD_S = 3.0         # caller's canned reply, then auto hang-up
 # the same tick the line begins. A short beat also reads as the call actually
 # connecting rather than the assistant talking to itself.
 POST_SPEECH_GAP_S = 0.35
+# ...and a second beat between the call CONNECTING and the caller speaking. A
+# real line does not deliver a sentence the instant it is picked up, and without
+# this the caller's first syllable lands on the same frame the panel flips to
+# "connected", which reads as the system talking rather than a person.
+PICKUP_GAP_S = 0.6
+# How long the panel shows only "Call from X." before the rest of the sentence
+# is appended, so the text arrives with the speech instead of all at once.
+# Defaults to the measured length of the LoA 1 clip, which is that exact
+# sentence in that exact voice; falls back to this when there is no audio.
+CLAUSE_DELAY_FALLBACK_S = 0.8
 
 
 # --- States -----------------------------------------------------------------
@@ -226,6 +236,11 @@ ARMED = 'armed'
 RINGING = 'ringing'
 AWAIT_INPUT = 'await_input'
 COUNTDOWN = 'countdown'
+# The assistant has committed to answering but has not finished SAYING so. The
+# call is not shown as connected yet, and the caller does not speak yet -- both
+# wait here. Without this, LoA 4 displayed "connected 00:00" and played the
+# caller's reply while the assistant was still mid-sentence.
+ANSWERING = 'answering'
 DONE = 'done'
 CONNECTED = 'connected'
 
@@ -237,7 +252,7 @@ _LOA_ROUTE = {
     1: AWAIT_INPUT,
     2: AWAIT_INPUT,
     3: COUNTDOWN,
-    4: CONNECTED,
+    4: ANSWERING,
 }
 
 # Assistant utterance per LoA. LoA 0 is silent -- that is the whole content of
@@ -648,6 +663,23 @@ class CallEvent(object):
         except Exception:                                     # noqa: BLE001
             return None
 
+    def _stop_voice(self, now_ms):
+        """Cut the assistant off mid-sentence, and retire its predicted end.
+
+        Called the moment the driver acts. Two things have to happen together:
+        the clip stops, and ``_voice_ends_ms`` moves to now -- otherwise the
+        ANSWERING gap would still wait out the remainder of a sentence nobody
+        is hearing, leaving the driver looking at a dead panel after they had
+        already answered.
+        """
+        if self._voice_channel is not None:
+            try:
+                self._voice_channel.stop()
+            except Exception:                                 # noqa: BLE001
+                pass
+            self._voice_channel = None
+        self._voice_ends_ms = min(self._voice_ends_ms, now_ms)
+
     def _stop_ring(self):
         if self._ring_channel is not None:
             try:
@@ -661,7 +693,8 @@ class CallEvent(object):
     @property
     def active(self):
         """True while the panel is on screen and may consume input."""
-        return self.state in (RINGING, AWAIT_INPUT, COUNTDOWN, CONNECTED)
+        return self.state in (RINGING, AWAIT_INPUT, COUNTDOWN, ANSWERING,
+                              CONNECTED)
 
     def arm(self, now_ms, loa, window_idx=None):
         """Schedule this window's call. False if nothing was armed.
@@ -691,6 +724,7 @@ class CallEvent(object):
         self._answered = False
         self._pending_outcome = None
         self._voice_ends_ms = 0
+        self._voice_started_ms = 0
         self._reply_started_ms = None
         return True
 
@@ -700,8 +734,9 @@ class CallEvent(object):
         if state == CONNECTED:
             self._stop_ring()
             self._answered = True
-            # The caller's reply is NOT played here -- see the CONNECTED branch
-            # of update(). It waits for the assistant to stop speaking.
+            # The caller does not speak yet: PICKUP_GAP_S first, handled in the
+            # CONNECTED branch of update().
+            self._reply_started_ms = None
 
     def _elapsed(self, now_ms):
         return now_ms - self._state_entered_ms
@@ -740,6 +775,7 @@ class CallEvent(object):
                     # Predicted end, not Channel.get_busy(): this has to behave
                     # identically with no audio device, where get_busy() is
                     # never True and the gap would collapse to nothing.
+                    self._voice_started_ms = now_ms
                     self._voice_ends_ms = now_ms + line.get_length() * 1000.0
                 self._enter(_LOA_ROUTE[self.loa], now_ms)
             return None
@@ -763,16 +799,21 @@ class CallEvent(object):
                 if self._response is None:
                     self._response = 'timeout'
                     self._response_ms = now_ms
+                self._enter(ANSWERING, now_ms)
+            return None
+
+        if self.state == ANSWERING:
+            # Hold everything -- the connected display AND the caller -- until
+            # the assistant has finished its line plus a beat. At LoA 4 the
+            # announcement and the reply would otherwise start on the same tick;
+            # at LoA 0/1 a driver who accepts instantly would talk over it.
+            if now_ms >= self._voice_ends_ms + POST_SPEECH_GAP_S * 1000.0:
                 self._enter(CONNECTED, now_ms)
             return None
 
         if self.state == CONNECTED:
             if self._reply_started_ms is None:
-                # Hold the caller until the assistant has finished its line plus
-                # a beat. At LoA 4 the two would otherwise start on the same
-                # tick; at LoA 0/1 a driver who accepts instantly would talk
-                # over the announcement the same way.
-                if now_ms >= self._voice_ends_ms + POST_SPEECH_GAP_S * 1000.0:
+                if self._elapsed(now_ms) >= PICKUP_GAP_S * 1000.0:
                     self._play('reply')
                     self._reply_started_ms = now_ms
                 return None
@@ -787,6 +828,7 @@ class CallEvent(object):
 
     def _resolve(self, now_ms, answered):
         self._stop_ring()
+        self._stop_voice(now_ms)
         self.state = DONE
         self._answered = answered
         self._pending_outcome = self.outcome(now_ms)
@@ -851,6 +893,13 @@ class CallEvent(object):
         if now_ms is None:
             now_ms = pygame.time.get_ticks()
 
+        # The driver has acted, so the assistant stops talking -- at LoA 1, 2
+        # and 3 its line can still be running when they answer or hang up, and
+        # carrying on over the top of a decision that has already been made is
+        # both unnatural and confusing about what state the call is in.
+        if affirm or negative:
+            self._stop_voice(now_ms)
+
         if self.state == COUNTDOWN:
             if negative:
                 self._response = 'cancel'
@@ -862,7 +911,7 @@ class CallEvent(object):
         if affirm:
             self._response = 'accept' if self.loa in (0, 1) else 'yes'
             self._response_ms = now_ms
-            self._enter(CONNECTED, now_ms)
+            self._enter(ANSWERING, now_ms)
             return 'affirmative'
         if negative:
             self._response = 'decline' if self.loa in (0, 1) else 'no'
@@ -999,6 +1048,12 @@ class CallEvent(object):
                               COL_WHITE, x, y + 4)
         return y
 
+    def _clause_delay_ms(self):
+        first = self._sounds.get(1)          # "Call from X." on its own
+        if first is not None:
+            return first.get_length() * 1000.0
+        return CLAUSE_DELAY_FALLBACK_S * 1000.0
+
     def _panel_line(self):
         """What the assistant panel says, given the LoA AND the current state.
 
@@ -1008,10 +1063,16 @@ class CallEvent(object):
         ring lead-in, jumped back to 3 when COUNTDOWN was actually entered, and
         then counted down a third time from CONNECTED.
         """
+        head = 'Call from %s.' % self.caller_name
         if self.state == RINGING:
             # The assistant has not spoken yet -- its clip plays on leaving this
             # state -- so the panel shows only who is calling.
-            return 'Call from %s.' % self.caller_name
+            return head
+        # Every assistant line opens with "Call from X.", so the rest is
+        # APPENDED once that clause has been spoken rather than appearing whole.
+        # The text then arrives with the voice instead of ahead of it.
+        if (self._now_ms - self._voice_started_ms) < self._clause_delay_ms():
+            return head
         if self.state == COUNTDOWN:
             return 'Call from %s. Answering in %d…' % (
                 self.caller_name, self._countdown_remaining())
