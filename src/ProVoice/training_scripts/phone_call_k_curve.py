@@ -177,6 +177,17 @@ def curve_for_arm(ckpt: pathlib.Path, df: pd.DataFrame, tau: float, val_frac: fl
     """
     model, arch = load_checkpoint(str(ckpt))
     install_fcd_head(model, embed_fcd)
+    # ORDER MATTERS, and BOTH halves do. install_fcd_head builds a new Linear on
+    # the head's CURRENT device, so it has to run before the move, not after.
+    #
+    # .to(device): embed_segments does `model.in_proj(xb.to(device))` and never
+    # moves the model itself -- load_checkpoint returns it on CPU, so without this
+    # the first forward pass dies with mat1 on cuda:0 and the weights on cpu.
+    #
+    # .eval(): the population config carries dropout 0.2, which is ACTIVE in a
+    # freshly-loaded module. Omitting this raises nothing -- it silently randomizes
+    # every embedding, so the curve would be noise no one could trace back here.
+    model.to(device).eval()
     head_type = arch.get("head_type", "softmax")
     gids, Xs, vs = build_segments(df, window_seconds=arch.get("window_seconds"),
                                   resample_hz=arch.get("resample_hz"))
