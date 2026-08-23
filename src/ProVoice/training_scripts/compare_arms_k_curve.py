@@ -103,6 +103,14 @@ def ensure_curve(arm: str, ckpt_dir: pathlib.Path, prefix: str, outdir: pathlib.
            # the sweep they are read beside -- and since lambda = tau/(2K) the
            # shortfall grows with K, which is the region the comparison is read in.
            "--steps", str(args.steps)]
+    # Both arms are swept with the SAME parallelism. sweep_l2sp_tau shards over
+    # drivers and summarises once in its parent, so this changes wall-clock only --
+    # but it must be identical for the two arms, because thread count changes float
+    # reduction order and these curves are differenced against each other.
+    if args.jobs > 1:
+        cmd += ["--jobs", str(args.jobs)]
+    if args.threads_per_job > 0:
+        cmd += ["--threads-per-job", str(args.threads_per_job)]
     if args.embed_fcd:
         # ONE flag, BOTH arms. Passing it here rather than expecting two earlier
         # commands to agree is what makes arm symmetry structural instead of a
@@ -182,6 +190,13 @@ def main() -> None:
                          "hard -- and any residual difference BETWEEN the arms at the same K "
                          "biases the comparison. Raise further if the sweep's [converge] "
                          "line still reports HIGH.")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="Passed to sweep_l2sp_tau for BOTH arms, which shards over drivers. "
+                         "Wall-clock only; selection still happens once per arm over the "
+                         "full driver set.")
+    ap.add_argument("--threads-per-job", dest="threads_per_job", type=int, default=0,
+                    help="Torch intra-op threads per shard. Applied identically to both "
+                         "arms -- see the note at the call site.")
     ap.add_argument("--k-cap", dest="k_cap", type=int, default=60)
     ap.add_argument("--max-points", dest="max_points", type=int, default=20)
     ap.add_argument("--embed-fcd", dest="embed_fcd", action="store_true",
