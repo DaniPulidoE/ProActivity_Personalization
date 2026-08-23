@@ -92,7 +92,7 @@ from ProVoice.training_scripts.folds import ALL_PIDS
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "..", "..", "scripts"))
 from sweep_train_frac import (  # noqa: E402
-    build_segments, embed_segments, evaluate,
+    build_segments, embed_segments, evaluate, pick_sweep_points,
 )
 
 DEFAULT_FUNCTION = "Respond to a phone call"
@@ -109,8 +109,8 @@ def read_json(p: pathlib.Path) -> Optional[Dict]:
         return None
 
 
-def load_driver_rows(src: pathlib.Path, pid: str, want_key: str) -> pd.DataFrame:
-    """One driver's rows, restricted to ONE function.
+def load_driver_rows(src: pathlib.Path, pid: str, want_key: Optional[str]) -> pd.DataFrame:
+    """One driver's rows. ``want_key=None`` keeps every function.
 
     Matching goes through ``fcd_config.resolve_function_key`` rather than string
     equality, because that is the same canonicalization the FCD vector itself is
@@ -119,62 +119,102 @@ def load_driver_rows(src: pathlib.Path, pid: str, want_key: str) -> pd.DataFrame
     legacy spellings ('Start a phone call'), which a literal comparison would
     silently drop.
 
-    MEMORY: ``iter_jsonl`` streams. The full file parses to a measured ~4 GB as
-    raw dicts; one driver's phone-call rows are roughly 1/60th of that, and the
-    filter runs BEFORE ``normalize_row`` so the discarded 98 % is never copied.
+    MEMORY: ``iter_jsonl`` streams. The full file parses to a measured ~4 GB as raw
+    dicts. Under ``--support-scope all`` one driver's rows are ~1/12th of that with
+    ~25 of the 73 keys kept -- the same working set ``sweep_l2sp_tau`` already
+    holds -- and are dropped before the next driver.
     """
     from ProVoice.fcd_config import resolve_function_key
     rows = []
     for r in iter_jsonl(src):
         if str(r.get("participantid", "")) != pid:
             continue
-        if resolve_function_key(str(r.get("functionname", "") or "")) != want_key:
+        if want_key is not None and \
+                resolve_function_key(str(r.get("functionname", "") or "")) != want_key:
             continue
         rows.append(normalize_row(r))
     return pd.DataFrame(rows)
 
 
-def lookup_curve(vs: Sequence[np.ndarray], n_val: int, ks: Sequence[int]) -> List[dict]:
-    """Model-free reference: the set-MAE-optimal CONSTANT from the first K labels.
+def lookup_curve(V: np.ndarray, pool_idx: np.ndarray, val_idx: np.ndarray,
+                 is_eval: np.ndarray, ks: Sequence[int]) -> List[dict]:
+    """Model-free reference: the set-MAE-optimal CONSTANT from the first K support
+    labels, scored on the same query rows the models are scored on.
 
-    Within a single function the ``(driver x function)`` lookup of
-    ``baseline_lookup`` collapses to exactly one number per driver, so this is
-    that baseline's within-function form rather than a new one -- ``best_constant``
-    is imported from it, not reimplemented.
+    Under ``--support-scope function`` every support label is already the target
+    function, so this is one constant per driver. Under ``all`` the support spans
+    five functions and the rule becomes the target function's CELL of
+    ``baseline_lookup``'s ``driver x function`` table: the constant is taken from
+    the eval-function labels among the first K, falling back to all K labels when
+    the budget has not yet reached one -- which is exactly ``predict``'s
+    ``driver_c`` fallback, not a new rule.
 
-    It is scored on the SAME ``vs`` array the model is scored on, not re-derived
-    from the labels CSV. That matters: ``build_segments`` drops segments with
-    missing or all-zero ``Level_*``, so a baseline read independently from the CSV
-    could be evaluated on a slightly different set and the comparison would be
-    off by whatever those segments contain.
+    Scored on the SAME ``V`` the models are scored on rather than re-derived from
+    the labels CSV: ``build_segments`` drops segments with missing or all-zero
+    ``Level_*``, so a baseline read independently could land on a different set.
 
-    K=0 is omitted deliberately -- with no labels there is no constant to pick,
-    and inventing one (a cohort mode) would give the baseline population
-    information the K=0 model row does not have.
+    K=0 is omitted deliberately -- with no labels there is no constant to pick, and
+    inventing one (a cohort mode) would hand the baseline population information
+    the K=0 model row does not have.
     """
-    V = np.stack(vs, axis=0)
-    pool, val = V[: len(V) - n_val], V[len(V) - n_val:]
+    val = V[val_idx]
     out = []
     for k in ks:
-        if k < 1 or k > len(pool):
+        if k < 1 or k > len(pool_idx):
             continue
-        c = best_constant(pool[:k])
+        take = pool_idx[:k]
+        cell = take[is_eval[take]]
+        c = best_constant(V[cell]) if len(cell) else best_constant(V[take])
         if c is None:
             continue
         pred = np.full(len(val), c, dtype=int)
-        out.append({"k": k, "set_mae": set_mae(val, pred),
-                    "set_acc": set_accuracy(val, pred), "constant": int(c)})
+        out.append({"k": int(k), "set_mae": set_mae(val, pred),
+                    "set_acc": set_accuracy(val, pred), "constant": int(c),
+                    "n_support_eval_fn": int(len(cell))})
     return out
 
 
-def curve_for_arm(ckpt: pathlib.Path, df: pd.DataFrame, tau: float, val_frac: float,
-                  steps: int, lr: float, embed_fcd: bool, device: str,
-                  k_step: int) -> Tuple[List[dict], dict]:
-    """Every integer K from 0 to the pool size, for ONE driver and ONE arm.
+def k_grid(n_pool: int, dense: bool, k_step: int) -> List[int]:
+    """The K values to evaluate.
+
+    ``dense`` = every integer (times ``k_step``), which is what a 13-22 segment
+    pool needs -- ``K_GRID_BASE`` tops out at 60 and would return ~10 usable
+    points with gaps exactly where the curve moves. Under ``--support-scope all``
+    the pool is ~90 and the standard grid is preferable instead: it costs 17
+    points rather than 90, and it puts this curve on the SAME K values as the
+    pooled sweeps, so the two are read off the same x-axis.
+    """
+    if dense:
+        return list(range(1, n_pool + 1, max(1, k_step)))
+    return [int(k) for k in pick_sweep_points(n_pool, 0, n_pool)]
+
+
+def curve_for_arm(ckpt: pathlib.Path, df: pd.DataFrame, want_key: str, tau: float,
+                  val_frac: float, steps: int, lr: float, embed_fcd: bool,
+                  device: str, k_step: int, support_scope: str,
+                  dense: bool) -> Tuple[List[dict], dict]:
+    """The K curve for ONE driver and ONE arm, evaluated on ``want_key`` only.
+
+    THE SPLIT IS DEFINED ON THE EVAL FUNCTION IN BOTH SCOPES, deliberately. The
+    query tail is the chronologically-last ``val_frac`` of the driver's
+    ``want_key`` segments, whatever the support scope is, so the two scopes are
+    scored on the IDENTICAL query rows and can be differenced cell by cell. Only
+    the support changes:
+
+      * ``function`` -- the ``want_key`` segments before the tail (13-22 of them);
+      * ``all``      -- EVERY segment before the tail (~90), which is what the live
+        study actually serves, since a participant's K labels come from their
+        population session and nothing in that design filters by function.
+
+    "Before the tail" is a position in the driver's full chronological ordering,
+    not within the function, so no support segment is ever recorded after the
+    first query segment under either scope. That is what keeps the temporal
+    guarantee when the support spans functions.
 
     The backbone runs once. Everything after ``embed_segments`` is a ~260-parameter
-    convex fit on a (K x 76) tensor, which is why the dense grid is affordable.
+    convex fit on a (K x 76) tensor, which is why a dense grid is affordable.
     """
+    from ProVoice.fcd_config import resolve_function_key
     model, arch = load_checkpoint(str(ckpt))
     install_fcd_head(model, embed_fcd)
     # ORDER MATTERS, and BOTH halves do. install_fcd_head builds a new Linear on
@@ -195,37 +235,62 @@ def curve_for_arm(ckpt: pathlib.Path, df: pd.DataFrame, tau: float, val_frac: fl
     if n_seg < 4:
         return [], {"gids": gids, "n_seg": n_seg, "skip": "fewer than 4 segments"}
 
+    # Which segments are the eval function. Taken from the dataframe by segment_id
+    # rather than by position, because build_segments SKIPS segments with missing
+    # or all-zero labels -- so its output is not index-aligned with a groupby of
+    # the input, and a positional mask would silently shift.
+    fn_by_gid = df.groupby("segment_id", sort=False)["functionname"].first()
+    is_eval = np.array([resolve_function_key(str(fn_by_gid.get(g, "") or "")) == want_key
+                        for g in gids])
+    eval_idx = np.flatnonzero(is_eval)
+    if len(eval_idx) < 3:
+        return [], {"gids": gids, "n_seg": n_seg,
+                    "skip": f"only {len(eval_idx)} segment(s) of {want_key!r}"}
+
     Z = embed_segments(model, Xs, vs, arch["context_length"], device)
     V = torch.from_numpy(np.stack(vs, axis=0))
     pop_head = model.head.to(Z.device)
 
-    # The tail is the chronologically LAST val_frac of this function's segments --
-    # not of the driver's session. Those are different sets: phone-call windows are
-    # interleaved with the other four functions, so this tail spans most of the
-    # session in wall-clock terms while containing only phone-call labels. That is
-    # the correct query set for a study that deploys on this function alone.
-    n_val = max(1, round(val_frac * n_seg))
-    n_pool = n_seg - n_val
-    Zpool, Vpool = Z[:n_pool], V[:n_pool]
-    Zval, Vval = Z[n_pool:], V[n_pool:]
+    n_val = max(1, round(val_frac * len(eval_idx)))
+    val_idx = eval_idx[len(eval_idx) - n_val:]
+    cut = int(val_idx[0])                      # first query segment, full ordering
+    keep = np.arange(n_seg) < cut
+    if support_scope == "function":
+        keep &= is_eval
+    pool_idx = np.flatnonzero(keep)
+    n_pool = len(pool_idx)
+    if n_pool < 1:
+        return [], {"gids": gids, "n_seg": n_seg, "skip": "empty support pool"}
+
+    Zpool, Vpool = Z[pool_idx], V[pool_idx]
+    Zval, Vval = Z[val_idx], V[val_idx]
 
     base = evaluate(pop_head, Zval, Vval, head_type)
     rows = [{"k": 0, "set_mae": base["mae"], "set_acc": base["acc"],
              "set_qwk": base["qwk"], "set_macro_f1": base["f1"],
-             "grad_norm": 0.0, "l2sp": 0.0, "adapt_steps": 0}]
-    for k in range(1, n_pool + 1, max(1, k_step)):
+             "grad_norm": 0.0, "l2sp": 0.0, "adapt_steps": 0,
+             "n_support_eval_fn": 0}]
+    ks = k_grid(n_pool, dense, k_step)
+    for k in ks:
         head, info = adapt_head(pop_head, Zpool[:k], Vpool[:k], tau=tau,
                                 head_type=head_type, steps=steps, lr=lr)
         m = evaluate(head, Zval, Vval, head_type)
-        rows.append({"k": k, "set_mae": m["mae"], "set_acc": m["acc"],
+        rows.append({"k": int(k), "set_mae": m["mae"], "set_acc": m["acc"],
                      "set_qwk": m["qwk"], "set_macro_f1": m["f1"],
                      "grad_norm": info["grad_norm"], "l2sp": info["l2sp"],
-                     "adapt_steps": int(info["steps"])})
+                     "adapt_steps": int(info["steps"]),
+                     # How many of the K support labels are the eval function. Under
+                     # scope=all this is ~K/5, and it is the number that makes the two
+                     # scopes comparable at equal INFORMATION rather than equal K.
+                     "n_support_eval_fn": int(is_eval[pool_idx[:k]].sum())})
     meta = {"gids": gids, "n_seg": n_seg, "n_pool": n_pool, "n_val": n_val,
+            "n_eval_seg": int(len(eval_idx)),
             "base_set_mae": base["mae"], "base_set_acc": base["acc"],
             "head_in": int(pop_head.in_features),
             "embed_fcd": int(pop_head.in_features > model.embedding_dim),
-            "head_type": head_type, "vs": vs, "skip": None}
+            "head_type": head_type, "skip": None,
+            "V": V.numpy(), "pool_idx": pool_idx, "val_idx": val_idx,
+            "is_eval": is_eval, "ks": ks}
     return rows, meta
 
 
@@ -240,21 +305,27 @@ def sweep_drivers(pids: Sequence[str], src: pathlib.Path, want_key: str,
     reaching both arms, which is what makes the comparison paired at the segment
     level rather than merely at the driver level.
     """
+    scope = args.support_scope
+    dense = args.k_grid == "dense"
     out: List[dict] = []
     for pid in pids:
-        df = load_driver_rows(src, pid, want_key)
+        # scope=all needs every function in the pool, so the function filter moves
+        # from the reader into curve_for_arm, which applies it to the SUPPORT only
+        # and never to the query tail.
+        df = load_driver_rows(src, pid, None if scope == "all" else want_key)
         if df.empty:
-            print(f"[{pid}] no rows for {want_key!r} — SKIPPED", flush=True)
+            print(f"[{pid}] no rows — SKIPPED", flush=True)
             continue
 
-        seen_gids, seen_vs, per_arm = None, None, {}
+        seen_gids, per_arm, ref = None, {}, None
         for arm in ARMS:
             ck = ckpt_dirs[arm] / f"{prefixes[arm]}{pid}.pt"
             if not ck.exists():
                 print(f"[{pid}][{arm}] no checkpoint at {ck} — SKIPPED", flush=True)
                 continue
-            rows, meta = curve_for_arm(ck, df, tau, args.val_frac, args.steps,
-                                       args.lr, args.embed_fcd, device, args.k_step)
+            rows, meta = curve_for_arm(ck, df, want_key, tau, args.val_frac,
+                                       args.steps, args.lr, args.embed_fcd, device,
+                                       args.k_step, scope, dense)
             if meta.get("skip"):
                 print(f"[{pid}][{arm}] {meta['skip']} — SKIPPED", flush=True)
                 continue
@@ -267,7 +338,7 @@ def sweep_drivers(pids: Sequence[str], src: pathlib.Path, want_key: str,
             # the kind of invariant that breaks quietly when someone rebuilds one
             # arm alone.
             if seen_gids is None:
-                seen_gids, seen_vs = meta["gids"], meta["vs"]
+                seen_gids, ref = meta["gids"], meta
             elif meta["gids"] != seen_gids:
                 raise SystemExit(
                     f"[{pid}] the arms disagree on the segment set: "
@@ -277,23 +348,27 @@ def sweep_drivers(pids: Sequence[str], src: pathlib.Path, want_key: str,
             per_arm[arm] = meta
             for r in rows:
                 out.append({"pid": pid, "arm": arm, "function": want_key,
-                            "n_seg": meta["n_seg"], "n_pool": meta["n_pool"],
-                            "n_val": meta["n_val"],
+                            "support_scope": scope,
+                            "n_seg": meta["n_seg"], "n_eval_seg": meta["n_eval_seg"],
+                            "n_pool": meta["n_pool"], "n_val": meta["n_val"],
                             "base_set_mae": meta["base_set_mae"],
+                            "base_set_acc": meta["base_set_acc"],
                             "head_in": meta["head_in"],
                             "embed_fcd": meta["embed_fcd"], "tau": tau, **r})
-            print(f"[{pid}][{arm}] n_seg={meta['n_seg']} pool={meta['n_pool']} "
-                  f"tail={meta['n_val']} floor={meta['base_set_mae']:.3f} "
-                  f"K=1..{meta['n_pool']}", flush=True)
+            print(f"[{pid}][{arm}] segs={meta['n_seg']} ({meta['n_eval_seg']} of "
+                  f"{want_key!r}) pool={meta['n_pool']} tail={meta['n_val']} "
+                  f"floor={meta['base_set_mae']:.3f} K={min(meta['ks'])}..{max(meta['ks'])}",
+                  flush=True)
 
-        if args.with_lookup and seen_gids is not None:
-            m0 = next(iter(per_arm.values()))
-            for r in lookup_curve(seen_vs, m0["n_val"], range(1, m0["n_pool"] + 1,
-                                                              max(1, args.k_step))):
+        if args.with_lookup and ref is not None:
+            for r in lookup_curve(ref["V"], ref["pool_idx"], ref["val_idx"],
+                                  ref["is_eval"], ref["ks"]):
                 out.append({"pid": pid, "arm": "lookup", "function": want_key,
-                            "n_seg": m0["n_seg"], "n_pool": m0["n_pool"],
-                            "n_val": m0["n_val"],
-                            "base_set_mae": m0["base_set_mae"],
+                            "support_scope": scope,
+                            "n_seg": ref["n_seg"], "n_eval_seg": ref["n_eval_seg"],
+                            "n_pool": ref["n_pool"], "n_val": ref["n_val"],
+                            "base_set_mae": ref["base_set_mae"],
+                            "base_set_acc": ref["base_set_acc"],
                             "head_in": -1, "embed_fcd": -1, "tau": float("nan"),
                             "set_qwk": float("nan"), "set_macro_f1": float("nan"),
                             "grad_norm": 0.0, "l2sp": 0.0, "adapt_steps": 0, **r})
@@ -552,6 +627,26 @@ def main() -> None:
                          "identical rather than tuned down: a residual difference between "
                          "the arms at the same K biases the comparison.")
     ap.add_argument("--lr", type=float, default=DEFAULT_ADAPT_LR)
+    ap.add_argument("--support-scope", dest="support_scope",
+                    choices=("function", "all"), default="function",
+                    help="What the K personalization labels are drawn from. "
+                         "'function' (default): only the target function's labels -- "
+                         "measures a hypothetical phone-call-only support. 'all': EVERY "
+                         "function's labels, which is what the live study actually "
+                         "serves, since a participant's K labels come from their "
+                         "population session and nothing in that design filters by "
+                         "function. The QUERY TAIL is the target function's last "
+                         "--val-frac in BOTH cases, so the two scopes are scored on "
+                         "identical rows and can be differenced cell by cell. 'all' also "
+                         "lifts the K ceiling from ~13 to ~90, because the pool is the "
+                         "driver's whole session rather than one function's slice.")
+    ap.add_argument("--k-grid", dest="k_grid", choices=("dense", "standard"),
+                    default="dense",
+                    help="'dense' = every integer K (right for a 13-22 segment pool). "
+                         "'standard' = sweep_train_frac.K_GRID_BASE, which is what "
+                         "--support-scope all wants: 17 points instead of ~90, on the "
+                         "SAME K values as the pooled sweeps so the curves share an "
+                         "x-axis.")
     ap.add_argument("--k-step", dest="k_step", type=int, default=1,
                     help="Stride of the dense K grid (default 1 = every integer K). The "
                          "pools are 13-22 segments, so every K is affordable and the "
@@ -592,7 +687,11 @@ def main() -> None:
         if not sel or "tau" not in sel:
             raise SystemExit(f"No tau (expected {args.selected_tau}); pass --tau.")
         tau = float(sel["tau"])
-    print(f"[function] {want_key!r}")
+    print(f"[function] {want_key!r}  (evaluated on this function's tail only)")
+    print(f"[support]  {args.support_scope}"
+          + ("  — K labels drawn from EVERY function, as the live study serves"
+             if args.support_scope == "all"
+             else "  — K labels drawn from this function only"))
     print(f"[tau] {tau:g} - frozen, the SAME value for both arms; nothing is selected here")
 
     ckpt_dirs = {"l2sp": pathlib.Path(args.l2sp_ckpt_dir),
