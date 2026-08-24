@@ -324,12 +324,22 @@ _ASSISTANT_LINE = {
 # the veto KEEPS it, so cancelling connects rather than hangs up. That is not an
 # inconsistency with the genuine call -- it is the same rule (the veto does the
 # opposite of the announced action) applied to an announcement that has flipped.
+#
+# "POSSIBLE", NOT "SUSPECTED". A TTS constraint, not a wording preference:
+# "suspected" is se-SPEC-ted, an unstressed initial syllable, and neural TTS
+# reduces hardest exactly there -- at the start of an utterance there is no
+# preceding context to carry it. The rendered clip dropped the /se/ outright and
+# landed as "spected spam call"; the file was not truncated (66 ms of lead-in
+# silence, same as the genuine lines), the model simply never voiced it. Any
+# replacement wording must also be stressed on its FIRST syllable. The screen
+# text and the clip move together -- a driver should not have to translate
+# between the word they hear and the word they see.
 _SPAM_LINE = {
     0: None,
-    1: 'Suspected spam call.',
-    2: 'Suspected spam call. Want me to reject it?',
-    3: 'Suspected spam call. Rejecting in 3… 2… 1…',
-    4: 'Suspected spam call. Rejecting now.',
+    1: 'Possible spam call.',
+    2: 'Possible spam call. Want me to reject it?',
+    3: 'Possible spam call. Rejecting in 3… 2… 1…',
+    4: 'Possible spam call. Rejecting now.',
 }
 
 # The number shown instead of a contact name. AT LoA 0 THE ASSISTANT SAYS
@@ -583,7 +593,7 @@ class CallEvent(object):
                 (_ASSISTANT_LINE, self.caller_name,
                  'Call from %s. Answering in 3…'),
                 (_SPAM_LINE, self.spam_caller_name,
-                 'Suspected spam call. Rejecting in 3…')):
+                 'Possible spam call. Rejecting in 3…')):
             for loa, tmpl in table.items():
                 if not tmpl:
                     continue
@@ -640,7 +650,7 @@ class CallEvent(object):
             - PANEL_ICON_GAP
 
         # How many rows the longest line needs ONCE the width is known. The
-        # width clamp can force a wrap ("Suspected spam call. Want me to reject
+        # width clamp can force a wrap ("Possible spam call. Want me to reject
         # it?" does not fit on one row at 0.34 w), and the panel is then two
         # rows taller in EVERY rendering, not only the ones that wrap.
         rows = max([len(self._wrap(s, self._font_text, self._text_inner))
@@ -1281,7 +1291,7 @@ class CallEvent(object):
         # leads with its ASSESSMENT rather than the caller, because the number
         # is not a name and reading it aloud would be both unnatural and the
         # single longest string in the layout.
-        head = ('Suspected spam call.' if self.spam
+        head = ('Possible spam call.' if self.spam
                 else 'Call from %s.' % self.caller_name)
 
         if self.state == RINGING:

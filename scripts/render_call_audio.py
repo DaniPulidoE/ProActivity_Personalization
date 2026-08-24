@@ -115,11 +115,20 @@ LINES = {
 # It leads with the assessment rather than the caller because there is no
 # caller name to lead with: the display shows a number, and reading a number
 # aloud would be both unnatural and the longest string in the layout.
+#
+# "POSSIBLE", NOT "SUSPECTED", and that is a TTS constraint rather than a
+# wording preference. "Suspected" is se-SPEC-ted: an unstressed initial
+# syllable, which is exactly where neural TTS reduces hardest, and at the START
+# of an utterance there is no preceding context to carry it. The rendered clip
+# lost the /se/ outright and landed as "spected spam call" -- the files were not
+# truncated (66 ms of lead-in silence, same as the genuine lines), the model
+# simply never voiced it. "Possible" is stressed on its first syllable, so the
+# failure mode cannot arise. Any replacement must keep that property.
 SPAM_LINES = {
-    'spam1_line.wav': 'Suspected spam call.',
-    'spam2_line.wav': 'Suspected spam call. Want me to reject it?',
-    'spam3_line.wav': 'Suspected spam call. Rejecting unless you cancel.',
-    'spam4_line.wav': 'Suspected spam call. Rejecting now.',
+    'spam1_line.wav': 'Possible spam call.',
+    'spam2_line.wav': 'Possible spam call. Want me to reject it?',
+    'spam3_line.wav': 'Possible spam call. Rejecting unless you cancel.',
+    'spam4_line.wav': 'Possible spam call. Rejecting now.',
 }
 
 # The caller, once the call is answered. Same everywhere a call connects,
@@ -133,12 +142,19 @@ CALLER_LINE = ('caller_reply.wav',
 # unreachable, and a connected call with silence on the line reads as a bug
 # rather than as a decision the driver made.
 #
-# A recognisable cold-open pitch, cut short by the auto hang-up. It must not be
-# funny: a line that gets a laugh would make the spam call memorable in its own
-# right and change how the driver treats the block around it.
+# A recognisable cold-open pitch. ONE COMPLETE SENTENCE, deliberately: the first
+# draft trailed off into "Our records show..." on the assumption the auto
+# hang-up would cut it, but CONNECTED_HOLD_S is longer than the clip, so the
+# fragment played in full and simply stopped -- which reads as a broken file
+# rather than as a call being ended. If a cut-off effect is ever wanted it has
+# to come from shortening the hold, not from writing an unfinished line.
+#
+# It must also not be funny: a line that gets a laugh would make the spam call
+# memorable in its own right and change how the driver treats the block around
+# it.
 SPAM_CALLER_LINE = ('spam_reply.wav',
                     'Hello, this is an important message about your vehicle '
-                    'warranty. Our records show...')
+                    'warranty.')
 
 
 def pick_voice(engine, wanted):
