@@ -9,11 +9,15 @@ arming rules, 9 the log schema).
 
 WHAT THIS OWNS AND WHAT IT DOES NOT
 -----------------------------------
-This module decides WHEN a call fires and WHICH LoA it carries, and it writes
-the outcome. ``call_event.CallEvent`` owns the interaction itself and knows
-nothing about schedules, blocks or conditions. Keeping the split means the five
-renderings can be exercised standalone while the schedule stays testable on its
-own clock.
+This module decides WHEN a call fires, WHICH LoA it carries, and WHETHER it is
+the block's spam call, and it writes the outcome. ``call_event.CallEvent`` owns
+the interaction itself and knows nothing about schedules, blocks or conditions.
+Keeping the split means the renderings can be exercised standalone while the
+schedule stays testable on its own clock.
+
+The spam call is decided HERE and never by the model: if the prediction chose
+which calls were spam, the manipulation would be confounded with the very thing
+it exists to probe. See the SPAM CALL block below.
 
 THE DRIVE PROCESS DOES NOT LOAD A MODEL
 ---------------------------------------
@@ -62,9 +66,44 @@ CALL_EVENT_COLUMNS = (
     'logged_ts', 'call_onset_ts', 'loa_frame_ts', 'loa_age_ms',
     'session_id', 'participantid', 'block_idx', 'k_condition',
     'call_idx', 'loa_source', 'served_loa', 'checkpoint_id',
+    'call_kind', 'proposed_action',
     'event_onset_ms', 'speed_kmh_at_onset', 'driver_response', 'input_mode',
     'response_latency_ms', 'outcome', 'skipped_reason',
 )
+
+# --- The spam call -----------------------------------------------------------
+#
+# Exactly ONE call per block is a suspected spam call, and it is NEVER the first.
+#
+# WHY ONE, AND WHY NOT THE FIRST
+# ------------------------------
+# One, because it is a probe and not a condition: five calls per block is
+# already the whole budget for the K contrast, and spending two of them on the
+# inverted proposal would halve the sample for the thing the block exists to
+# measure. Never the first, because the first call is where the driver learns
+# what the interface does at all -- meeting the inverted proposal before the
+# ordinary one would make the exception the reference point, and a driver who
+# then treated later genuine calls as suspicious would contaminate the other
+# four.
+#
+# WHY IT IS DRAWN PER BLOCK, NOT FIXED PER DRIVER
+# -----------------------------------------------
+# A driver sees three blocks. If the spam call sat at the same position in all
+# three, they would have every chance to notice -- "the third call is always the
+# dodgy one" -- and by block 3 would be responding to the schedule rather than
+# to the assistant. Redrawing per block costs nothing in balance: each block
+# still contains exactly one spam and four genuine calls, so the K conditions
+# remain identical in composition and differ only in where the spam call falls.
+# Position is not the manipulation; the proposal is.
+#
+# Pass an explicit index to pin it (a reviewer wanting to see one rung) -- the
+# value is written to every row either way, so a pinned block is identifiable.
+SPAM_FIRST_ELIGIBLE_CALL = 2
+# Offset for the spam draw's RNG, so choosing the position does not consume a
+# value from the jitter stream. Sharing one generator made the call TIMES depend
+# on the spam index, which would have made two --study-seed runs that differed
+# only in spam position incomparable.
+_SPAM_SEED_OFFSET = 7919
 
 # Presets. --short-trial exists so the whole path -- arming, gating, rendering,
 # input, logging -- can be walked in two minutes instead of ten.
@@ -171,7 +210,8 @@ class StudySession(object):
 
     def __init__(self, source, duration_s, n_calls, interval_s, jitter_s,
                  warmup_s=None, seed=None, log_path=None, session_id='',
-                 participantid='', block_idx='', k_condition=''):
+                 participantid='', block_idx='', k_condition='',
+                 spam_call_idx=None):
         self.source = source
         self.duration_ms = float(duration_s) * 1000.0
         self.n_calls = int(n_calls)
@@ -188,6 +228,20 @@ class StudySession(object):
         self.participantid = participantid
         self.block_idx = block_idx
         self.k_condition = k_condition
+
+        # 0 disables the spam call entirely (and is what a block with fewer
+        # than two calls gets, since there is then no eligible position);
+        # -1 makes EVERY call spam, which only --test-spam sets and which is
+        # never a study configuration.
+        if spam_call_idx is None:
+            hi = self.n_calls
+            spam_call_idx = (
+                random.Random(None if seed is None
+                              else seed + _SPAM_SEED_OFFSET
+                              ).randint(SPAM_FIRST_ELIGIBLE_CALL, hi)
+                if hi >= SPAM_FIRST_ELIGIBLE_CALL else 0)
+        self.spam_call_idx = int(spam_call_idx)
+        self.spam_fired = False
 
         self.started_ms = None
         self.calls_fired = 0
@@ -248,8 +302,33 @@ class StudySession(object):
             return 'just_started_moving'
         return None
 
+    def _is_spam(self, idx):
+        """Is call number `idx` the block's spam call?"""
+        return self.spam_call_idx == -1 or idx == self.spam_call_idx
+
+    def _rescue_spam_slot(self):
+        """Move the spam call to the next remaining position after a skip.
+
+        The spam call is 1 of 5 and it is the ONLY trial in the block where
+        agreeing with the assistant and doing nothing come apart. Letting a red
+        light or a stale decision delete it would cost the block that contrast
+        entirely, and silently -- the row would just say `skipped`. Every
+        surviving position is equally valid (the constraint was only "not the
+        first"), so the slot moves rather than being lost.
+
+        Returns False when the skipped call was the last eligible one; the
+        block then simply has no spam call, which `summary()` says out loud.
+        """
+        if self.spam_call_idx <= 0 or self.spam_fired:
+            return False        # disabled, --test-spam (-1), or already had one
+        if self.call_idx + 1 > self.n_calls:
+            self.spam_call_idx = 0
+            return False
+        self.spam_call_idx = self.call_idx + 1
+        return True
+
     def update(self, now_ms, speed_kmh, popup_active, call_active, read_status):
-        """Returns (loa, call_idx) when a call should be armed, else None."""
+        """Returns (loa, call_idx, is_spam) when to arm a call, else None."""
         if self.started_ms is None or self._due_ms is None:
             return None
         if now_ms < self._due_ms:
@@ -261,10 +340,7 @@ class StudySession(object):
         held = self._gate(now_ms, speed_kmh, popup_active, call_active)
         if held is not None:
             if (now_ms - self._due_since_ms) >= MAX_DEFER_S * 1000.0:
-                self._write_skip(now_ms, held, speed_kmh)
-                self.call_idx += 1
-                self.calls_skipped += 1
-                self._schedule(now_ms)
+                self._skip(now_ms, held, speed_kmh)
             else:
                 self._due_ms = now_ms + DEFER_RETRY_S * 1000.0
             return None
@@ -274,17 +350,18 @@ class StudySession(object):
             # No decision is NOT a reason to invent one. The window is written
             # off with its reason, which is recoverable in analysis; a
             # fabricated LoA would be indistinguishable from a served one.
-            self._write_skip(now_ms, reason or 'no_decision', speed_kmh)
-            self.call_idx += 1
-            self.calls_skipped += 1
-            self._schedule(now_ms)
+            self._skip(now_ms, reason or 'no_decision', speed_kmh)
             return None
 
         self.call_idx += 1
         self.calls_fired += 1
+        is_spam = self._is_spam(self.call_idx)
+        if is_spam:
+            self.spam_fired = True
         self._pending = {
             'call_idx': self.call_idx,
             'served_loa': loa,
+            'call_kind': 'spam' if is_spam else 'genuine',
             'loa_age_ms': self.source.last_age_ms,
             'loa_frame_ts': self.source.last_frame_ts,
             'checkpoint_id': self.source.last_checkpoint,
@@ -293,7 +370,7 @@ class StudySession(object):
             'speed_kmh_at_onset': round(speed_kmh, 1) if speed_kmh is not None else '',
         }
         self._schedule(now_ms)
-        return loa, self.call_idx
+        return loa, self.call_idx, is_spam
 
     def note_outcome(self, outcome, now_ms, input_mode='wheel'):
         """Called with CallEvent's outcome dict when the interaction resolves."""
@@ -304,6 +381,11 @@ class StudySession(object):
             'driver_response': outcome.get('driver_response', ''),
             'response_latency_ms': outcome.get('response_latency_ms', ''),
             'outcome': outcome.get('outcome', ''),
+            # From the EVENT, not from _pending: the schedule knows which call
+            # was meant to be spam, but only the event knows what it actually
+            # rendered and therefore what it proposed.
+            'call_kind': outcome.get('call_kind', row.get('call_kind', '')),
+            'proposed_action': outcome.get('proposed_action', ''),
             'input_mode': input_mode,
             'skipped_reason': '',
         })
@@ -311,14 +393,27 @@ class StudySession(object):
 
     # -- logging -------------------------------------------------------------
 
-    def _write_skip(self, now_ms, reason, speed_kmh):
+    def _skip(self, now_ms, reason, speed_kmh):
+        """Write off the due call, advance, and rehome the spam slot if needed."""
+        idx = self.call_idx + 1
+        was_spam = self._is_spam(idx)
         self._write({
-            'call_idx': self.call_idx + 1,
+            'call_idx': idx,
             'served_loa': '',
+            'call_kind': 'spam' if was_spam else 'genuine',
             'skipped_reason': reason,
             'speed_kmh_at_onset': round(speed_kmh, 1) if speed_kmh is not None else '',
         })
-        print('[study] call %d SKIPPED (%s)' % (self.call_idx + 1, reason))
+        self.call_idx += 1
+        self.calls_skipped += 1
+        note = ''
+        if was_spam:
+            note = (' -- the SPAM call moves to call %d' % (self.call_idx + 1)
+                    if self._rescue_spam_slot()
+                    else ' -- it was the SPAM call and there is no later slot; '
+                         'this block has none')
+        print('[study] call %d SKIPPED (%s)%s' % (idx, reason, note))
+        self._schedule(now_ms)
 
     def _write(self, row):
         if not self.log_path:
@@ -348,6 +443,15 @@ class StudySession(object):
     def summary(self):
         base = ('%d call(s) fired, %d skipped, of %d planned'
                 % (self.calls_fired, self.calls_skipped, self.n_calls))
+        if not self.spam_fired:
+            # Said out loud rather than left to the CSV. The spam call is the
+            # only trial that separates agreeing with the assistant from doing
+            # nothing, so a block without one is not a complete block -- and
+            # that is worth knowing while the participant is still in the room.
+            base += (' -- NO SPAM CALL was delivered in this block'
+                     if self.spam_call_idx <= 0 else
+                     ' -- the SPAM call (slot %d) never fired'
+                     % self.spam_call_idx)
         if self.overran:
             base += (' -- ENDED ON THE OVERRUN GUARD at %.0f x the nominal '
                      'duration, so calls are MISSING; check how much of the '

@@ -103,10 +103,42 @@ LINES = {
     'loa4_line.wav': 'Call from {caller}. Answering now.',
 }
 
+# The SPAM call's lines: one call per block, same five rungs, the assistant's
+# proposal inverted from answer to reject. See call_event.py's spam block for
+# why that inversion is the point.
+#
+# The wording deliberately mirrors the genuine set clause for clause -- lead
+# with what is calling, then what I propose to do -- so the two differ in the
+# PROPOSAL and not in how much the assistant says. A longer or more elaborate
+# spam line would make salience, not autonomy, the thing that changed.
+#
+# It leads with the assessment rather than the caller because there is no
+# caller name to lead with: the display shows a number, and reading a number
+# aloud would be both unnatural and the longest string in the layout.
+SPAM_LINES = {
+    'spam1_line.wav': 'Suspected spam call.',
+    'spam2_line.wav': 'Suspected spam call. Want me to reject it?',
+    'spam3_line.wav': 'Suspected spam call. Rejecting unless you cancel.',
+    'spam4_line.wav': 'Suspected spam call. Rejecting now.',
+}
+
 # The caller, once the call is answered. Same everywhere a call connects,
 # including after a manual ACCEPT at LoA 0/1, so only the PATH to the outcome
 # varies between conditions.
-CALLER_LINE = ('caller_reply.wav', 'Hey, are you still coming tonight?')
+CALLER_LINE = ('caller_reply.wav',
+               'Hey there, how is everything going? Just wanted to catch up.')
+
+# ...and the spam caller, on the rare path where the driver puts one through
+# (accept at LoA 0/1, "No" at LoA 2, cancel at LoA 3). Rare is not the same as
+# unreachable, and a connected call with silence on the line reads as a bug
+# rather than as a decision the driver made.
+#
+# A recognisable cold-open pitch, cut short by the auto hang-up. It must not be
+# funny: a line that gets a laugh would make the spam call memorable in its own
+# right and change how the driver treats the block around it.
+SPAM_CALLER_LINE = ('spam_reply.wav',
+                    'Hello, this is an important message about your vehicle '
+                    'warranty. Our records show...')
 
 
 def pick_voice(engine, wanted):
@@ -174,7 +206,7 @@ def render_sapi(jobs, outdir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--engine', choices=('piper', 'sapi'), default='piper')
-    ap.add_argument('--caller', default='Daniel',
+    ap.add_argument('--caller', default='Sam',
                     help='Caller name spoken in every line. Keep it FIXED and '
                          'neutral across the whole study (default: %(default)s).')
     ap.add_argument('--voice', default=None,
@@ -242,7 +274,14 @@ def main():
     c_arg = args.caller_speaker if args.engine == 'piper' else args.caller_rate
     jobs = [(name, text.format(caller=args.caller), assistant, a_arg)
             for name, text in sorted(LINES.items())]
+    jobs += [(name, text, assistant, a_arg)
+             for name, text in sorted(SPAM_LINES.items())]
     jobs.append((CALLER_LINE[0], CALLER_LINE[1], caller, c_arg))
+    # The spam caller gets the SAME voice as the genuine one. Giving it a third
+    # speaker would let the driver identify a spam call from the first syllable
+    # of the reply -- but by then they have already decided, so it would only
+    # add a cue after the measurement, at the cost of another voice to licence.
+    jobs.append((SPAM_CALLER_LINE[0], SPAM_CALLER_LINE[1], caller, c_arg))
 
     if args.engine == 'piper':
         render_piper(jobs, outdir, model_dir)

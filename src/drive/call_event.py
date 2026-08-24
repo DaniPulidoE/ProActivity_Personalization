@@ -230,7 +230,17 @@ DEFAULT_ONSET_OFFSET_S = 0.0   # from arm() to the phone ringing
 DEFAULT_CAP_S = 8.0            # ringing -> forced timeout, for the input rungs
 RING_LEAD_S = 1.2              # ring alone before the assistant speaks or acts
 COUNTDOWN_S = 3.0              # LoA 3 only
-CONNECTED_HOLD_S = 3.0         # caller's canned reply, then auto hang-up
+# Caller's line, then auto hang-up. Must EXCEED the reply clip or the call cuts
+# off mid-sentence: at 3.0 s the 2.82 s "just wanted to catch up" line left 0.18 s
+# of headroom, and any edit to that text would have truncated it silently.
+# Re-check this whenever caller_reply.wav is re-rendered -- the script prints its
+# duration.
+CONNECTED_HOLD_S = 4.0
+# How long "call rejected" stays up after a spam call is turned away. Short: it
+# is an acknowledgement, not an interaction. But NOT zero -- at LoA 4 the
+# assistant says "rejecting now" and, without this, the panel would vanish on
+# the same tick, leaving the driver no confirmation that anything happened.
+REJECTED_HOLD_S = 1.8
 # Silence between the assistant finishing its line and the caller starting.
 # Without it the two overlap -- at LoA 4 the assistant says "Answering now" and
 # the caller speaks over the top of it, because the route enters CONNECTED on
@@ -255,6 +265,11 @@ COUNTDOWN = 'countdown'
 # wait here. Without this, LoA 4 displayed "connected 00:00" and played the
 # caller's reply while the assistant was still mid-sentence.
 ANSWERING = 'answering'
+# The spam mirror of ANSWERING: the assistant has committed to REJECTING and is
+# still saying so. Same reason for existing -- the call must not be shown as
+# gone while the sentence announcing it is still playing.
+REJECTING = 'rejecting'
+REJECTED = 'rejected'
 DONE = 'done'
 CONNECTED = 'connected'
 
@@ -281,6 +296,51 @@ _ASSISTANT_LINE = {
     4: 'Call from %s. Answering now.',
 }
 
+# --- Spam calls --------------------------------------------------------------
+#
+# Exactly ONE call per block is a suspected spam call, and never the first one;
+# the schedule owns that choice (study_session.py), not this module.
+#
+# WHAT A SPAM CALL CHANGES, AND WHAT IT DOES NOT
+# ----------------------------------------------
+# The ladder is untouched. Same five rungs, same owner of the screen at each,
+# same meaning for "no input": nothing happens at 0-2, the assistant's action
+# happens at 3-4. What flips is WHICH ACTION the assistant proposes -- answer
+# becomes reject. A spam call is the same instrument pointed the other way, not
+# a sixth condition.
+#
+# WHY IT IS WORTH THE BUILD
+# -------------------------
+# On a genuine call "the assistant did the right thing" and "the assistant did
+# the more autonomous thing" are the same observation, so a driver who is simply
+# passive is indistinguishable from one who agrees -- and passivity is exactly
+# what a driving task produces. On the spam call the correct action is to do
+# LESS, so the two come apart: pressing nothing at LoA 4 now means the system
+# was right, while pressing nothing at LoA 0 means the driver let a spam call
+# ring out. That is the only place in the block where the behavioural response
+# separates agreement from acquiescence.
+#
+# CONSEQUENCE FOR THE VETO RUNG. At LoA 3 the no-input path rejects the call and
+# the veto KEEPS it, so cancelling connects rather than hangs up. That is not an
+# inconsistency with the genuine call -- it is the same rule (the veto does the
+# opposite of the announced action) applied to an announcement that has flipped.
+_SPAM_LINE = {
+    0: None,
+    1: 'Suspected spam call.',
+    2: 'Suspected spam call. Want me to reject it?',
+    3: 'Suspected spam call. Rejecting in 3… 2… 1…',
+    4: 'Suspected spam call. Rejecting now.',
+}
+
+# The number shown instead of a contact name. AT LoA 0 THE ASSISTANT SAYS
+# NOTHING, so this display is the only cue the driver gets -- which is the whole
+# point of that rung -- and it therefore has to look like a genuine unrecognised
+# caller rather than announce itself as spam.
+#
+# +44 7700 900xxx is Ofcom's reserved drama range: never allocated to a
+# subscriber, so it cannot reach a real person if anyone ever dials it back.
+SPAM_CALLER_NAME = '+44 7700 900482'
+
 # Bitmap glyph for the receiver, dropped in beside the clips with its licence
 # recorded in assets/calls/manifest.json. Blitted AS DRAWN -- scaled and nothing
 # else. Override the file with PROVOICE_CALL_ICON.
@@ -299,6 +359,17 @@ _SOUND_FILES = {
     3: 'loa3_line.wav',
     4: 'loa4_line.wav',
     'reply': 'caller_reply.wav',
+    # Spam. Keyed 'spam<loa>' rather than by a (spam, loa) tuple so a missing
+    # file names itself in the warning. 'spam0' is absent for the same reason
+    # LoA 0 has no genuine line: silence IS the rendering.
+    'spam1': 'spam1_line.wav',
+    'spam2': 'spam2_line.wav',
+    'spam3': 'spam3_line.wav',
+    'spam4': 'spam4_line.wav',
+    # Only reachable when the driver answers a spam call anyway (accept at
+    # LoA 0/1, "No" is not enough at 2, cancel at 3). Rare, but it must not be
+    # silent -- a connected call with nobody on it reads as a bug.
+    'spam_reply': 'spam_reply.wav',
 }
 
 
@@ -440,10 +511,13 @@ class CallEvent(object):
     driving and the event is meant to be handled in traffic.
     """
 
-    def __init__(self, dim, assets_dir=None, caller_name='Daniel',
+    def __init__(self, dim, assets_dir=None, caller_name='Sam',
+                 spam_caller_name=SPAM_CALLER_NAME,
                  onset_offset_s=DEFAULT_ONSET_OFFSET_S, cap_s=DEFAULT_CAP_S,
                  enabled=True, chrome=None, input_mode=INPUT_WHEEL):
         self.dim = dim
+        self.spam_caller_name = spam_caller_name
+        self.spam = False
         self.chrome = chrome or PANEL_CHROME
         self.input_mode = (input_mode if input_mode in _PROMPT else INPUT_WHEEL)
         self.yes_key, self.no_key = _PROMPT[self.input_mode]
@@ -497,40 +571,58 @@ class CallEvent(object):
 
     # -- layout --------------------------------------------------------------
 
+    def _spoken_candidates(self):
+        """Every quoted assistant line the panel can ever draw, genuine + spam.
+
+        LoA 3's entry is the LIVE countdown ("Answering in 3…"), never the
+        three-digit template in _ASSISTANT_LINE -- measuring the template made
+        the panel ~25 % wider than anything it can display.
+        """
+        out = []
+        for table, who, live3 in (
+                (_ASSISTANT_LINE, self.caller_name,
+                 'Call from %s. Answering in 3…'),
+                (_SPAM_LINE, self.spam_caller_name,
+                 'Suspected spam call. Rejecting in 3…')):
+            for loa, tmpl in table.items():
+                if not tmpl:
+                    continue
+                tmpl = live3 if loa == 3 else tmpl
+                out.append('"%s"' % (tmpl % who if '%s' in tmpl else tmpl))
+        return out
+
     def _measure(self):
-        """Widest string any of the five renderings can produce, in pixels.
+        """Widest string any rendering can produce, in pixels.
 
         Every candidate is listed explicitly rather than measured lazily at draw
-        time, because the box must be identical in all five states -- sizing it
-        to whatever happens to be on screen would make the panel breathe between
-        conditions.
+        time, because the box must be identical in all TEN states (five rungs x
+        genuine/spam) -- sizing it to whatever happens to be on screen would
+        make the panel breathe between conditions, and since the spam call sits
+        at a different position in each block, a panel that resized for it would
+        announce itself before the driver had read a word.
         """
         if self._font_text is None:
             return 0
         cands = [(self._font_title, 'ASSISTANT'),
                  (self._font_title, 'INCOMING CALL'),
                  (self._font_text, '%s Answer         RECOMMENDED' % self.yes_key),
+                 (self._font_text, '%s Decline        RECOMMENDED' % self.no_key),
                  (self._font_text, '%s No        %s Yes' % (self.no_key, self.yes_key)),
                  (self._font_text, '%s Decline' % self.no_key),
-                 (self._font_text, '%s Cancel' % self.no_key),
-                 (self._font_text, self.caller_name),
-                 (self._font_small, '%s — ringing, on hold' % self.caller_name),
-                 (self._font_small, '%s — connected     00:00' % self.caller_name)]
-        for loa, tmpl in _ASSISTANT_LINE.items():
-            if not tmpl:
-                continue
-            if loa == 3:
-                # What is DRAWN is the live countdown ("Answering in 3…"),
-                # never the three-digit template -- measuring the template made
-                # the panel ~25 %% wider than anything it can display.
-                tmpl = 'Call from %s. Answering in 3…'
-            cands.append((self._font_text, '"%s"' % (tmpl % self.caller_name)))
+                 (self._font_text, '%s Cancel' % self.no_key)]
+        for who in (self.caller_name, self.spam_caller_name):
+            cands += [(self._font_text, who),
+                      (self._font_small, '%s — ringing, on hold' % who),
+                      (self._font_small, '%s — connected     00:00' % who),
+                      (self._font_small, '%s — call rejected' % who)]
+        cands += [(self._font_text, s) for s in self._spoken_candidates()]
         return max(f.size(t)[0] for f, t in cands)
 
     def _layout(self, dim):
         """The panel rect: measured width, row-counted height, fixed anchor."""
         width, height = dim
         if self._font_text is None:
+            self._text_inner = 0
             return pygame.Rect(int(width * PANEL_LEFT_FRAC), 0,
                                int(width * PANEL_MIN_WIDTH_FRAC), 0)
 
@@ -539,11 +631,27 @@ class CallEvent(object):
                         width * PANEL_MIN_WIDTH_FRAC),
                     width * PANEL_MAX_WIDTH_FRAC))
 
-        # Tallest rendering is LoA 3: header, one spoken line, the countdown
+        # The spoken line is drawn to the RIGHT of the icon, so the width it
+        # actually gets is narrower than the panel's inner width. Computed once
+        # here and reused by _render_assistant: when the two disagreed, the
+        # renderer wrapped against a generous limit and the longest spam line
+        # ran out through the right border.
+        self._text_inner = w - PANEL_PAD_LEFT - PANEL_PAD - self.icon_size \
+            - PANEL_ICON_GAP
+
+        # How many rows the longest line needs ONCE the width is known. The
+        # width clamp can force a wrap ("Suspected spam call. Want me to reject
+        # it?" does not fit on one row at 0.34 w), and the panel is then two
+        # rows taller in EVERY rendering, not only the ones that wrap.
+        rows = max([len(self._wrap(s, self._font_text, self._text_inner))
+                    for s in self._spoken_candidates()] or [1])
+
+        # Tallest rendering is LoA 3: header, the spoken line(s), the countdown
         # bar, the cancel row, then the separator and status strip.
         th, xh, sh = (self._font_title.get_height(), self._font_text.get_height(),
                       self._font_small.get_height())
-        h = (PANEL_PAD_TOP + PANEL_PAD + (th + 4) + 2 * (xh + 4) + 16 + 6 + sh + 6)
+        h = (PANEL_PAD_TOP + PANEL_PAD + (th + 4) + (rows + 1) * (xh + 4)
+             + 16 + 6 + sh + 6)
 
         speed_mid = (height * SPEED_BASELINE_FRAC
                      - _speed_block_height(height) / 2.0)
@@ -710,15 +818,41 @@ class CallEvent(object):
     def active(self):
         """True while the panel is on screen and may consume input."""
         return self.state in (RINGING, AWAIT_INPUT, COUNTDOWN, ANSWERING,
-                              CONNECTED)
+                              CONNECTED, REJECTING, REJECTED)
 
-    def arm(self, now_ms, loa, window_idx=None):
+    @property
+    def display_name(self):
+        """Who the panel says is calling. A number when it is spam."""
+        return self.spam_caller_name if self.spam else self.caller_name
+
+    def _line_key(self):
+        """Key into ``_SOUND_FILES`` for this rung's assistant utterance."""
+        return ('spam%d' % self.loa) if self.spam else self.loa
+
+    def _route(self):
+        """State to enter after the ring lead-in.
+
+        Identical to ``_LOA_ROUTE`` except at LoA 4, where a spam call is being
+        turned away rather than picked up. Every other rung shares its state
+        machine with the genuine call and differs only in wording -- which is
+        the property that keeps this one component instead of two.
+        """
+        if self.spam and self.loa == 4:
+            return REJECTING
+        return _LOA_ROUTE[self.loa]
+
+    def arm(self, now_ms, loa, window_idx=None, spam=False):
         """Schedule this window's call. False if nothing was armed.
 
         ``loa`` of None means no decision was available -- the transport was
         stale, or ProVoice had not produced one yet. We refuse rather than
         substituting a level: a fabricated LoA is indistinguishable from a served
         one afterwards. The caller logs the skip.
+
+        ``spam`` makes it a suspected spam call: same rung, inverted proposal.
+        The SCHEDULE decides this (study_session.py), never the LoA -- if the
+        model's prediction chose which calls were spam, the manipulation would
+        be confounded with the thing it is meant to probe.
         """
         if not self.enabled or loa is None:
             return False
@@ -731,6 +865,7 @@ class CallEvent(object):
             return False
 
         self.loa = loa
+        self.spam = bool(spam)
         self.window_idx = window_idx
         self.state = ARMED
         self._onset_ms = now_ms + self.onset_offset_ms
@@ -784,14 +919,15 @@ class CallEvent(object):
 
         if self.state == RINGING:
             if self._elapsed(now_ms) >= RING_LEAD_S * 1000.0:
-                line = self._sounds.get(self.loa)
+                key = self._line_key()
+                line = self._sounds.get(key)
                 if line is not None:
-                    self._voice_channel = self._play(self.loa)
+                    self._voice_channel = self._play(key)
                     # Predicted end, not Channel.get_busy(): this has to behave
                     # identically with no audio device, where get_busy() is
                     # never True and the gap would collapse to nothing.
                     self._voice_ends_ms = now_ms + line.get_length() * 1000.0
-                self._enter(_LOA_ROUTE[self.loa], now_ms)
+                self._enter(self._route(), now_ms)
             return None
 
         if self.state == AWAIT_INPUT:
@@ -809,11 +945,28 @@ class CallEvent(object):
             if self._elapsed(now_ms) >= COUNTDOWN_S * 1000.0:
                 # Nobody vetoed: the action happens. This is the whole content
                 # of auto_with_veto and the reason the timeout means the
-                # opposite of what it means at LoA 2.
+                # opposite of what it means at LoA 2. On a spam call the
+                # announced action is the rejection, so the same rule sends it
+                # the other way.
                 if self._response is None:
                     self._response = 'timeout'
                     self._response_ms = now_ms
-                self._enter(ANSWERING, now_ms)
+                self._enter(REJECTING if self.spam else ANSWERING, now_ms)
+            return None
+
+        if self.state == REJECTING:
+            # Mirror of ANSWERING: hold the outcome until the assistant has
+            # finished saying it. Without the beat, LoA 4 flashes "call
+            # rejected" over the top of its own announcement.
+            if now_ms >= self._voice_ends_ms + POST_SPEECH_GAP_S * 1000.0:
+                self._stop_ring()
+                self._enter(REJECTED, now_ms)
+            return None
+
+        if self.state == REJECTED:
+            if self._elapsed(now_ms) >= REJECTED_HOLD_S * 1000.0:
+                self._resolve(now_ms, answered=False)
+                return self._take_pending()
             return None
 
         if self.state == ANSWERING:
@@ -828,7 +981,7 @@ class CallEvent(object):
         if self.state == CONNECTED:
             if self._reply_started_ms is None:
                 if self._elapsed(now_ms) >= PICKUP_GAP_S * 1000.0:
-                    self._play('reply')
+                    self._play('spam_reply' if self.spam else 'reply')
                     self._reply_started_ms = now_ms
                 return None
             # Measured from the REPLY, not from connecting: otherwise the hold
@@ -857,9 +1010,19 @@ class CallEvent(object):
         latency = None
         if self._response_ms is not None:
             latency = int(self._response_ms - self._onset_ms)
+        # `proposed_action` is stored rather than re-derived in analysis. It is a
+        # function of (loa, spam) and could be recomputed -- but the whole point
+        # of the spam call is that agreement and passivity finally come apart,
+        # and that contrast is `outcome == proposed_action`. Leaving it implicit
+        # invites someone to reconstruct the mapping from memory and get LoA 3's
+        # veto backwards.
+        proposed = ('none' if self.loa == 0
+                    else ('reject' if self.spam else 'answer'))
         return {
             'window_idx': self.window_idx,
             'served_loa': self.loa,
+            'call_kind': 'spam' if self.spam else 'genuine',
+            'proposed_action': proposed,
             'event_onset_ms': int(self._onset_ms),
             'driver_response': self._response or 'none',
             'response_latency_ms': latency,
@@ -914,10 +1077,22 @@ class CallEvent(object):
         if affirm or negative:
             self._stop_voice(now_ms)
 
+        # THE INVARIANT ACROSS ALL TEN RENDERINGS, and the reason spam needed no
+        # new input handling: the AFFIRMATIVE control always agrees with what
+        # the assistant proposed, and the NEGATIVE always produces the opposite
+        # outcome. On a genuine call the proposal is to answer, so affirm
+        # connects; on a spam call it is to reject, so affirm hangs up and the
+        # negative is what puts the caller through. Left/right never swap
+        # meaning, only consequence -- if the paddles changed roles between
+        # call kinds, a motor confound would ride along with the manipulation.
         if self.state == COUNTDOWN:
             if negative:
                 self._response = 'cancel'
                 self._response_ms = now_ms
+                if self.spam:
+                    # The veto stopped a REJECTION, so the call survives it.
+                    self._enter(ANSWERING, now_ms)
+                    return 'negative'
                 self._resolve(now_ms, answered=False)
                 return 'negative'
             return None
@@ -925,11 +1100,21 @@ class CallEvent(object):
         if affirm:
             self._response = 'accept' if self.loa in (0, 1) else 'yes'
             self._response_ms = now_ms
-            self._enter(ANSWERING, now_ms)
+            # At LoA 0/1 the buttons are the DRIVER's Answer/Decline in both
+            # call kinds -- only the recommendation badge moves -- so accepting
+            # a spam call connects it, exactly as the label says.
+            if self.spam and self.loa == 2:
+                self._enter(REJECTING, now_ms)
+            else:
+                self._enter(ANSWERING, now_ms)
             return 'affirmative'
         if negative:
             self._response = 'decline' if self.loa in (0, 1) else 'no'
             self._response_ms = now_ms
+            if self.spam and self.loa == 2:
+                # "No, don't reject it" -- the driver wants the call.
+                self._enter(ANSWERING, now_ms)
+                return 'negative'
             self._resolve(now_ms, answered=False)
             return 'negative'
         return None
@@ -1007,29 +1192,40 @@ class CallEvent(object):
                                + self.icon_size * 0.7,
                                head_y + self._font_title.get_height() / 2,
                                self.icon_size, COL_ACCENT)
-        y = self._blit(display, self._font_text, self.caller_name, COL_WHITE, tx, y)
+        y = self._blit(display, self._font_text, self.display_name, COL_WHITE,
+                       tx, y)
         y += 6
 
-        if self.loa == 1:
-            # The badge IS the suggestion. Marker (star) plus colour, never
-            # colour alone -- and it sits on the DRIVER's control, which is what
-            # distinguishes advising from taking over.
-            # Text first, then the star into the gap the spaces reserve --
-            # measuring the FULL string up to the badge is what keeps the glyph
-            # off the R. Drawing it from a guessed offset put it on top.
-            label = '%s Answer         RECOMMENDED' % self.yes_key
-            gap_at = self._font_text.size('%s Answer   ' % self.yes_key)[0]
-            y_mid = y + self._font_text.get_height() / 2
-            self._blit(display, self._font_text, label, COL_ACCENT, tx, y)
-            self._draw_star(display, tx + gap_at + self._font_text.get_height() * 0.3,
-                            y_mid, self._font_text.get_height() * 0.95,
-                            COL_ACCENT)
-            y += self._font_text.get_height() + 4
-        else:
-            y = self._blit(display, self._font_text, '%s Answer' % self.yes_key,
-                           COL_WHITE, tx, y)
-        return self._blit(display, self._font_text, '%s Decline' % self.no_key,
-                          COL_WHITE, tx, y)
+        # The badge IS the suggestion, and at LoA 1 it is the ONLY thing the
+        # assistant contributes -- which is what distinguishes advising from
+        # taking over. On a spam call it moves to Decline: same rung, same
+        # widget, opposite advice, and nothing else on the card changes. That is
+        # deliberately the smallest possible manipulation, so a driver who
+        # follows the badge on genuine calls and follows it here too is doing
+        # the same thing, not responding to a different interface.
+        recommend = None if self.loa != 1 else ('decline' if self.spam
+                                                else 'answer')
+        y = self._render_option(display, tx, y, '%s Answer' % self.yes_key,
+                                recommend == 'answer')
+        return self._render_option(display, tx, y, '%s Decline' % self.no_key,
+                                   recommend == 'decline')
+
+    def _render_option(self, display, x, y, label, recommended):
+        """One row of the driver's phone card, badged or plain.
+
+        Text first, then the star into the gap the spaces reserve -- measuring
+        the FULL string up to the badge is what keeps the glyph off the R.
+        Drawing it from a guessed offset put it on top.
+        """
+        if not recommended:
+            return self._blit(display, self._font_text, label, COL_WHITE, x, y)
+        gap_at = self._font_text.size(label + '   ')[0]
+        y_mid = y + self._font_text.get_height() / 2
+        self._blit(display, self._font_text, '%s         RECOMMENDED' % label,
+                   COL_ACCENT, x, y)
+        self._draw_star(display, x + gap_at + self._font_text.get_height() * 0.3,
+                        y_mid, self._font_text.get_height() * 0.95, COL_ACCENT)
+        return y + self._font_text.get_height() + 4
 
     def _render_assistant(self, display, x, y):
         """LoA 2-4: the assistant's panel has replaced the phone card."""
@@ -1046,20 +1242,25 @@ class CallEvent(object):
 
         spoken = self._panel_line()
         if spoken:
-            chunks = self._wrap(spoken, self._font_text,
-                                self.rect.width - PANEL_PAD_LEFT - PANEL_PAD)
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    chunk = '"' + chunk
-                if i == len(chunks) - 1:
-                    chunk = chunk + '"'
+            # Quoted BEFORE wrapping, and against _text_inner rather than the
+            # panel's full inner width. Both matter: the text starts to the
+            # right of the icon, and adding the quotes afterwards measured a
+            # string ~10 px narrower than the one drawn -- enough, at the width
+            # cap, for the longest spam line to fit in the layout and overflow
+            # on screen. This is now the same call _layout makes.
+            for chunk in self._wrap('"%s"' % spoken, self._font_text,
+                                    self._text_inner):
                 y = self._blit(display, self._font_text, chunk, COL_WHITE, x, y)
 
         if self.state == COUNTDOWN:
             y = self._render_countdown_bar(display, x, y + 4)
             return self._blit(display, self._font_text,
                               '%s Cancel' % self.no_key, COL_COUNTDOWN, x, y)
-        if self.loa == 2:
+        if self.loa == 2 and self.state == AWAIT_INPUT:
+            # Gated on the STATE, not on the rung alone: without it the Yes/No
+            # row stayed on screen through ANSWERING and CONNECTED, offering
+            # controls for a question the driver had already answered.
+            #
             # Negative on the LEFT, affirmative on the RIGHT, so the option's
             # position on screen matches the paddle that selects it.
             return self._blit(display, self._font_text,
@@ -1076,23 +1277,39 @@ class CallEvent(object):
         ring lead-in, jumped back to 3 when COUNTDOWN was actually entered, and
         then counted down a third time from CONNECTED.
         """
+        # Opening clause, shared by every state. On a spam call the assistant
+        # leads with its ASSESSMENT rather than the caller, because the number
+        # is not a name and reading it aloud would be both unnatural and the
+        # single longest string in the layout.
+        head = ('Suspected spam call.' if self.spam
+                else 'Call from %s.' % self.caller_name)
+
         if self.state == RINGING:
             # The assistant has not spoken yet -- its clip plays on leaving this
             # state -- so the panel shows only who is calling. From there the
             # line appears WHOLE: revealing it clause by clause in step with the
             # speech was tried and read as the panel stuttering.
-            return 'Call from %s.' % self.caller_name
+            return head
         if self.state == COUNTDOWN:
-            return 'Call from %s. Answering in %d…' % (
-                self.caller_name, self._countdown_remaining())
+            return '%s %s in %d…' % (head, 'Rejecting' if self.spam
+                                     else 'Answering', self._countdown_remaining())
+        if self.state in (REJECTING, REJECTED):
+            return '%s Rejecting now.' % head
         if self.state in (ANSWERING, CONNECTED):
             # ANSWERING belongs here too. Without it LoA 3 fell through to the
             # _ASSISTANT_LINE default and briefly displayed its raw template,
             # "Answering in 3... 2... 1...", which is a record of what the wav
             # says and was never meant to be drawn.
-            return 'Call from %s. Answering now.' % self.caller_name
-        line = _ASSISTANT_LINE.get(self.loa)
-        return (line % self.caller_name) if line else None
+            #
+            # A SPAM call in ANSWERING means the driver overrode the assistant
+            # (refused the rejection at LoA 2, vetoed it at LoA 3), so the panel
+            # must stop saying "rejecting" -- the announced action is no longer
+            # what is happening.
+            return '%s Answering now.' % head
+        line = (_SPAM_LINE if self.spam else _ASSISTANT_LINE).get(self.loa)
+        if not line:
+            return None
+        return (line % self.caller_name) if '%s' in line else line
 
     def _countdown_remaining(self):
         """3, 2, 1 -- one second each, from the start of COUNTDOWN.
@@ -1132,10 +1349,15 @@ class CallEvent(object):
         if self.state == CONNECTED:
             secs = max(0, int(self._elapsed(self._now_ms) / 1000.0))
             text = '%s — connected     %02d:%02d' % (
-                self.caller_name, secs // 60, secs % 60)
+                self.display_name, secs // 60, secs % 60)
             colour = COL_CONNECTED
+        elif self.state in (REJECTING, REJECTED):
+            # The confirmation. At LoA 4 nothing else on the panel tells the
+            # driver the call is gone rather than still ringing silently.
+            text = '%s — call rejected' % self.display_name
+            colour = COL_COUNTDOWN
         else:
-            text = '%s — ringing, on hold' % self.caller_name
+            text = '%s — ringing, on hold' % self.display_name
             colour = COL_DIM
         # No icon here. At the small font's ~13 px the receiver loses its
         # silhouette and reads as a smudge; the header already carries it, and
@@ -1143,16 +1365,36 @@ class CallEvent(object):
         display.blit(self._font_small.render(text, True, colour),
                      (self.rect.left + PANEL_PAD_LEFT, y))
 
+    @classmethod
+    def _wrap(cls, text, font, max_w):
+        """Break `text` to `max_w`, PREFERRING sentence boundaries.
+
+        Greedy word wrapping put `it?"` alone on the second row of the longest
+        spam line, which reads as a typographic accident rather than a chosen
+        break. Every line this panel speaks has the form "<what is calling>.
+        <what I propose to do>", so the sentence boundary is where a reader
+        would break it anyway -- and packing by sentence makes the wrap
+        structurally identical between the genuine and spam wordings, instead
+        of leaving one rung looking mishandled.
+
+        Falls back to word wrapping when a single sentence overflows on its own.
+        """
+        units = [s + '.' for s in text.split('. ')]
+        units[-1] = units[-1][:-1]      # the final unit kept its own ending
+        if len(units) > 1 and all(font.size(u)[0] <= max_w for u in units):
+            return cls._pack(units, font, max_w)
+        return cls._pack(text.split(), font, max_w)
+
     @staticmethod
-    def _wrap(text, font, max_w):
-        words, lines, cur = text.split(), [], ''
-        for word in words:
-            trial = (cur + ' ' + word).strip()
+    def _pack(units, font, max_w):
+        lines, cur = [], ''
+        for unit in units:
+            trial = (cur + ' ' + unit).strip()
             if font.size(trial)[0] <= max_w or not cur:
                 cur = trial
             else:
                 lines.append(cur)
-                cur = word
+                cur = unit
         if cur:
             lines.append(cur)
         return lines
@@ -1165,7 +1407,8 @@ class CallEvent(object):
 #
 #     uv run python src/drive/call_event.py [--fullscreen] [--speed-x-frac 0.20]
 #
-# Press 0-4 to arm that LoA, A/B to answer, ESC to quit.
+# Press 0-4 to arm that LoA, SHIFT+0-4 for its SPAM rendering, J/K to answer,
+# ESC to quit.
 
 class _DemoSpeed(object):
     """Stand-in for ``HUD._render_speed``, reproducing it EXACTLY.
@@ -1249,18 +1492,16 @@ def _demo():
     else:
         dim = (args.width, args.height)
         screen = pygame.display.set_mode(dim)
-    pygame.display.set_caption('call_event demo -- 0-4 to arm, A / B to answer')
-
-    print('[demo] %dx%d  panel=%s  speed=%s'
-          % (dim[0], dim[1],
-             'x'.join(str(v) for v in (int(dim[0] * PANEL_WIDTH_FRAC),
-                                       int(dim[1] * PANEL_HEIGHT_FRAC))),
-             'hidden' if args.no_speed else 'shown'))
+    pygame.display.set_caption('call_event demo -- 0-4 arm, SHIFT+0-4 spam, J / K answer')
 
     clock = pygame.time.Clock()
     call = CallEvent(dim, onset_offset_s=0.2)
     speedo = None if args.no_speed else _DemoSpeed(dim, args.speed_x_frac)
     hint = pygame.font.Font(pygame.font.get_default_font(), 16)
+
+    print('[demo] %dx%d  panel=%dx%d at (%d, %d)  speed=%s'
+          % (dim[0], dim[1], call.rect.w, call.rect.h, call.rect.x, call.rect.y,
+             'hidden' if args.no_speed else 'shown'))
 
     running, last, speed = True, None, 120.0
     while running:
@@ -1270,9 +1511,18 @@ def _demo():
                 running = False
             elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 running = False
-            elif (ev.type == pygame.KEYDOWN and ev.unicode in '01234'
+            elif (ev.type == pygame.KEYDOWN
+                  and pygame.K_0 <= ev.key <= pygame.K_4
                   and not call.active):
-                call.arm(now, int(ev.unicode), window_idx=1)
+                # SHIFT + 0-4 arms the SPAM rendering of that rung.
+                #
+                # Keyed on ev.key rather than ev.unicode: with SHIFT held the
+                # character depends on the keyboard layout ('"' on a UK board,
+                # '@' on a US one), so a unicode test would not match a digit
+                # at all and the spam renderings would be unreachable on
+                # whichever layout was not hard-coded.
+                call.arm(now, ev.key - pygame.K_0, window_idx=1,
+                         spam=bool(ev.mod & pygame.KMOD_SHIFT))
             else:
                 call.handle_event(ev, now_ms=now)
 
@@ -1289,7 +1539,7 @@ def _demo():
         if speedo is not None:
             speedo.render(screen, speed)
         call.render(screen)
-        screen.blit(hint.render('0-4 arm   A/B answer   ESC quit', True,
+        screen.blit(hint.render('0-4 arm   SHIFT+0-4 spam   J/K answer   ESC quit', True,
                                 (120, 120, 120)), (20, 20))
         if last:
             screen.blit(hint.render(str(last), True, (160, 160, 160)), (20, 44))

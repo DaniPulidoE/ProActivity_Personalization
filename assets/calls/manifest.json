@@ -16,9 +16,9 @@
       "licence": "n/a - not derived from any dataset"
     },
     "loa1_line.wav, loa2_line.wav, loa3_line.wav, loa4_line.wav": {
-      "description": "assistant voice",
+      "description": "assistant voice, genuine call (LoA 1-4; LoA 0 is silent by design)",
       "engine": "Piper (piper1-gpl). GPL governs the software, not its audio output.",
-      "voice_model": "en_US-libritts_r-medium, speaker 40",
+      "voice_model": "en_US-libritts_r-medium, speaker 92",
       "dataset": "LibriTTS-R",
       "dataset_url": "http://www.openslr.org/141/",
       "licence": "CC BY 4.0",
@@ -30,6 +30,22 @@
       "description": "the caller, once the call is answered",
       "voice_model": "en_US-libritts_r-medium, speaker 256",
       "note": "a DIFFERENT speaker from the assistant, on the same model: with one voice the driver hears the assistant answer itself, which undercuts the 'it acted on your behalf' framing at LoA 3 and 4",
+      "dataset": "LibriTTS-R",
+      "licence": "CC BY 4.0",
+      "attribution_required": "Speech synthesised with Piper using the en_US-libritts_r-medium voice, trained on LibriTTS-R (Koizumi et al., 2023), CC BY 4.0."
+    },
+    "spam1_line.wav, spam2_line.wav, spam3_line.wav, spam4_line.wav": {
+      "description": "assistant voice, SUSPECTED SPAM call (LoA 1-4). Same speaker, same clause structure and comparable length as the genuine lines -- only the proposed action is inverted, from answer to reject.",
+      "voice_model": "en_US-libritts_r-medium, speaker 92",
+      "dataset": "LibriTTS-R",
+      "licence": "CC BY 4.0",
+      "attribution_required": "Speech synthesised with Piper using the en_US-libritts_r-medium voice, trained on LibriTTS-R (Koizumi et al., 2023), CC BY 4.0.",
+      "rendered_by": "scripts/render_call_audio.py"
+    },
+    "spam_reply.wav": {
+      "description": "the spam caller, on the rare path where the driver puts the call through anyway",
+      "voice_model": "en_US-libritts_r-medium, speaker 256",
+      "note": "the SAME speaker as caller_reply.wav. A third voice would let the driver identify a spam call from the first syllable of the reply -- but they have already responded by then, so it would add a cue only after the measurement.",
       "dataset": "LibriTTS-R",
       "licence": "CC BY 4.0",
       "attribution_required": "Speech synthesised with Piper using the en_US-libritts_r-medium voice, trained on LibriTTS-R (Koizumi et al., 2023), CC BY 4.0."

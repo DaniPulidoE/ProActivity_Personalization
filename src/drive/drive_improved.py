@@ -3325,12 +3325,24 @@ def game_loop(args):
                 log_path=os.path.join(os.getcwd(), 'data', 'call_events.csv'),
                 seed=args.study_seed, session_id=session_id,
                 participantid=getattr(args, 'participantid', ''),
-                block_idx=args.block_idx, k_condition=args.k_condition, **cfg)
+                block_idx=args.block_idx, k_condition=args.k_condition,
+                spam_call_idx=(-1 if args.test_spam else args.spam_call),
+                **cfg)
             print('[study] block %s condition %r: %d calls over %.0f min, '
                   '~%.0f s apart (jitter +/-%.0f s), LoA from %s.'
                   % (args.block_idx or '?', args.k_condition or '?',
                      cfg['n_calls'], cfg['duration_s'] / 60.0,
                      cfg['interval_s'], cfg['jitter_s'], study.source.mode))
+            # Printed, but the console is not where it is RECORDED -- the index
+            # rides in every call_events.csv row, so the analysis never has to
+            # trust a scrollback buffer for which trial was the inverted one.
+            print('[study] spam call: %s'
+                  % ('EVERY call (--test-spam; not a study configuration)'
+                     if study.spam_call_idx == -1 else
+                     'none in this block' if study.spam_call_idx <= 0 else
+                     'call %d of %d%s' % (study.spam_call_idx, cfg['n_calls'],
+                                          ' (pinned)' if args.spam_call
+                                          is not None else '')))
             if not args.random_loa:
                 print('[study] a served LoA older than %.1f s will be refused '
                       '(--loa-max-age).' % args.loa_max_age
@@ -3715,9 +3727,18 @@ def game_loop(args):
                     # participant who found this key could manufacture one.
                     if (args.call_preview and not study_on
                             and event.type == pygame.KEYDOWN
-                            and event.unicode in '01234'
+                            and pygame.K_0 <= event.key <= pygame.K_4
                             and not call_preview.active):
-                        call_preview.arm(now_ms, int(event.unicode), 0)
+                        # SHIFT gives the SPAM rendering of the same rung, so
+                        # both wordings can be checked against each other on the
+                        # rig without restarting.
+                        #
+                        # Keyed on event.key, not event.unicode: with SHIFT held
+                        # the character is layout-dependent ('"' on a UK board,
+                        # '@' on a US one) and would not match a digit at all.
+                        call_preview.arm(
+                            now_ms, event.key - pygame.K_0, 0,
+                            spam=bool(event.mod & pygame.KMOD_SHIFT))
                     else:
                         call_preview.handle_event(event, now_ms=now_ms)
 
@@ -3739,18 +3760,21 @@ def game_loop(args):
                                        loa_popup.active, call_preview.active,
                                        _read_status_file)
                     if due is not None:
-                        loa, call_idx = due
-                        call_preview.arm(now_ms, loa, call_idx)
-                        print('[study] call %d/%d armed at LoA %d (%.0f s in).'
+                        loa, call_idx, is_spam = due
+                        call_preview.arm(now_ms, loa, call_idx, spam=is_spam)
+                        print('[study] call %d/%d armed at LoA %d, %s (%.0f s in).'
                               % (call_idx, study.n_calls, loa,
+                                 'SPAM' if is_spam else 'genuine',
                                  study.elapsed_s(now_ms)))
 
                 finished = call_preview.update(now_ms)
                 if finished:
                     if study is not None:
                         study.note_outcome(finished, now_ms)
-                        print('[study] call %s -> %s (%s)'
+                        print('[study] call %s (%s, proposed %s) -> %s (%s)'
                               % (finished.get('window_idx'),
+                                 finished.get('call_kind'),
+                                 finished.get('proposed_action'),
                                  finished.get('driver_response'),
                                  finished.get('outcome')))
                     else:
@@ -4010,6 +4034,20 @@ def main():
              '--short-trial, which is exactly five calls. Implies --study; NOT '
              'a study configuration.')
     argparser.add_argument(
+        '--spam-call', dest='spam_call', type=int, default=None,
+        help='Pin WHICH call in the block is the suspected spam call, instead '
+             'of drawing it. One call per block is spam and it is never the '
+             'first (see study_session.py); by default the position is redrawn '
+             'each block so a driver cannot learn it across their three. Pass '
+             '0 to run a block with no spam call at all. The value is written '
+             'to every row, so a pinned block is identifiable afterwards.')
+    argparser.add_argument(
+        '--test-spam', dest='test_spam', action='store_true',
+        help='Make EVERY call a spam call. For walking the five spam '
+             'renderings in one pass -- pair it with --test-calls, which deals '
+             'the rungs 0-4 in order. Implies --study; NOT a study '
+             'configuration, and every row still records call_kind.')
+    argparser.add_argument(
         '--loa-max-age', dest='loa_max_age', type=float, default=3.0,
         help='Refuse a served LoA older than this many seconds and log the '
              'call as skipped (default: %(default)s). STALENESS IS THE SILENT '
@@ -4159,8 +4197,17 @@ def main():
     # driver to label windows nobody is going to use. Forced off rather than
     # left to the experimenter to remember, because forgetting it does not fail
     # -- it quietly produces a block that measures something else.
-    if args.short_trial or args.test_calls:
+    if args.short_trial or args.test_calls or args.test_spam:
         args.study = True
+    if args.test_spam and args.spam_call is not None:
+        argparser.error('--test-spam makes every call spam, so --spam-call has '
+                        'nothing left to pin. Pick one.')
+    if args.spam_call is not None and args.spam_call == 1:
+        argparser.error('--spam-call 1 is not allowed: the first call is where '
+                        'the driver learns what the interface does, and meeting '
+                        'the inverted proposal there would make the exception '
+                        'the reference point for the other four. Use 0 to '
+                        'disable, or 2 and up.')
     if args.test_calls and args.random_loa:
         argparser.error('--test-calls and --random-loa both replace the served '
                         'LoA and contradict each other: one walks 0-4 in order, '
@@ -4182,6 +4229,9 @@ def main():
         argparser.error('--random-loa / --test-calls only have an effect on a '
                         'study block. Add --study (or --short-trial), or drop '
                         'them.')
+    if args.spam_call is not None and not args.study:
+        argparser.error('--spam-call only has an effect on a study block. Add '
+                        '--study (or --short-trial), or drop it.')
 
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '
