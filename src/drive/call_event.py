@@ -440,7 +440,7 @@ class CallEvent(object):
     driving and the event is meant to be handled in traffic.
     """
 
-    def __init__(self, dim, assets_dir=None, caller_name='Mark',
+    def __init__(self, dim, assets_dir=None, caller_name='Daniel',
                  onset_offset_s=DEFAULT_ONSET_OFFSET_S, cap_s=DEFAULT_CAP_S,
                  enabled=True, chrome=None, input_mode=INPUT_WHEEL):
         self.dim = dim

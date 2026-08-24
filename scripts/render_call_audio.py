@@ -174,7 +174,7 @@ def render_sapi(jobs, outdir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--engine', choices=('piper', 'sapi'), default='piper')
-    ap.add_argument('--caller', default='Mark',
+    ap.add_argument('--caller', default='Daniel',
                     help='Caller name spoken in every line. Keep it FIXED and '
                          'neutral across the whole study (default: %(default)s).')
     ap.add_argument('--voice', default=None,
