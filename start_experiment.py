@@ -1067,6 +1067,21 @@ _CARLA_PRESETS = {
     # pop-ups off -- is set by the --study-satisfaction validation, so this
     # preset only says "that study, over the link".
     "experiment_study_satisfaction_carla_remote": {
+        # fixed=True pins the EGO SPAWN POINT to FIXED_SPAWN_POINT_INDEX, the
+        # same way the calibration preset does. The traffic scenario was already
+        # pinned -- resolve_traffic_seed forces STUDY_TRAFFIC_SEED on every
+        # non-collection run and refuses --traffic-seed outright -- but the
+        # spawn point was still drawn at random per launch, so three blocks
+        # began in three different parts of the map.
+        #
+        # That matters more here than it did for calibration. K is a
+        # WITHIN-SUBJECT factor: the driver rates three blocks against each
+        # other, so anything that differs between them competes with K for the
+        # difference. A block that starts on a wide arterial and one that starts
+        # in a tight junction are not the same driving task, and no amount of
+        # counterbalancing recovers that -- counterbalancing balances ORDER, not
+        # a nuisance variable redrawn independently inside every cell.
+        "fixed": True,
         "remote": True, "study_satisfaction": True, "fullscreen": True,
         "functionname": STUDY_FUNCTIONNAME,
         "remote_host": CARLA_MACHINE_IP, "remote_bind": CARLA_MACHINE_IP},

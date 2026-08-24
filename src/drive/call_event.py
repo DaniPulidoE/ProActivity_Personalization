@@ -204,12 +204,23 @@ CALL_KEY_NEGATIVE = K_j            # left-hand key
 
 INPUT_WHEEL = 'wheel'
 INPUT_KEYBOARD = 'keyboard'
-# What the on-screen button prompts read, per input mode. The label has to name
-# the control the driver is actually holding.
-_PROMPT = {
-    INPUT_WHEEL: ('[R]', '[L]'),
-    INPUT_KEYBOARD: ('[K]', '[J]'),
-}
+
+# What the on-screen prompts read. FIXED at the wheel's labels, in every run.
+#
+# These used to switch to '[K]' / '[J]' whenever no wheel was detected, on the
+# principle that a label should name the control the driver is holding. That is
+# right for a tool and wrong for an instrument: the participant is ALWAYS on the
+# wheel, so the keyboard labels could only ever appear by accident -- a paddle
+# that failed to enumerate, a session started before the wheel was plugged in --
+# and the result would be one participant seeing a different panel from the rest,
+# silently, with nothing in the data to say so.
+#
+# The keyboard keys stay live regardless (CALL_KEY_AFFIRM / CALL_KEY_NEGATIVE,
+# below): handle_event accepts KEYDOWN and JOYBUTTONDOWN unconditionally and
+# never consults these labels. J and K are the experimenter's fallback, so they
+# are deliberately NOT advertised on a panel the participant is reading.
+PROMPT_AFFIRM = '[R]'          # right paddle
+PROMPT_NEGATIVE = '[L]'        # left paddle
 
 # --- Timing -----------------------------------------------------------------
 #
@@ -529,8 +540,15 @@ class CallEvent(object):
         self.spam_caller_name = spam_caller_name
         self.spam = False
         self.chrome = chrome or PANEL_CHROME
-        self.input_mode = (input_mode if input_mode in _PROMPT else INPUT_WHEEL)
-        self.yes_key, self.no_key = _PROMPT[self.input_mode]
+        # `input_mode` is now only the FALLBACK for the logged device -- what to
+        # record when a call resolves without anyone touching a control, i.e. a
+        # timeout at LoA 0-2 or the untouched LoA 4. When the driver does act,
+        # handle_event overwrites it with the device that actually produced the
+        # response, which is what `input_mode` in call_events.csv is for.
+        self.input_mode = (input_mode if input_mode in (INPUT_WHEEL, INPUT_KEYBOARD)
+                           else INPUT_WHEEL)
+        self._response_device = None
+        self.yes_key, self.no_key = PROMPT_AFFIRM, PROMPT_NEGATIVE
         self.enabled = enabled
         self.caller_name = caller_name
         self.onset_offset_ms = float(onset_offset_s) * 1000.0
@@ -875,6 +893,7 @@ class CallEvent(object):
         self._state_entered_ms = now_ms
         self._response = None
         self._response_ms = None
+        self._response_device = None
         self._answered = False
         self._pending_outcome = None
         self._voice_ends_ms = 0
@@ -1028,6 +1047,7 @@ class CallEvent(object):
             'proposed_action': proposed,
             'event_onset_ms': int(self._onset_ms),
             'driver_response': self._response or 'none',
+            'input_mode': self._response_device or self.input_mode,
             'response_latency_ms': latency,
             'outcome': 'answered' if self._answered else 'not_answered',
             'skipped_reason': '',
@@ -1057,12 +1077,15 @@ class CallEvent(object):
             return None
 
         affirm = negative = False
+        device = None
         if event.type == pygame.KEYDOWN:
             affirm = event.key == CALL_KEY_AFFIRM
             negative = event.key == CALL_KEY_NEGATIVE
+            device = INPUT_KEYBOARD
         elif event.type == pygame.JOYBUTTONDOWN:
             affirm = event.button == CALL_WHEEL_BUTTON_AFFIRM
             negative = event.button == CALL_WHEEL_BUTTON_NEGATIVE
+            device = INPUT_WHEEL
         else:
             return None
 
@@ -1079,6 +1102,12 @@ class CallEvent(object):
         # both unnatural and confusing about what state the call is in.
         if affirm or negative:
             self._stop_voice(now_ms)
+            # The device that ACTUALLY produced the response, not the one the
+            # panel advertised. The two can differ now that the labels are fixed
+            # to the wheel's, and a keyboard press during a participant run means
+            # the experimenter intervened -- which the analysis has to be able to
+            # see rather than infer.
+            self._response_device = device
 
         # THE INVARIANT ACROSS ALL TEN RENDERINGS, and the reason spam needed no
         # new input handling: the AFFIRMATIVE control always agrees with what

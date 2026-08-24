@@ -372,7 +372,7 @@ class StudySession(object):
         self._schedule(now_ms)
         return loa, self.call_idx, is_spam
 
-    def note_outcome(self, outcome, now_ms, input_mode='wheel'):
+    def note_outcome(self, outcome, now_ms, input_mode=None):
         """Called with CallEvent's outcome dict when the interaction resolves."""
         row = dict(self._pending or {})
         self._pending = None
@@ -386,7 +386,12 @@ class StudySession(object):
             # rendered and therefore what it proposed.
             'call_kind': outcome.get('call_kind', row.get('call_kind', '')),
             'proposed_action': outcome.get('proposed_action', ''),
-            'input_mode': input_mode,
+            # From the EVENT by default. The old signature defaulted to the
+            # literal 'wheel' and the drive loop never passed anything, so every
+            # row claimed the wheel even when the experimenter had used the
+            # keyboard fallback -- a column that could not be wrong, and so said
+            # nothing.
+            'input_mode': input_mode or outcome.get('input_mode', ''),
             'skipped_reason': '',
         })
         self._write(row)
