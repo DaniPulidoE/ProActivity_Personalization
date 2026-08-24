@@ -741,22 +741,15 @@ class CallEvent(object):
                 pygame.draw.arc(display, colour, box, math.radians(20),
                                 math.radians(70), max(1, int(size * 0.10) - k))
 
-    def _draw_diamond(self, display, cx, cy, size, colour):
-        """The assistant marker. Was a U+25C6 glyph, which freesansbold.ttf
-        does not have -- it rendered as an empty .notdef box. Same for the star
-        below and the U+25A0 the status strip used to carry. Anything outside
-        Latin-1 has to be DRAWN here, not typed.
-        """
-        r = size * 0.34
-        if OUTLINE_PX and self.chrome == 'none':
-            o = r + OUTLINE_PX
-            pygame.draw.polygon(display, COL_OUTLINE, [
-                (cx, cy - o), (cx + o, cy), (cx, cy + o), (cx - o, cy)])
-        pygame.draw.polygon(display, colour, [
-            (cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)])
-
     def _draw_star(self, display, cx, cy, size, colour):
-        """The recommendation marker (was U+2605; see _draw_diamond)."""
+        """The recommendation marker, and now the ONLY marker on the panel.
+
+        DRAWN, not typed. It was a U+2605 glyph, which freesansbold.ttf does not
+        have -- it rendered as an empty .notdef box. The same was true of the
+        U+25C6 diamond this file used to draw beside the headers (removed
+        2026-08-24 at the supervisor's request) and the U+25A0 the status strip
+        once carried. Anything outside Latin-1 has to be drawn here.
+        """
         def _pts(grow):
             out = []
             for k in range(10):
@@ -1191,17 +1184,17 @@ class CallEvent(object):
                            y + self._font_title.get_height() / 2,
                            self.icon_size, COL_PHONE, waves=ring)
         tx = x + self.icon_size + PANEL_ICON_GAP
-        header = 'INCOMING CALL'
-        head_y = y
-        y = self._blit(display, self._font_title, header, COL_CALL, tx, y)
-        if self.loa == 1:
-            # Assistant present but passive: it annotates the driver's card
-            # rather than owning it.
-            self._draw_diamond(display,
-                               tx + self._font_title.size(header)[0]
-                               + self.icon_size * 0.7,
-                               head_y + self._font_title.get_height() / 2,
-                               self.icon_size, COL_ACCENT)
+        # No diamond after the header. It used to mark "the assistant is present
+        # but passive" at LoA 1, alongside the RECOMMENDED badge below -- two
+        # markers for one fact. The badge is the stronger and more specific of
+        # the two (it says WHICH option the assistant favours, not merely that
+        # it has an opinion), so the diamond was the one to go.
+        #
+        # What now separates LoA 0 from LoA 1 is therefore the badge plus the
+        # spoken line, with LoA 0 silent and unbadged. That is still §5.3's "0 to
+        # 1 changes one marker" -- the badge simply IS that marker now.
+        y = self._blit(display, self._font_title, 'INCOMING CALL', COL_CALL,
+                       tx, y)
         y = self._blit(display, self._font_text, self.display_name, COL_WHITE,
                        tx, y)
         y += 6
@@ -1244,11 +1237,16 @@ class CallEvent(object):
                            self.icon_size, COL_ASSISTANT,
                            waves=self.state in (RINGING, AWAIT_INPUT, COUNTDOWN))
         x = x + self.icon_size + PANEL_ICON_GAP
-        self._draw_diamond(display, x + self.icon_size * 0.35,
-                           y + self._font_title.get_height() / 2,
-                           self.icon_size, COL_ACCENT)
-        y = self._blit(display, self._font_title, 'ASSISTANT', COL_ACCENT,
-                       x + self.icon_size * 1.05, y)
+        # NO diamond marker here. It used to sit before the header, mirroring
+        # the one LoA 1 puts on the driver's phone card -- but on this panel the
+        # header already reads "ASSISTANT", so the marker restated in a glyph
+        # what the word says in full, and the indent it needed pushed the header
+        # out of line with the body text below it.
+        #
+        # The LoA 1 marker STAYS (see _render_phone_card): there the card
+        # belongs to the driver and says "INCOMING CALL", so the diamond is the
+        # only thing on it identifying the assistant as present at all.
+        y = self._blit(display, self._font_title, 'ASSISTANT', COL_ACCENT, x, y)
 
         spoken = self._panel_line()
         if spoken:
