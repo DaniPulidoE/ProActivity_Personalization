@@ -1382,10 +1382,16 @@ class SessionEndedOverlay(object):
     participant staring at a frozen simulator.
     """
 
-    def __init__(self, width, height, reason=''):
+    def __init__(self, width, height, reason='', continues=False):
         self.width = width
         self.height = height
         self.reason = (reason or '').strip()
+        # `continues` = something happens AFTER this screen, so do not promise
+        # the participant they are finished. In a study block the button press
+        # opens the questionnaire; in every other run it really is the end.
+        # Telling someone the session is over and then handing them thirteen
+        # more items is a worse experience than the extra word costs.
+        self.continues = continues
         self._title_font = pygame.font.Font(pygame.font.get_default_font(), 44)
         self._text_font = pygame.font.Font(pygame.font.get_default_font(), 26)
         self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
@@ -1404,12 +1410,15 @@ class SessionEndedOverlay(object):
         overlay.fill((0, 0, 0))
         display.blit(overlay, (0, 0))
 
-        title = self._title_font.render('Experiment session ended', True,
-                                        (255, 255, 255))
+        title = self._title_font.render(
+            'Driving block complete' if self.continues
+            else 'Experiment session ended', True, (255, 255, 255))
         display.blit(title, title.get_rect(
             center=(self.width // 2, int(self.height * 0.38))))
 
         hint = self._text_font.render(
+            'Press any button on the steering wheel to continue.'
+            if self.continues else
             'Press any button on the steering wheel to exit.', True,
             (235, 235, 235))
         display.blit(hint, hint.get_rect(
@@ -3793,7 +3802,10 @@ def game_loop(args):
                                       study.summary())
                     end_overlay = SessionEndedOverlay(
                         args.width, args.height,
-                        'block complete (%s)' % study.summary())
+                        'block complete (%s)' % study.summary(),
+                        # The questionnaire follows the button press, so this
+                        # screen is a hand-off and not a goodbye.
+                        continues=True)
                     _set_world_frozen(world, True)
 
             # NOT ducked for a call. set_ducked(True) fades the bed to SILENCE

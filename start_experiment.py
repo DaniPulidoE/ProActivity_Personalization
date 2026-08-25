@@ -162,6 +162,7 @@ data is analysed.
 """
 
 import html
+import json
 import os
 import re
 import socket
@@ -839,6 +840,37 @@ def write_session_id(root: Path) -> str:
 # COMMAND BUILDERS (FIXED)
 # =========================
 
+def block_finished_in_status(path, session) -> bool:
+    """Has Drive reported this block over, via the reverse status bridge?
+
+    THE SECOND SIGNAL, and the one that actually survives the rig. Drive does
+    NOT exit when a study block ends -- it freezes the world, shows the
+    end-of-session overlay and waits for a key, so the launcher sees a live
+    DRIVE process for as long as the screen is up. If the operator then stops
+    the launcher with Ctrl-C (which is exactly what --remote's own instructions
+    tell them to do), Drive is killed rather than exiting, and a wiring that
+    watched only for "DRIVE exited 0" would conclude the block never finished
+    and silently skip the questionnaire. That is what happened the first time.
+
+    So block completion is taken from the fact Drive publishes at the moment it
+    happens -- the ``drive_ended`` event it POSTs to this machine's own status
+    server -- and the process exit is treated as a second, redundant signal.
+
+    Session-scoped: a stale file from the previous block would otherwise mark
+    this one finished before it started.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return False                      # not started, or raced the rewrite
+    if not isinstance(rec, dict):
+        return False
+    if session and (rec.get("session_id") or "") != session:
+        return False
+    return rec.get("drive_ended_ts") is not None
+
+
 def run_questionnaire(args, session) -> int:
     """Van der Laan + INTUI, once the block has finished. Blocking, foreground.
 
@@ -1329,22 +1361,11 @@ def run_provoice_only(args) -> None:
     finally:
         pm.stop_all()
         print("[EXIT] experiment stopped")
-
-    # AFTER the finally, so the rig is down and nothing is recording while the
-    # participant answers. Only on a clean block end: a Ctrl-C, a crash or a
-    # SystemExit skips this entirely, because a questionnaire about a block that
-    # did not happen is worse than a missing one -- it looks like data.
-    if block_complete and not args.no_questionnaire:
-        code = run_questionnaire(args, session)
-        if code != 0:
-            raise SystemExit(code)
-    elif block_complete:
-        print("[SKIP] questionnaire suppressed (--no-questionnaire). Run it by "
-              "hand before the next block, or the block has no ratings:")
-        print("    %s -m src.drive.questionnaire --participantid %s "
-              "--condition %s --block-idx %s --session-id %s"
-              % (sys.executable, args.participantid, args.condition,
-                 args.block_idx, session))
+    # NO questionnaire here, deliberately. This is the ProVoice half, which runs
+    # on the machine the participant is NOT sitting at -- it has no display in
+    # front of them, and it is given no --participantid, --condition or
+    # --block-idx to file the answers under. The form belongs to the CARLA half;
+    # see the tail of main().
 
 
 # =========================
@@ -2502,6 +2523,13 @@ def main():
     # declared out here because it is read AFTER the try/finally, where the
     # questionnaire runs.
     block_complete = False
+    # Separate from block_complete: the block can be FINISHED (Drive said so)
+    # while Drive is still up showing its end screen. Only the exit ends the
+    # loop; only the report decides whether to ask the questionnaire.
+    drive_exited = False
+    # None = the questionnaire has not been run. Set to the child's exit code
+    # once it has, so the fallback after the `finally` cannot open a second one.
+    questionnaire_code = None
 
     try:
         # =========================
@@ -2743,9 +2771,23 @@ def main():
         # =========================
         print("[RUNNING] experiment started")
 
+        watch_status = bool(args.study_satisfaction and args.remote
+                            and args.status_file)
         while True:
             time.sleep(1)
-            if block_complete:
+            # Checked BEFORE the exit scan: Drive stays alive on its end screen,
+            # so this is usually the first thing to fire, and setting the flag
+            # early is what lets a Ctrl-C from the operator still reach the
+            # questionnaire. It deliberately does NOT break -- the participant
+            # dismisses the end screen, Drive exits, and the branch below ends
+            # the loop the tidy way.
+            if (watch_status and not block_complete
+                    and block_finished_in_status(args.status_file, session)):
+                block_complete = True
+                print("[DONE] Drive reports the block is over. The questionnaire "
+                      "opens once the rig is down -- dismiss the end screen, or "
+                      "Ctrl-C here; either way the answers are still recorded.")
+            if drive_exited:
                 break
             # Snapshot: restart_supervised() rewrites pm.processes.
             for name, p in list(pm.processes):
@@ -2757,18 +2799,37 @@ def main():
                     print("[DONE] calibration stored; stopping the experiment")
                     raise SystemExit(0)
                 if name == "DRIVE" and args.study_satisfaction and code == 0:
-                    # THE NORMAL END OF A STUDY BLOCK, not a crash. Drive runs
-                    # its own 10-minute clock and exits when the last call is
-                    # accounted for, so a zero here is the block completing --
-                    # it was being reported as [CRASH] because nothing
-                    # distinguished it from Drive dying.
+                    drive_exited = True
+                    # A CLEAN EXIT, not a crash -- it was being reported as
+                    # [CRASH] because nothing distinguished a zero here from
+                    # Drive dying.
                     #
-                    # Flag and break rather than SystemExit: the questionnaire
-                    # has to run AFTER pm.stop_all(), and raising here would take
-                    # the whole function out through `finally` and skip it.
-                    print("[DONE] study block finished; shutting the rig down "
-                          "before the questionnaire.")
+                    # But note WHEN this fires: Drive does not exit when the
+                    # block ends, it shows the end-of-session overlay and waits
+                    # for a key, so this is the participant DISMISSING that
+                    # screen, which can be minutes later or never. Block
+                    # completion itself comes from the status bridge above; this
+                    # branch only ends the loop tidily and, on a local run with
+                    # no bridge, doubles as the completion signal.
+                    #
+                    # Flag rather than SystemExit: the questionnaire has to run
+                    # AFTER pm.stop_all(), and raising here would take the whole
+                    # function out through `finally` and skip it.
+                    print("[DONE] Drive closed.")
                     block_complete = True
+                    # STRAIGHT AWAY, before pm.stop_all(). The participant just
+                    # pressed a button on a screen that said "continue", so the
+                    # form has to be what appears next -- putting the rig
+                    # teardown in between shows them a desktop for several
+                    # seconds and turns one hand-off into two.
+                    #
+                    # Nothing here records participant data: CARLA, the traffic,
+                    # the bridges and the status server are all still up, and
+                    # ProVoice on the other machine stopped when it saw
+                    # drive_ended. So there is nothing to gain by shutting down
+                    # first, and a worse handover to lose.
+                    if not args.no_questionnaire:
+                        questionnaire_code = run_questionnaire(args, session)
                     break
 
                 # A supervised side channel dying must not end a participant
@@ -2827,6 +2888,31 @@ def main():
     finally:
         pm.stop_all()
         print("[EXIT] experiment stopped")
+
+    # AFTER the finally, so the rig is down and nothing is recording while the
+    # participant answers. Only on a clean block end: a Ctrl-C, a crash or a
+    # SystemExit skips this entirely, because a questionnaire about a block that
+    # did not happen is worse than a missing one -- it looks like data.
+    #
+    # This belongs to main() and NOT to run_provoice_only(): the two functions
+    # end with an identical `finally: pm.stop_all()`, and a first-occurrence
+    # patch once put this block in the other one, where `block_complete` does not
+    # exist. It only surfaced at shutdown, on the ProVoice machine.
+    # FALLBACK PATH ONLY. The normal route runs it the moment Drive closes, so
+    # this covers the block that finished but whose Drive never exited -- the
+    # operator pressed Ctrl-C on the end screen instead of a wheel button.
+    if (block_complete and not args.no_questionnaire
+            and questionnaire_code is None):
+        questionnaire_code = run_questionnaire(args, session)
+    if questionnaire_code not in (None, 0):
+        raise SystemExit(questionnaire_code)
+    if block_complete and args.no_questionnaire:
+        print("[SKIP] questionnaire suppressed (--no-questionnaire). Run it by "
+              "hand before the next block, or the block has no ratings:")
+        print("    %s -m src.drive.questionnaire --participantid %s "
+              "--condition %s --block-idx %s --session-id %s"
+              % (sys.executable, args.participantid, args.condition,
+                 args.block_idx, session))
 
 
 if __name__ == "__main__":
