@@ -89,31 +89,35 @@ one ``--verify-against`` actually checks, cell by cell, against that run's CSV.
 Everything downstream of ``embed_segments`` is a ~260-parameter convex fit on a
 (K x 76) tensor, so the whole cohort costs one backbone pass per driver.
 
-TAU COMES FROM ``results/committed_tau.json``, NOT FROM A FLAG
+TAU=1.0, ADOPTED FROM THE CURVE -- NOT ``committed_tau.json``
 =============================================================
-tau=0.05, 2000 steps, lr=5e-3 — the values committed on 2026-08-18 for BOTH
-arms. Note the K curve above was produced at tau=1.0 / 6000 steps, so the
-checkpoints this script writes are NOT at the curve's tau by default. That is
-deliberate: the committed file is the decision, and its own analysis shows tau is
-a tenth-order effect (the whole grid below tau=1 spans 0.028 against a
-between-driver sd of 0.343), so it cannot move the arm choice. It does move the
-absolute numbers slightly, which is why ``--verify-against`` tolerances are on by
-default rather than exact — pass ``--tau 1.0 --steps 6000`` to reproduce the
-curve exactly and expect agreement to ~1e-6.
+``results/committed_tau.json`` commits tau=0.05 for both arms. **It was never
+applied.** Confirmed by the operator on 2026-08-25 and corroborated on disk: the
+phone-call curve records tau=1.0, ``selected_anil.json`` records tau=1.0, and the
+only runs at 0.05 (``results/arm_comparison``, 2026-08-19) predate the ANIL sweep
+and use a superseded ANIL with a different unadapted floor.
 
-The committed value is also the BETTER of the two at the K this study deploys.
-Mean set-MAE over K in 1..12 on ``results/l2sp_sweep_fcd_extend``, where the
-ordering is monotone in tau: 0.005 -> 1.3135, **0.05 -> 1.3390**, 0.5 -> 1.3576,
-1.0 -> 1.3653. A weaker anchor wins at every low K, which is the opposite of the
-usual intuition and is worth a sentence in the write-up.
+So this script adopts tau, steps, val_frac and embed_fcd from
+``--match-curve``'s own JSON. The reason is not deference to history: the ladder
+0.948 / 0.708 / 0.514 that justified K=4 and K=8 is a **tau=1.0 ladder**, and K
+was read off it. Deploy at 0.05 and the served head corresponds to no measured
+curve point -- ``--verify-against`` would be comparing two different estimators,
+and the study's independent variable would have been chosen on a curve the
+deployment does not sit on.
 
-**Do not re-select tau on the phone-call slice.** Going below 0.05 buys 0.026
-against a between-driver sd of 0.343, and ``committed_tau.json`` already declined
-the grid minimum for a reason that is not cosmetic: the Laplace layer expands
-about the MAP, 0.005 sits at the grid edge, and 0.05 is the best-converged point
-in the grid (98% of cells at |grad|<=1e-3). Re-tuning on this function's tail
-would also be exactly the selection-validity problem ``phone_call_k_curve``
-refuses to open -- 5-10 query segments per driver.
+What that costs, stated rather than left to be discovered: **tau=0.05 is
+measurably better at these K.** Mean set-MAE over K in 1..12 on
+``results/l2sp_sweep_fcd_extend``, monotone in tau: 0.005 -> 1.3135,
+0.05 -> 1.3390, 0.5 -> 1.3576, **1.0 -> 1.3653**. A weaker anchor wins at every
+low K, which is the opposite of the usual intuition. Adopting it properly means
+re-running the phone-call curve at 0.05 and re-reading K off the new curve --
+and, for the ANIL arm, re-meta-training, since iMAML's inner loop is
+tau-dependent. Until then, matching the curve is worth more than 0.026 of
+set-MAE against a between-driver sd of 0.343.
+
+**Do not re-select tau on the phone-call slice** in any case: 5-10 query segments
+per driver is exactly the selection-validity problem ``phone_call_k_curve``
+refuses to open.
 
 WHAT PROVENANCE GETS WRITTEN, AND WHY IN ``arch``
 =================================================
@@ -167,11 +171,20 @@ DEFAULT_K_MAP = {0: 0, 1: 4, 2: 8}
 # of the driver being unusual.
 GRAD_NORM_WARN = 1e-3
 
-# Tolerance for --verify-against when tau/steps differ from the curve's. Loose
-# enough to pass a tau change (a tenth-order effect), tight enough that a
-# different SUPPORT SET -- the failure this check exists to catch -- cannot slip
-# through: per-driver set-MAE differences from a wrong support are ~0.1-0.5.
-VERIFY_ATOL = 0.05
+# --verify-against tolerances. TWO, because they answer different questions.
+#
+# When the adaptation settings were ADOPTED from the curve (the default), this
+# script runs the identical estimator on the identical support, so the two
+# numbers must agree to float noise. Anything above the exact bound is a real
+# difference -- a different support set, a different split, a rebuilt LODO
+# checkpoint -- and should stop the build.
+#
+# When tau or steps were overridden the estimators genuinely differ, and only the
+# SUPPORT SET is still being checked. A wrong support moves per-driver set-MAE by
+# ~0.1-0.5 on this slice, so the loose bound still catches it while tolerating a
+# tau change.
+VERIFY_ATOL_EXACT = 1e-4
+VERIFY_ATOL_LOOSE = 0.05
 
 
 def sha256_of(path: pathlib.Path) -> str:
@@ -243,6 +256,8 @@ def resolve_adapt_cfg(args) -> Dict:
 
 def support_and_tail(df: pd.DataFrame, arch: Dict, model, want_key: str,
                      val_frac: float, device: str):
+    # `want_key` is the CANONICAL key from resolve_function_key ('startaphonecall'),
+    # never the display name -- see resolve_key().
     """Embed one driver's phone-call segments and split support / evaluation tail.
 
     Identical construction to ``phone_call_k_curve.curve_for_arm`` under
@@ -304,11 +319,13 @@ def build_for_driver(pid: str, args, cfg: Dict, k_map: Dict[int, int],
     head_type = arch.get("head_type", "softmax")
     pop_head = model.head
 
-    df = load_driver_rows(pathlib.Path(args.in_data), pid, args.function)
+    df = load_driver_rows(pathlib.Path(args.in_data), pid, args.function_key)
     if df.empty:
-        print(f"[{pid}] no rows for {args.function!r} -- skipped.")
+        print(f"[{pid}] no rows for {args.function!r} "
+              f"(key {args.function_key!r}) -- skipped.")
+        report_available_functions(pathlib.Path(args.in_data), pid)
         return []
-    packed, why = support_and_tail(df, arch, model, args.function,
+    packed, why = support_and_tail(df, arch, model, args.function_key,
                                    args.val_frac, device)
     if packed is None:
         print(f"[{pid}] {why} -- skipped.")
@@ -370,7 +387,10 @@ def build_for_driver(pid: str, args, cfg: Dict, k_map: Dict[int, int],
             "adapt_lr": float(cfg["lr"]),
             "l2sp": float(info["l2sp"]),
             "grad_norm": float(info["grad_norm"]),
-            "function": args.function,
+            # The canonical key, matching what phone_call_k_curve.json records,
+            # plus the display name it came from.
+            "function": args.function_key,
+            "function_name": args.function,
             "embed_fcd": int(args.embed_fcd),
             "head_in": int(head.in_features),
             "base_checkpoint": ckpt.name,
@@ -425,8 +445,12 @@ def check_against_curve(curve: pd.DataFrame, pid: str, k: int, mae: float,
         return "(no curve cell)"
     ref = float(sel.iloc[0]["set_mae"])
     d = mae - ref
-    return ("MATCH  d=%+.4f" % d) if abs(d) <= VERIFY_ATOL else \
-        ("MISMATCH d=%+.4f vs curve %.4f -- DIFFERENT SUPPORT?" % (d, ref))
+    atol = VERIFY_ATOL_EXACT if args._matches_curve else VERIFY_ATOL_LOOSE
+    if abs(d) <= atol:
+        return "MATCH  d=%+.1e" % d
+    hint = ("DIFFERENT SUPPORT?" if args._matches_curve
+            else "expected under a tau/steps override -- check the SIZE")
+    return "MISMATCH d=%+.4f vs curve %.4f -- %s" % (d, ref, hint)
 
 
 def check_anil_tau(args, cfg: Dict) -> None:
@@ -576,16 +600,24 @@ def main() -> None:
         args.val_frac = cfg.get("val_frac", args.val_frac)
     if args.embed_fcd and not cfg.get("embed_fcd", True):
         args.embed_fcd = False
+    # Did we actually run the curve's estimator? Decides which tolerance
+    # --verify-against applies, so it is settled once rather than re-derived.
+    args._matches_curve = str(cfg.get("source", "")).endswith(".json")
     verify = pd.read_csv(args.verify_against) if args.verify_against else None
 
     print("arm=%s  function=%r  tau=%g  steps=%d  lr=%g  embed_fcd=%d  device=%s"
           % (args.arm, args.function, cfg["tau"], cfg["steps"], cfg["lr"],
              int(args.embed_fcd), args.device))
     print("conditions: " + "  ".join("%d->K=%d" % (c, k_map[c]) for c in sorted(k_map)))
-    if verify is not None and (cfg["tau"] != 1.0 or cfg["steps"] != 6000):
-        print("NOTE verifying against a curve produced at a different tau/steps; "
-              "cells are compared to +-%.2f set-MAE, which catches a wrong "
-              "SUPPORT SET but not a small tau shift." % VERIFY_ATOL)
+    if verify is not None:
+        print("verify tolerance: %s (%.0e) -- %s"
+              % (("EXACT", VERIFY_ATOL_EXACT,
+                  "settings adopted from the curve, so the estimators are "
+                  "identical and only the support set can differ")
+                 if args._matches_curve else
+                 ("LOOSE", VERIFY_ATOL_LOOSE,
+                  "tau/steps overridden, so only a wrong SUPPORT SET is being "
+                  "checked, not the estimator")))
     if args.dry_run:
         print("DRY RUN -- no files will be written.")
     print()
