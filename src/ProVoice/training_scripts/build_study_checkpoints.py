@@ -367,7 +367,6 @@ def build_for_driver(pid: str, args, cfg: Dict, k_map: Dict[int, int],
     install_fcd_head(model, args.embed_fcd)
     model.to(device).eval()
     head_type = arch.get("head_type", "softmax")
-    pop_head = model.head
 
     df = load_driver_rows(pathlib.Path(args.in_data), pid, args.function_key)
     if df.empty:
@@ -382,6 +381,22 @@ def build_for_driver(pid: str, args, cfg: Dict, k_map: Dict[int, int],
         return []
 
     Z, V = packed["Z"], packed["V"]
+
+    # THE BACKBONE IS DONE; EVERYTHING FROM HERE IS ON CPU.
+    #
+    # embed_segments returns `.cpu()` tensors unconditionally (see its last line)
+    # and V comes from torch.from_numpy, so both are CPU whatever --device says.
+    # Taking pop_head straight off the model after `.to(device)` therefore pairs
+    # a CUDA head with CPU embeddings, and the first matmul dies with "mat1 is on
+    # cpu". Moving the whole model back is preferable to moving just the head:
+    # the ~260-parameter fit and the metrics gain nothing from the GPU at K<=8,
+    # and it means the state_dict handed to save_checkpoint is uniformly CPU
+    # rather than a mix of a CPU head and a CUDA backbone.
+    model.cpu()
+    pop_head = model.head
+    assert pop_head.weight.device == Z.device == V.device, (
+        f"device split: head={pop_head.weight.device} Z={Z.device} V={V.device}")
+
     pool_idx, val_idx = packed["pool_idx"], packed["val_idx"]
     Zpool, Vpool = Z[pool_idx], V[pool_idx]
     Zval, Vval = Z[val_idx], V[val_idx]
