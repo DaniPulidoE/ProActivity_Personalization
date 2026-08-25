@@ -839,6 +839,61 @@ def write_session_id(root: Path) -> str:
 # COMMAND BUILDERS (FIXED)
 # =========================
 
+def run_questionnaire(args, session) -> int:
+    """Van der Laan + INTUI, once the block has finished. Blocking, foreground.
+
+    WHY IT IS LAUNCHED HERE AND NOT TYPED BY HAND
+    ---------------------------------------------
+    ``--participantid``, ``--condition`` and ``--block-idx`` are already settled
+    on this machine and already stamped into every call_events.csv row. Retyping
+    them at the one moment the operator is also resetting the simulator is how a
+    block's questionnaire ends up filed under the wrong condition -- and unlike a
+    wrong model path, nothing downstream would ever contradict it. So they are
+    passed through from the same args the block ran under.
+
+    AFTER pm.stop_all(), DELIBERATELY. The drive window is gone, ProVoice has
+    stopped recording and the bridges are down, so nothing is writing while the
+    participant answers. It also means a questionnaire that is abandoned costs
+    only the questionnaire.
+
+    Returns the child's exit code; 0 is a completed form, 1 an abort (nothing is
+    written), anything else a launch problem.
+    """
+    cmd = [
+        sys.executable, "-m", "src.drive.questionnaire",
+        "--participantid", str(args.participantid),
+        "--condition", str(args.condition),
+        "--block-idx", str(args.block_idx),
+        "--session-id", session,
+        *(["--fullscreen"] if args.fullscreen else []),
+    ]
+    print()
+    print("=" * 72)
+    print("[QUESTIONNAIRE] participant %s, block %s, condition %s"
+          % (args.participantid, args.block_idx, args.condition))
+    print("[QUESTIONNAIRE] mouse or number keys; the wheel is ignored here.")
+    print("=" * 72)
+    try:
+        code = subprocess.call(cmd)
+    except OSError as e:
+        print("[QUESTIONNAIRE] could not start: %s" % e)
+        code = 127
+    if code == 0:
+        return 0
+    # Every failure ends the same way: the block's answers are NOT recorded, and
+    # the fix is one line the operator can paste. Printing it beats leaving them
+    # to reconstruct three flags from memory after a 10-minute drive.
+    print()
+    print("[QUESTIONNAIRE] NOT COMPLETED (exit %s). Nothing was written." % code)
+    if code == 1:
+        print("                The form was closed before it was finished.")
+    print("                Re-run it on its own with:")
+    print()
+    print("    " + shell_quote(cmd))
+    print()
+    return code
+
+
 def build_drive_cmd(session, args, status_url=None):
     return [
         sys.executable,
@@ -1275,6 +1330,22 @@ def run_provoice_only(args) -> None:
         pm.stop_all()
         print("[EXIT] experiment stopped")
 
+    # AFTER the finally, so the rig is down and nothing is recording while the
+    # participant answers. Only on a clean block end: a Ctrl-C, a crash or a
+    # SystemExit skips this entirely, because a questionnaire about a block that
+    # did not happen is worse than a missing one -- it looks like data.
+    if block_complete and not args.no_questionnaire:
+        code = run_questionnaire(args, session)
+        if code != 0:
+            raise SystemExit(code)
+    elif block_complete:
+        print("[SKIP] questionnaire suppressed (--no-questionnaire). Run it by "
+              "hand before the next block, or the block has no ratings:")
+        print("    %s -m src.drive.questionnaire --participantid %s "
+              "--condition %s --block-idx %s --session-id %s"
+              % (sys.executable, args.participantid, args.condition,
+                 args.block_idx, session))
+
 
 # =========================
 # PROCESS MANAGER
@@ -1569,6 +1640,17 @@ def main():
                              "them; counterbalance the order across "
                              "participants. Forces the study traffic scenario "
                              "and --modeltype xlstm.")
+    parser.add_argument("--no-questionnaire", dest="no_questionnaire",
+                        action="store_true",
+                        help="Do NOT open the post-block questionnaire (Van der "
+                             "Laan acceptance + INTUI Magical Experience) when a "
+                             "--study-satisfaction block finishes. It normally "
+                             "opens automatically, with the participant, "
+                             "condition and block already filled in from this "
+                             "run -- which is the point, since those three are "
+                             "what a hand-typed launch gets wrong. Use this only "
+                             "for a rehearsal; the exact command to run it later "
+                             "is printed.")
     parser.add_argument("--condition", type=int, choices=(0, 1, 2), default=None,
                         help="Which model this block serves: 0 = population "
                              "(no personalization), 1 = low label count, 2 = "
@@ -2068,11 +2150,14 @@ def main():
                          action="store_true",
                          help="Satisfaction study, CARLA machine: one 10 min "
                               "block with 5 calls, over the link. "
-                              "= --study-satisfaction --remote --fullscreen. "
-                              "Give --participantid, --condition and "
+                              "= --study-satisfaction --remote --fullscreen "
+                              "--fixed. Give --participantid, --condition and "
                               "--block-idx HERE -- this machine chooses the "
                               "served model and publishes it, so the ProVoice "
-                              "side is told rather than asked.")
+                              "side is told rather than asked. When the block "
+                              "ends, the post-block questionnaire opens here "
+                              "automatically with those three already filled "
+                              "in (--no-questionnaire suppresses it).")
     presets.add_argument("--study-satisfaction-provoice-remote",
                          dest="experiment_study_satisfaction_provoice_remote",
                          nargs="?", const="", default=None, metavar="BRIDGE",
@@ -2390,6 +2475,9 @@ def main():
         print("[NOTE] --remote with --no-popup: no LoA labels will be recorded "
               "here. That is the calibration phase; for a data-collection run "
               "it means the session collects nothing, so drop --no-popup.")
+    if args.no_questionnaire and not args.study_satisfaction:
+        parser.error("--no-questionnaire only has an effect on a "
+                     "--study-satisfaction block; nothing else opens one.")
     if args.remote and args.calibration_only:
         # The status bridge reports the remote ProVoice's exit to DRIVE, which
         # ends the drive and shows the end screen. This launcher process still
@@ -2409,6 +2497,11 @@ def main():
     session = write_session_id(root)
 
     pm = ProcessManager()
+    # Set only when a --study-satisfaction block ends by itself, which is the one
+    # exit that means "this went fine, now ask the participant". It has to be
+    # declared out here because it is read AFTER the try/finally, where the
+    # questionnaire runs.
+    block_complete = False
 
     try:
         # =========================
@@ -2652,6 +2745,8 @@ def main():
 
         while True:
             time.sleep(1)
+            if block_complete:
+                break
             # Snapshot: restart_supervised() rewrites pm.processes.
             for name, p in list(pm.processes):
                 code = p.poll()
@@ -2661,6 +2756,20 @@ def main():
                     # Expected: ProVoice exits itself once the baseline is stored.
                     print("[DONE] calibration stored; stopping the experiment")
                     raise SystemExit(0)
+                if name == "DRIVE" and args.study_satisfaction and code == 0:
+                    # THE NORMAL END OF A STUDY BLOCK, not a crash. Drive runs
+                    # its own 10-minute clock and exits when the last call is
+                    # accounted for, so a zero here is the block completing --
+                    # it was being reported as [CRASH] because nothing
+                    # distinguished it from Drive dying.
+                    #
+                    # Flag and break rather than SystemExit: the questionnaire
+                    # has to run AFTER pm.stop_all(), and raising here would take
+                    # the whole function out through `finally` and skip it.
+                    print("[DONE] study block finished; shutting the rig down "
+                          "before the questionnaire.")
+                    block_complete = True
+                    break
 
                 # A supervised side channel dying must not end a participant
                 # session. Report it loudly -- the gap it leaves is real, the
