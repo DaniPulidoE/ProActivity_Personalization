@@ -133,8 +133,18 @@ INTUI_ITEMS = (
     ("...was fascinating",    "...was dull",               False, "magical"),
 )
 
+# Van der Laan's own instruction, which every item completes: "I find such a
+# system... Useful / Useless". Printed once above the block rather than repeated
+# on each row, the same way INTUI's stem is.
+#
+# It says SYSTEM, not "assistant", because that is the published wording and the
+# generic noun is what makes the instrument comparable across the studies that
+# report it. --vdl-stem overrides it if the brief names the assistant instead;
+# that is a wording change to record, not a formatting choice.
+VDL_STEM = "I find such a system..."
+
 PAGES = (
-    ("vdl",   "Acceptance of the assistant", VDL_ITEMS, None),
+    ("vdl",   "Acceptance of the assistant", VDL_ITEMS, VDL_STEM),
     ("intui", "Your experience",             INTUI_ITEMS, INTUI_STEM),
 )
 
@@ -216,14 +226,15 @@ MARGIN = 44
 class Questionnaire(object):
     """Two pages of semantic differentials, mouse or keyboard."""
 
-    def __init__(self, screen, scale_points: int, intui_stem: str):
+    def __init__(self, screen, scale_points: int, stems: dict = None):
         self.screen = screen
         self.n = scale_points
-        # Pages are built ONCE, here, with the stem substituted -- rather than
+        # Pages are built ONCE, here, with the stems substituted -- rather than
         # patching the module-level PAGES, which would make the instrument
         # depend on import order and leak between two instances.
+        stems = stems or {}
         self.pages = tuple(
-            (k, t, items, (intui_stem if k == "intui" else stem))
+            (k, t, items, stems.get(k, stem))
             for k, t, items, stem in PAGES)
         self.quit_requested = False
         w, h = screen.get_size()
@@ -483,6 +494,13 @@ def main() -> None:
                          "participant meets one format, at the cost of "
                          "comparability with published norms. Keep it FIXED "
                          "across every participant and block.")
+    ap.add_argument("--vdl-stem", dest="vdl_stem", default=VDL_STEM,
+                    help="Shared instruction above the Van der Laan items "
+                         "(default: %(default)r, the published wording). Note "
+                         "it says 'system' while the page title says "
+                         "'assistant'; change both together if the brief calls "
+                         "it something else, and keep it FIXED across every "
+                         "participant and block.")
     ap.add_argument("--intui-stem", dest="intui_stem", default=INTUI_STEM,
                     help="Shared stem for the INTUI items (default: %(default)r, "
                          "the published wording). Changing it to name the "
@@ -533,7 +551,8 @@ def main() -> None:
     pygame.display.set_caption("Questionnaire - participant %s, block %s"
                                % (args.participantid, args.block_idx))
 
-    q = Questionnaire(screen, args.scale_points, args.intui_stem)
+    q = Questionnaire(screen, args.scale_points,
+                      {"vdl": args.vdl_stem, "intui": args.intui_stem})
 
     clock = pygame.time.Clock()
     started = time.time()
