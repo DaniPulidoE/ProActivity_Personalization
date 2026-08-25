@@ -26,25 +26,49 @@ score on that function's temporal tail only). Paired over 12 drivers:
     8   0.514   0.501   -0.013 (0.19 SE)      3/12
 
 The arms are indistinguishable at both study K values (the run's own headline:
-Wilcoxon p=0.73, "indistinguishable"), so accuracy does not choose. What chooses
-is the K=0 row.
+Wilcoxon p=0.73, "indistinguishable"), and note the sign counts: L2-SP is better
+for 8 of 12 drivers at K=4 and 9 of 12 at K=8, while ANIL's nominally lower MEAN
+is carried by two or three large wins. By the median driver L2-SP *is* the better
+model, so "pick the best one" does not select ANIL either.
 
-**The K=0 confound is the whole argument.** The study serves
-``pop_heldout_<pid>.pt`` as its unpersonalized condition, and the design requires
-all three conditions to share one backbone so that no part of the K effect can be
-"the backbone had seen your data". ANIL's floor is 0.130 better than L2-SP's
-because its backbone is meta-trained. Serve ANIL at K>0 with the LODO model at
-K=0 and **0.130 of the 0.240 K=0->K=4 movement is the backbone changing, not the
-labels** — more than half the effect, confounded. Serve the ANIL meta-init at
-K=0 instead and the condition stops being "the population model": a meta-init is
-trained specifically to be adapted, so labelling it "no personalization" in the
-write-up would be false.
+**The argument that decides it is definitional, not statistical.** The K=0
+condition has to mean *no personalization*. The ANIL meta-init is a model whose
+entire training objective was "be easy to personalize" -- it IS personalization
+machinery, and labelling it the no-personalization control is a category error
+regardless of its MAE. L2-SP's K=0 is ``pop_heldout_<pid>.pt``, a population
+model and nothing else, which is exactly the claim the condition makes.
 
-Two lesser reasons point the same way. L2-SP moves FURTHER from its own floor,
-which is what the live study is trying to detect (K=4: -0.240 vs -0.133; K=8:
--0.434 vs -0.318, improving 9/12 drivers vs 8/12) — a bigger, more consistent
-per-label movement is a better chance of a detectable satisfaction difference.
-And it is the simpler artifact to defend.
+That also settles the mixed design, which is the one arrangement that is
+outright broken: LODO at K=0 with ANIL at K>0 puts a different backbone under the
+baseline than under the treatments, so part of the K effect is the backbone
+changing. (Treat the size of that part as unknown rather than as the 0.130 floor
+gap -- that gap is itself only 1.15 SE and favours L2-SP on 7 of 12 drivers.)
+
+One measurement consequence, worth knowing before anyone argues for all-ANIL on
+"use the best models" grounds: a better floor COMPRESSES the effect the study
+exists to measure. All-ANIL runs 0.818 -> 0.686 -> 0.501 (K span -0.317);
+all-L2-SP runs 0.948 -> 0.708 -> 0.514 (-0.434), and the K=0->K=4 step nearly
+halves, -0.240 to -0.132. With 12 participants and a satisfaction DV that is
+power there is none to spare.
+
+WHERE "USE THE BEST MODELS" ACTUALLY BITES -- AND IT IS NOT THE ARM
+==================================================================
+Two things in this file already answer it, and both are worth defending out loud
+rather than leaving implicit.
+
+**Phone-call-only support is ~7x more label-efficient than the alternative.**
+Scored on the identical phone-call tail, support drawn from ALL functions
+(``phone_call_k_curve_all``) needs K~60 to reach what this function's own labels
+reach at K=6:
+
+    K            4       6       8      40      60
+    function  0.708   0.467   0.514     --      --
+    all       0.827   0.876   0.833   0.648   0.430
+
+**And K=8 is already the plateau for this function**, so the supervisor's premise
+-- more data in the real world -- does not imply a better condition-2 model here.
+K=13 reaches 0.492 against K=8's 0.514: K=8 captures ~95% of the total achievable
+gain, and the remaining 0.022 is noise at a 5-10 segment tail.
 
 NOT a reason: "LODO wins at few labels and ANIL at many". The measured pattern is
 the reverse at the low end (ANIL's mean is nominally better at K=1-4 and L2-SP's
@@ -77,6 +101,20 @@ absolute numbers slightly, which is why ``--verify-against`` tolerances are on b
 default rather than exact — pass ``--tau 1.0 --steps 6000`` to reproduce the
 curve exactly and expect agreement to ~1e-6.
 
+The committed value is also the BETTER of the two at the K this study deploys.
+Mean set-MAE over K in 1..12 on ``results/l2sp_sweep_fcd_extend``, where the
+ordering is monotone in tau: 0.005 -> 1.3135, **0.05 -> 1.3390**, 0.5 -> 1.3576,
+1.0 -> 1.3653. A weaker anchor wins at every low K, which is the opposite of the
+usual intuition and is worth a sentence in the write-up.
+
+**Do not re-select tau on the phone-call slice.** Going below 0.05 buys 0.026
+against a between-driver sd of 0.343, and ``committed_tau.json`` already declined
+the grid minimum for a reason that is not cosmetic: the Laplace layer expands
+about the MAP, 0.005 sits at the grid edge, and 0.05 is the best-converged point
+in the grid (98% of cells at |grad|<=1e-3). Re-tuning on this function's tail
+would also be exactly the selection-validity problem ``phone_call_k_curve``
+refuses to open -- 5-10 query segments per driver.
+
 WHAT PROVENANCE GETS WRITTEN, AND WHY IN ``arch``
 =================================================
 ``arch['study']`` carries participant_id, held_out_pid, arm, condition, K, tau,
@@ -104,6 +142,7 @@ import torch
 from ProVoice.models.xlstm_model import load_checkpoint, save_checkpoint
 from ProVoice.models.head_adapt import (
     adapt_head, install_fcd_head, DEFAULT_ADAPT_LR, DEFAULT_ADAPT_STEPS,
+    DEFAULT_TAU as DEFAULT_TAU_FALLBACK,
 )
 from ProVoice.training_scripts.folds import ALL_PIDS
 # The function filter is IMPORTED, not re-implemented: it resolves through
@@ -143,20 +182,63 @@ def sha256_of(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 
-def load_committed(path: pathlib.Path) -> Dict:
-    """The committed tau and adaptation budget, or a loud failure.
+def resolve_adapt_cfg(args) -> Dict:
+    """The adaptation settings, taken FROM THE CURVE THAT CHOSE THE K VALUES.
 
-    Read rather than defaulted: ``committed_tau.json`` states that it applies to
-    both arms and that the per-sweep ``selected_tau.json`` files are unusable
-    (their 1-SE tie-break returns the grid maximum, an artifact of where each
-    grid happened to end). Hardcoding a number here would be a fourth opinion.
+    Not from ``committed_tau.json``. That file records a decision (tau=0.05) that
+    was never applied: the LODO checkpoints, the ANIL meta-training and every
+    published curve were all run at **tau=1.0**, confirmed by the operator on
+    2026-08-25 and by ``phone_call_k_curve.json`` and ``selected_anil.json``
+    agreeing on 1.0. Deploying at 0.05 would make the served head correspond to
+    no measured curve point at all -- the ladder 0.948 / 0.708 / 0.514 that
+    justified K=4 and K=8 is a tau=1.0 ladder, and K was read off it.
+
+    So the curve's own JSON is the source of truth here, which also means this
+    script cannot drift from it silently: change the curve, rerun this, and the
+    settings follow. ``committed_tau.json`` is still read, but only to say out
+    loud that the two disagree.
+
+    Note what is being given up, so it can be stated rather than discovered:
+    tau=0.05 is measurably BETTER at these K (pooled over K<=12, monotone in tau:
+    0.05 -> 1.3390 against 1.0 -> 1.3653). Deploying the better tau would mean
+    re-running the phone-call curve at 0.05 and re-reading K off it -- and, for
+    the ANIL arm, re-meta-training, since its inner loop is tau-dependent. Until
+    that happens, matching the curve is worth more than 0.026 of set-MAE.
     """
-    if not path.exists():
-        raise SystemExit(
-            f"{path} not found. It is the record of which tau the study "
-            f"deploys; pass --tau/--steps/--lr explicitly to override, or point "
-            f"--committed at the right file.")
-    return json.loads(path.read_text(encoding="utf-8"))
+    cfg: Dict = {"lr": DEFAULT_ADAPT_LR}
+    src = pathlib.Path(args.match_curve) if args.match_curve else None
+    if src is not None and src.exists():
+        j = json.loads(src.read_text(encoding="utf-8"))
+        cfg["tau"] = float(j["tau"])
+        cfg["steps"] = int(j["steps"])
+        cfg["source"] = str(src)
+        # val_frac and embed_fcd are inherited too, for the same reason: they
+        # define the split and the head width the curve was measured on, and a
+        # mismatch in either would silently score a different estimator.
+        cfg["val_frac"] = float(j.get("val_frac", args.val_frac))
+        cfg["embed_fcd"] = bool(j.get("embed_fcd", 1))
+    else:
+        if src is not None:
+            print(f"[WARN] {src} not found; falling back to head_adapt defaults.")
+        cfg.update(tau=DEFAULT_TAU_FALLBACK, steps=DEFAULT_ADAPT_STEPS,
+                   source="head_adapt defaults", val_frac=args.val_frac,
+                   embed_fcd=True)
+
+    for k, v in (("tau", args.tau), ("steps", args.steps), ("lr", args.lr)):
+        if v is not None:
+            cfg[k] = v
+            cfg["source"] = "CLI override"
+
+    committed = pathlib.Path(args.committed)
+    if committed.exists():
+        ct = float(json.loads(committed.read_text(encoding="utf-8")).get("tau", float("nan")))
+        if ct == ct and abs(ct - cfg["tau"]) > 1e-12:
+            print("[NOTE] %s commits tau=%g, but this build uses tau=%g -- the "
+                  "value everything was actually RUN at. The committed file was "
+                  "never applied; keeping the pipeline self-consistent beats "
+                  "adopting it for the served checkpoints alone. Say which was "
+                  "used in the write-up." % (committed, ct, cfg["tau"]))
+    return cfg
 
 
 def support_and_tail(df: pd.DataFrame, arch: Dict, model, want_key: str,
@@ -347,6 +429,67 @@ def check_against_curve(curve: pd.DataFrame, pid: str, k: int, mae: float,
         ("MISMATCH d=%+.4f vs curve %.4f -- DIFFERENT SUPPORT?" % (d, ref))
 
 
+def check_anil_tau(args, cfg: Dict) -> None:
+    """Refuse to serve an ANIL init at a tau it was not meta-trained for.
+
+    THIS IS NOT A STYLE CHECK. The ANIL arm is iMAML, and iMAML was chosen over
+    path-differentiated ANIL for exactly one reason (CLAUDE.md): implicit
+    differentiation needs only the inner problem's SOLUTION, so the meta-training
+    inner loop can be the identical objective that gets deployed. That objective
+    is soft-CORN plus ``lam * ||theta - theta_pop||^2`` with ``lam = tau / (2K)``
+    -- it is tau-dependent. Meta-train at tau=1.0 and serve at tau=0.05 and the
+    deployed problem is NOT the one that was differentiated through, which voids
+    the single guarantee the variant was selected for. Nothing would raise; the
+    checkpoint would simply be an init optimized for a different fixed point.
+
+    ``results/anil_sweep*/selected_anil.json`` currently records tau=1.0 with the
+    note "tau is FROZEN from the L2-SP sweep", but it was written 2026-08-21,
+    three days AFTER results/committed_tau.json committed tau=0.05 for both arms
+    and said sweep_anil_hparams must be pointed at that file. So the two records
+    disagree, and an ANIL build inherits the disagreement silently. Resolve it by
+    re-meta-training at the committed tau -- not by passing --tau here, which only
+    moves the mismatch from meta-training to serving.
+    """
+    if args.arm != "anil":
+        return                     # L2-SP has no meta-trained tau to match
+
+    # ONE named file, not a glob over every sweep on disk. The draft runs used
+    # different taus (anil_sweep_draft is at 0.05, the finals at 1.0), so a scan
+    # can only ever contradict itself -- and which sweep produced the checkpoints
+    # in --ckpt-dir is something the operator knows and this script does not.
+    p = pathlib.Path(args.anil_selected) if args.anil_selected else None
+    if p is None:
+        cands = [q for q in pathlib.Path("results").glob("anil_sweep*/selected_anil.json")
+                 if "draft" not in q.parent.name]
+        p = max(cands, key=lambda q: q.stat().st_mtime) if cands else None
+    if p is None or not p.exists():
+        print("[WARN] --arm anil but no selected_anil.json was found, so the "
+              "meta-training tau cannot be checked against tau=%g. Verify by "
+              "hand before serving -- see check_anil_tau." % cfg["tau"])
+        return
+
+    j = json.loads(p.read_text(encoding="utf-8"))
+    t = float(j.get("tau", float("nan")))
+    if t == t and abs(t - cfg["tau"]) > 1e-12:
+        raise SystemExit(
+            "REFUSING to build ANIL checkpoints at tau=%g: %s records the "
+            "meta-training inner-loop tau as %g.\n\n"
+            "iMAML's inner objective depends on tau (lam = tau/2K), so an init "
+            "meta-trained at %g is optimized for a fixed point that tau=%g does "
+            "not have. Serving it here would void the one property iMAML was "
+            "chosen for over path-differentiated ANIL.\n\n"
+            "Options, in order of preference:\n"
+            "  1. Re-meta-train ANIL with inner tau=%g (the committed value).\n"
+            "  2. Pass --tau %g to match the meta-init, and state in the "
+            "write-up that the ANIL arm is served at a tau the L2-SP sweep did "
+            "not select.\n"
+            "  3. Point --anil-selected at the sweep that actually produced "
+            "%s.\n"
+            % (cfg["tau"], p, t, t, cfg["tau"], cfg["tau"], t, args.ckpt_dir))
+    print("[ok] ANIL meta-training tau (%s) matches the adaptation tau: %g."
+          % (p, cfg["tau"]))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -374,7 +517,23 @@ def main() -> None:
                     help="Evaluation tail, for REPORTING only -- nothing is "
                          "fitted or selected on it (default: %(default)s). Must "
                          "match the curve's to compare against it.")
-    ap.add_argument("--committed", default="results/committed_tau.json")
+    ap.add_argument("--match-curve", dest="match_curve",
+                    default="results/phone_call_k_curve/phone_call_k_curve.json",
+                    help="The K curve this study reads its K values off. Its "
+                         "tau, steps, val_frac and embed_fcd are ADOPTED, so the "
+                         "served head is the same estimator as the curve point "
+                         "that justified deploying it (default: %(default)s).")
+    ap.add_argument("--committed", default="results/committed_tau.json",
+                    help="Cross-check only. Records a tau that was never "
+                         "applied; a disagreement with --match-curve is printed, "
+                         "not acted on.")
+    ap.add_argument("--anil-selected", dest="anil_selected", default=None,
+                    help="selected_anil.json for the sweep that produced the "
+                         "--ckpt-dir checkpoints. Used ONLY with --arm anil, to "
+                         "refuse a build whose adaptation tau differs from the "
+                         "meta-training inner-loop tau (see check_anil_tau -- "
+                         "the mismatch voids iMAML's train/serve identity). "
+                         "Defaults to the newest non-draft results/anil_sweep*/.")
     ap.add_argument("--tau", type=float, default=None,
                     help="Override the committed tau. Only for reproducing a "
                          "specific curve run.")
@@ -409,14 +568,14 @@ def main() -> None:
             "it; a non-zero K there would make the study's baseline a "
             "personalized model." % k_map[0])
 
-    committed = load_committed(pathlib.Path(args.committed))
-    cfg = {
-        "tau": args.tau if args.tau is not None else float(committed["tau"]),
-        "steps": args.steps if args.steps is not None
-                 else int(committed.get("adapt_steps", DEFAULT_ADAPT_STEPS)),
-        "lr": args.lr if args.lr is not None
-              else float(committed.get("adapt_lr", DEFAULT_ADAPT_LR)),
-    }
+    cfg = resolve_adapt_cfg(args)
+    check_anil_tau(args, cfg)
+    # Inherited from the curve so the estimator cannot drift; an explicit CLI
+    # value still wins, since --val-frac has a real default.
+    if args.val_frac == 0.3:
+        args.val_frac = cfg.get("val_frac", args.val_frac)
+    if args.embed_fcd and not cfg.get("embed_fcd", True):
+        args.embed_fcd = False
     verify = pd.read_csv(args.verify_against) if args.verify_against else None
 
     print("arm=%s  function=%r  tau=%g  steps=%d  lr=%g  embed_fcd=%d  device=%s"
