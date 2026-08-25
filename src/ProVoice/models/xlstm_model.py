@@ -1010,7 +1010,21 @@ def load_checkpoint(path: str, map_location: str = 'cpu') -> Tuple[XLSTMSequence
     # inference) but don't pass them to the constructor. Checkpoints written
     # before resampling existed simply lack the key, and .get() yields None →
     # resampling stays off for them, which is the old behaviour.
-    _DATA_CONTRACT_KEYS = ("window_seconds", "resample_hz")
+    #
+    # 'study' is the third kind: PROVENANCE, written by
+    # training_scripts/build_study_checkpoints.py — which participant this head
+    # was adapted for, which LODO fold it came from, K, tau, and the base
+    # checkpoint's hash. It rides in `arch` rather than beside it because arch is
+    # already the checkpoint's data contract and survives a rename, and because
+    # the serving loader has to be able to assert the held-out pid matches
+    # --participantid: serving 004's head to 003 is silent and unrecoverable
+    # after the session.
+    #
+    # EVERY OTHER arch KEY IS A CONSTRUCTOR KWARG and is splatted into
+    # XLSTMSequenceClassifier below, so anything added here without being
+    # exempted raises TypeError at load. That is the whole reason this tuple
+    # exists rather than each caller remembering to strip its own extras.
+    _DATA_CONTRACT_KEYS = ("window_seconds", "resample_hz", "study")
     ctor_kwargs = {k: v for k, v in arch.items() if k not in _DATA_CONTRACT_KEYS}
     model = XLSTMSequenceClassifier(**ctor_kwargs)
 

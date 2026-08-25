@@ -142,45 +142,29 @@ _CALIBRATION_SCHEMA: Dict[str, Tuple[str, ...]] = {
 # and the zero-count value is used to avoid taking the square root of zero.
 _YAWN_ANSCOMBE_ZERO = 2.0 * math.sqrt(3.0 / 8.0)
 
-# ── Robust baseline statistics for the rPPG signals ───────────────────────────
-# HR/RR readings contain occasional harmonic-lock outliers (see _hr_is_harmonic),
-# so the baseline uses median + MAD rather than mean + std.
-# This value approximates the std by the median
-_MAD_TO_SIGMA = 1.4826
-# Floor in dispersion for bpm and rr:
+# ── rPPG heart-rate filtering ─────────────────────────────────────────────────
+# Every constant below, and the cleaning algorithm compute_calibration uses, are
+# defined ONCE in ProVoice.hr_filter and re-exported here under their original
+# names so the rest of this file is unchanged. That module is also imported by
+# data_preprocessing/heart_rate_preprocessing.py, which is what makes the stored
+# baseline this file writes and the baseline the offline dataset build writes the
+# same computation rather than two that happen to agree.
+from . import hr_filter as _hr_filter
+from .hr_filter import (
+    _HR_DELTA_CLIP,
+    _HR_HARMONIC_HI,
+    _HR_HARMONIC_LO,
+    _HR_RANGE,
+    _HR_REF_MIN,
+    _HR_REJECT_RUN_MAX,
+    _MAD_TO_SIGMA,
+    _ROBUST_SCALE_FLOOR,
+)
 
-_ROBUST_SCALE_FLOOR = {'bpm': 5.0, 'rr': 2.0}
-
-# Bound on the z-scores _standardized_delta emits (hr_delta, rr_delta), in both
-# directions. READ BY data_preprocessing/heart_rate_preprocessing.py via AST, so
-# this assignment is the single definition for the live and offline paths alike
-# — keep it a plain literal.
-#
-# Why bound it at all: the calibration std is measured over a 180 s window and
-# systematically underestimates a driver's range across a full drive (cohort
-# median 2.81 vs 5.28 bpm), and it does so by a different factor per driver
-# (1.0x to 4.0x). That inflates hr_delta unevenly — measured up to ±12 — on the
-# one STATE_NUM column that is not already inside [0,1].
-_HR_DELTA_CLIP = 5.0
-
-# ── HR harmonic rejection ─────────────────────────────────────────────────────
-# Band, as a multiple of the running reference, in which a reading is treated as
-# the 2nd harmonic rather than the pulse. +-15% around 2x: the toolbox's FFT
-# resolution is 30/600 Hz = 3 bpm, so a true 2f peak always lands well inside.
-_HR_HARMONIC_LO = 1.7
-_HR_HARMONIC_HI = 2.3
-# Physiologically defensible range for a seated adult. Outside it the estimator
-# is not measuring a pulse, whatever it reported — its own search band is
-# 36-198 bpm, so it can and does return rates nobody has. READ BY
-# data_preprocessing/heart_rate_preprocessing.py via AST, so the live gate and
-# the offline gate are one definition; keep it a plain literal.
-_HR_RANGE = (40.0, 180.0)
-# Accepted readings needed before the band is trusted enough to reject anything.
-_HR_REF_MIN = 3
-# Consecutive rejections after which the REFERENCE is presumed wrong rather than
-# the readings, and is re-seeded. Bounds the worst case: without it a bad
-# reference could suppress every reading for the rest of the session.
-_HR_REJECT_RUN_MAX = 5
+# Minimum surviving readings before the cleaned set may define a baseline.
+# Mirrors --min-kept in heart_rate_preprocessing.py: a median over 3 readings is
+# not an improvement on a median over 28, it is a different and worse estimate.
+_CAL_MIN_KEPT = 5
 
 
 class DataCollector:
@@ -964,22 +948,65 @@ class DataCollector:
                     # NOTE: for 'ear' this field holds the MEDIAN, not the mean.
                     mean = float(np.median(values))
                     std = (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
-                elif key in ('bpm', 'rr'):
-                    # Fully robust: median for location, MAD for scale. The rPPG
-                    # readings entering here still contain the occasional 2f
-                    # harmonic that slipped past _hr_is_harmonic (and, for 'rr',
-                    # no harmonic filter at all — see the note in that method).
-                    # The MEAN would be pulled by them, but the STD far more so:
-                    # a handful of ~150s among ~75s inflates it enormously, and
-                    # _standardized_delta divides hr_delta by it.
+                elif key == 'bpm':
+                    # THE SAME COMPUTATION THE OFFLINE DATASET BUILD PERFORMS.
+                    #
+                    # This runs ONCE, at the end of the calibration phase, with
+                    # all ~28 readings already collected — it is a BATCH step,
+                    # not a streaming one, so nothing stops it running the full
+                    # offline filter. That is the whole reason the live baseline
+                    # can match the dataset's: the per-reading path in
+                    # _capture_loop is strictly causal and cannot, but this is
+                    # not that path.
+                    #
+                    # Before this, the two disagreed by an octave. This branch
+                    # aggregated RAW readings while the offline build aggregated
+                    # filtered ones, and participant 010's stored baseline came
+                    # out at 111.5 bpm — the 2f harmonic of a pulse their own
+                    # smartwatch puts near 55, which made hr_delta a per-driver
+                    # constant offset instead of a driver-state feature.
+                    #
+                    # The one thing still missing relative to the offline build
+                    # is evidence, not algorithm: heart_rate_preprocessing.py
+                    # pools the calibration readings with every SESSION reading
+                    # before voting on the octave (~530 values), while here only
+                    # the ~28 calibration readings exist. A driver whose
+                    # calibration is mostly 2f can therefore still be resolved to
+                    # the wrong octave, and only a post-hoc run of that script
+                    # fixes it (it rewrites this file, and the next session loads
+                    # the corrected value).
+                    pid = str(self.static_context.get('participantid') or '').strip()
+                    f0, _f0_share, _f0_margin = _hr_filter.session_fundamental(
+                        values, verified=_hr_filter.VERIFIED_FUNDAMENTAL.get(pid))
+                    kept = _hr_filter.clean_calibration(values, f0)
+                    stats = (_hr_filter.baseline_from_readings(kept)
+                             if len(kept) >= _CAL_MIN_KEPT else None)
+                    if stats is None:
+                        # Too few readings survived to re-estimate from. Falling
+                        # back to the robust statistic over the RAW readings is
+                        # the conservative failure: median + MAD is what this
+                        # branch did before, and MAD is the right estimator when
+                        # the input has not been cleaned (on raw readings the SD
+                        # reaches 15-25 bpm for the contaminated participants).
+                        print(f"[Calibration] bpm: only {len(kept)} reading(s) survived "
+                              f"filtering out of {len(values)} — falling back to the "
+                              f"unfiltered median + MAD baseline.")
+                        mean = float(np.median(values))
+                        mad = float(np.median([abs(x - mean) for x in values]))
+                        std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
+                    else:
+                        mean, std = stats
+                        print(f"[Calibration] bpm: {len(kept)}/{len(values)} readings kept "
+                              f"(fundamental {f0:.0f} bpm) — baseline "
+                              f"{mean:.1f} +- {std:.2f} bpm.")
+                elif key == 'rr':
+                    # NOT cleaned: hr_filter's rules are heart-rate rules (the 2f
+                    # band is anchored on a pulse), and the offline build does not
+                    # touch rr either, so filtering it here would make the live rr
+                    # baseline differ from every rr baseline in the dataset.
+                    # Median + MAD over the raw readings, as before.
                     mean = float(np.median(values))
                     mad = float(np.median([abs(x - mean) for x in values]))
-                    # Floored: below this the MAD is measuring estimator noise
-                    # over a 180 s window rather than the driver's range, and
-                    # _standardized_delta DIVIDES hr_delta by it. Same floor
-                    # heart_rate_preprocessing.py applies when it rewrites a
-                    # stored baseline, so a driver calibrated live and a driver
-                    # whose file was preprocessed land on the same scale.
                     std = max(_MAD_TO_SIGMA * mad, _ROBUST_SCALE_FLOOR[key])
                 else:
                     mean = sum(values) / len(values)
