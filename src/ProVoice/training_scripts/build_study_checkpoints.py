@@ -187,6 +187,55 @@ VERIFY_ATOL_EXACT = 1e-4
 VERIFY_ATOL_LOOSE = 0.05
 
 
+def resolve_key(name: str) -> str:
+    """Display name -> the canonical key every downstream comparison uses.
+
+    ``load_driver_rows`` and the ``is_eval`` mask both test
+    ``resolve_function_key(row.functionname) == want_key``, so ``want_key`` has to
+    be the RESOLVED key ('startaphonecall'), never the display name. Passing
+    'Respond to a phone call' straight through compares a key against a label,
+    matches nothing, and reports "no rows" for every driver -- which is what it
+    did, and which no amount of staring at the data explains.
+
+    Idempotent, so either spelling works as input. ``phone_call_k_curve.json``
+    records the resolved form, which is why this is also what goes in the
+    provenance.
+    """
+    from ProVoice.fcd_config import resolve_function_key, UNKNOWN_FUNCTION_KEY
+    key = resolve_function_key(name)
+    if key == UNKNOWN_FUNCTION_KEY:
+        raise SystemExit(
+            f"--function {name!r} does not resolve to a known function; it "
+            f"lands on {UNKNOWN_FUNCTION_KEY!r}, whose FCD vector is neutral "
+            f"all-3s. Every segment would be scored with no task context. "
+            f"Check the spelling against fcd_config.FUNCTIONS.")
+    return key
+
+
+def report_available_functions(src: pathlib.Path, pid: str, limit: int = 12) -> None:
+    """Say WHICH functions this driver actually has, after an empty filter.
+
+    A bare "no rows" sends you to look at the data file; the useful question is
+    whether the filter or the data is wrong, and that is answerable in one pass.
+    """
+    from ProVoice.fcd_config import resolve_function_key
+    from ProVoice.models.train_XLSTM import iter_jsonl
+    import collections
+    seen: collections.Counter = collections.Counter()
+    rows = 0
+    for r in iter_jsonl(src):
+        if str(r.get("participantid", "")) != pid:
+            continue
+        rows += 1
+        seen[resolve_function_key(str(r.get("functionname", "") or ""))] += 1
+    if not rows:
+        print(f"       ...and NO rows at all for participantid {pid!r}. Check "
+              f"the id spelling in {src} (zero-padded '001', not '1'?).")
+        return
+    print(f"       {rows} row(s) for {pid!r}, resolving to: "
+          + ", ".join(f"{k!r}x{v}" for k, v in seen.most_common(limit)))
+
+
 def sha256_of(path: pathlib.Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -230,6 +279,7 @@ def resolve_adapt_cfg(args) -> Dict:
         # mismatch in either would silently score a different estimator.
         cfg["val_frac"] = float(j.get("val_frac", args.val_frac))
         cfg["embed_fcd"] = bool(j.get("embed_fcd", 1))
+        cfg["curve_function"] = j.get("function")
     else:
         if src is not None:
             print(f"[WARN] {src} not found; falling back to head_adapt defaults.")
@@ -592,6 +642,8 @@ def main() -> None:
             "it; a non-zero K there would make the study's baseline a "
             "personalized model." % k_map[0])
 
+    # Resolve ONCE, here. Every downstream comparison is key-vs-key.
+    args.function_key = resolve_key(args.function)
     cfg = resolve_adapt_cfg(args)
     check_anil_tau(args, cfg)
     # Inherited from the curve so the estimator cannot drift; an explicit CLI
@@ -605,9 +657,16 @@ def main() -> None:
     args._matches_curve = str(cfg.get("source", "")).endswith(".json")
     verify = pd.read_csv(args.verify_against) if args.verify_against else None
 
-    print("arm=%s  function=%r  tau=%g  steps=%d  lr=%g  embed_fcd=%d  device=%s"
-          % (args.arm, args.function, cfg["tau"], cfg["steps"], cfg["lr"],
-             int(args.embed_fcd), args.device))
+    print("arm=%s  function=%r (key %r)  tau=%g  steps=%d  lr=%g  embed_fcd=%d  "
+          "device=%s" % (args.arm, args.function, args.function_key, cfg["tau"],
+                         cfg["steps"], cfg["lr"], int(args.embed_fcd), args.device))
+    # The curve records the key it was computed on; if this build is filtering to
+    # a different function, every --verify-against cell would silently miss.
+    curve_fn = cfg.get("curve_function")
+    if curve_fn and curve_fn != args.function_key:
+        print("[WARN] --match-curve was computed on function %r but this build "
+              "filters to %r. The K values were read off a curve for a "
+              "DIFFERENT function." % (curve_fn, args.function_key))
     print("conditions: " + "  ".join("%d->K=%d" % (c, k_map[c]) for c in sorted(k_map)))
     if verify is not None:
         print("verify tolerance: %s (%.0e) -- %s"
