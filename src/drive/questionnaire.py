@@ -647,10 +647,10 @@ def main() -> None:
     ap.add_argument("--scale-points", dest="scale_points", type=int, default=7,
                     help="Points per INTUI item (default: %(default)s). Does "
                          "NOT touch Van der Laan -- VDL is fixed at "
-                         "VDL_SCALE_POINTS=%d (its published form, an "
-                         "unlabelled 5-stop slider) regardless of this flag. "
-                         "Keep it FIXED across every participant and block."
-                         % VDL_SCALE_POINTS)
+                         "VDL_SCALE_POINTS=" + str(VDL_SCALE_POINTS) +
+                         " (its published form, an unlabelled 5-stop "
+                         "slider) regardless of this flag. Keep it FIXED "
+                         "across every participant and block.")
     ap.add_argument("--vdl-stem", dest="vdl_stem", default=VDL_STEM,
                     help="Shared instruction above the Van der Laan items "
                          "(default: %(default)r, the published wording). Note "
