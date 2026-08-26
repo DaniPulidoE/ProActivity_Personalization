@@ -667,7 +667,10 @@ class CallEvent(object):
                  (self._font_title, 'INCOMING CALL'),
                  (self._font_text, '%s Answer         RECOMMENDED' % self.yes_key),
                  (self._font_text, '%s Decline        RECOMMENDED' % self.no_key),
-                 (self._font_text, '%s No        %s Yes' % (self.no_key, self.yes_key)),
+                 # LoA 2's Yes/No is stacked, not one string -- measure the two
+                 # lines it actually draws, not the old side-by-side text.
+                 (self._font_text, '%s No' % self.no_key),
+                 (self._font_text, '%s Yes' % self.yes_key),
                  (self._font_text, '%s Decline' % self.no_key),
                  (self._font_text, '%s Cancel' % self.no_key)]
         for who in (self.caller_name, self.spam_caller_name):
@@ -706,12 +709,19 @@ class CallEvent(object):
         rows = max([len(self._wrap(s, self._font_text, self._text_inner))
                     for s in self._spoken_candidates()] or [1])
 
-        # Tallest rendering is LoA 3: header, the spoken line(s), the countdown
-        # bar, the cancel row, then the separator and status strip.
+        # What comes after the spoken line(s) differs by rung, and the taller
+        # of the two sets the panel's height (both apply to EVERY rendering,
+        # since the footprint is fixed across all ten):
+        #   LoA 3   a 16 px countdown bar, then one Cancel row.
+        #   LoA 2   two stacked rows, No then Yes (was one row, side by side,
+        #           until stacked at the supervisor's request).
+        # Whichever is taller no longer has a fixed identity -- it depends on
+        # the font metrics -- so it is taken as a max rather than assumed.
         th, xh, sh = (self._font_title.get_height(), self._font_text.get_height(),
                       self._font_small.get_height())
-        h = (PANEL_PAD_TOP + PANEL_PAD + (th + 4) + (rows + 1) * (xh + 4)
-             + 16 + 6 + sh + 6)
+        after_spoken = max(16 + (xh + 4), 2 * (xh + 4))
+        h = (PANEL_PAD_TOP + PANEL_PAD + (th + 4) + rows * (xh + 4)
+             + after_spoken + 6 + sh + 6)
 
         speed_mid = (height * SPEED_BASELINE_FRAC
                      - _speed_block_height(height) / 2.0)
@@ -1329,14 +1339,21 @@ class CallEvent(object):
                               '%s Cancel' % self.no_key, COL_COUNTDOWN, x, y)
         if self.loa == 2 and self.state == AWAIT_INPUT:
             # Gated on the STATE, not on the rung alone: without it the Yes/No
-            # row stayed on screen through ANSWERING and CONNECTED, offering
+            # rows stayed on screen through ANSWERING and CONNECTED, offering
             # controls for a question the driver had already answered.
             #
-            # Negative on the LEFT, affirmative on the RIGHT, so the option's
-            # position on screen matches the paddle that selects it.
-            return self._blit(display, self._font_text,
-                              '%s No        %s Yes' % (self.no_key, self.yes_key),
-                              COL_WHITE, x, y + 4)
+            # STACKED, at the supervisor's request (was side by side). No
+            # first, Yes second -- same order the side-by-side layout read in
+            # (left-to-right becomes top-to-bottom), so this isn't a new
+            # convention, just the same one turned 90 degrees. The paddle
+            # mapping is unchanged -- left paddle is still "No", right paddle
+            # still "Yes" -- the label just no longer sits on the side of the
+            # panel matching its paddle, which the horizontal layout had going
+            # for it and this one gives up.
+            y = self._blit(display, self._font_text, '%s No' % self.no_key,
+                           COL_WHITE, x, y + 4)
+            return self._blit(display, self._font_text, '%s Yes' % self.yes_key,
+                              COL_WHITE, x, y)
         return y
 
     def _panel_line(self):

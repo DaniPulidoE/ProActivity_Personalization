@@ -22,14 +22,26 @@ between "we don't act on it" and "it isn't there".
 
 The wheel therefore stays plugged in between blocks with no effect on this form.
 
-SEVEN POINTS, NOT FIVE -- A DEVIATION WORTH STATING
-===================================================
-Van der Laan (1997) is published as a **five**-point semantic differential and
-its norms, means and cut-offs are all on that scale. This runs it on **seven**
-points, matching INTUI, so a participant meets one response format all evening
-instead of two. That is a defensible choice and a real one: subscale scores are
-NOT directly comparable with published Van der Laan values, and the write-up has
-to say so rather than quoting norms. ``--scale-points 5`` restores the original.
+VAN DER LAAN IS 5 POINTS, UNLABELLED, AND NOW RENDERED THAT WAY
+=================================================================
+Verified against the printed form: nine rows of ``pole  |_|_|_|_|_|  pole`` --
+five boxes, no digits in them. Van der Laan (1997) is a five-point semantic
+differential, full stop; its norms, means and cut-offs are all on that scale.
+An earlier version of this module ran it on seven numbered points to match
+INTUI, on the reasoning that meeting one response format all evening beats two.
+That reasoning is dropped, not merely overridden: matching the validated
+instrument's actual form -- five unlabelled stops -- outranks response-format
+consistency, so VDL_SCALE_POINTS is fixed at 5 and is NOT the ``--scale-points``
+flag's business any more (that flag now sizes INTUI alone, still 7 by default).
+Consequence worth stating plainly: the two pages ARE two different formats
+again, dots-with-numbers for INTUI and an unlabelled slider for VDL. That is
+the cost of being correct about VDL rather than convenient about it.
+
+Rendered as a SLIDER -- a track with 5 stops and no printed numbers, dragged or
+clicked -- rather than 5 numbered dots, because "5 boxes to tick" is what the
+printed form shows and a slider is the closest on-screen analogue that keeps
+the "no numbers" property; five numbered dots at N=5 would have been closer to
+correct than N=7 but still shows digits the paper form does not.
 
 POLARITY IS THE THING THAT GETS SILENTLY WRONG
 ==============================================
@@ -143,6 +155,11 @@ INTUI_ITEMS = (
 # that is a wording change to record, not a formatting choice.
 VDL_STEM = "I find such a system..."
 
+# FIXED, not a CLI knob. The published instrument has 5 points; this is a fact
+# about Van der Laan, not a formatting preference to sweep. See the module
+# docstring. INTUI keeps its own, adjustable, --scale-points (default 7).
+VDL_SCALE_POINTS = 5
+
 PAGES = (
     ("vdl",   "Acceptance of the assistant", VDL_ITEMS, VDL_STEM),
     ("intui", "Your experience",             INTUI_ITEMS, INTUI_STEM),
@@ -151,10 +168,17 @@ PAGES = (
 DEFAULT_CSV = os.path.join("data", "study_1_questionnaire.csv")
 
 
-def build_columns(scale_points: int):
-    """The CSV header. Fixed and explicit, in the style of call_events.csv."""
+def build_columns(intui_scale_points: int):
+    """The CSV header. Fixed and explicit, in the style of call_events.csv.
+
+    TWO scale-point columns, not one: VDL is fixed at VDL_SCALE_POINTS and
+    INTUI is whatever --scale-points was for this run. A single shared column
+    stopped being able to describe the questionnaire once the two pages could
+    disagree.
+    """
     cols = ["logged_ts", "session_id", "participantid", "block_idx",
-            "k_condition", "scale_points", "duration_s"]
+            "k_condition", "vdl_scale_points", "intui_scale_points",
+            "duration_s"]
     for i in range(len(VDL_ITEMS)):
         cols.append("vdl%d_raw" % (i + 1))
     for i in range(len(VDL_ITEMS)):
@@ -184,7 +208,7 @@ def score(raw: int, positive_right: bool, scale_points: int) -> int:
     return raw if positive_right else (scale_points + 1 - raw)
 
 
-def write_codebook(path: str, scale_points: int) -> None:
+def write_codebook(path: str, intui_scale_points: int) -> None:
     """One row per item: what it said, which way round, which subscale.
 
     Written once, beside the data. Without it the CSV is unreadable by anyone
@@ -193,18 +217,21 @@ def write_codebook(path: str, scale_points: int) -> None:
     """
     if os.path.exists(path):
         return
+    points_for = {"vdl": VDL_SCALE_POINTS, "intui": intui_scale_points}
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["column", "instrument", "item_no", "left_pole", "right_pole",
                     "positive_pole", "reverse_coded", "subscale", "scale_points",
-                    "scoring"])
+                    "widget", "scoring"])
         for tag, items in (("vdl", VDL_ITEMS), ("intui", INTUI_ITEMS)):
+            sp = points_for[tag]
             for i, (lo, hi, pos_right, sub) in enumerate(items, start=1):
                 w.writerow(["%s%d" % (tag, i), tag, i, lo, hi,
                             "right" if pos_right else "left",
-                            int(not pos_right), sub, scale_points,
+                            int(not pos_right), sub, sp,
+                            "slider (unlabelled)" if tag == "vdl" else "dots (numbered)",
                             "scored = raw" if pos_right
-                            else "scored = %d - raw" % (scale_points + 1)])
+                            else "scored = %d - raw" % (sp + 1)])
     print("[questionnaire] wrote codebook -> %s" % path)
 
 
@@ -219,16 +246,24 @@ COL_WARN = (255, 170, 90)
 COL_FOCUS = (70, 78, 92)
 
 DOT_R = 15
+TICK_R = 10               # slider stop half-size (a small square, not a dot)
+TRACK_H = 3
 ROW_H = 62
 MARGIN = 44
 
 
 class Questionnaire(object):
-    """Two pages of semantic differentials, mouse or keyboard."""
+    """Two pages of semantic differentials, mouse or keyboard.
 
-    def __init__(self, screen, scale_points: int, stems: dict = None):
+    The two pages use DIFFERENT widgets and, since this change, different
+    point counts -- VDL a 5-stop unlabelled slider, INTUI N numbered dots. Both
+    facts live in ``self._n_by_page`` / the ``page_kind`` helper rather than a
+    single ``self.n``, which is what let the two pages silently share a scale
+    they should not have.
+    """
+
+    def __init__(self, screen, intui_scale_points: int, stems: dict = None):
         self.screen = screen
-        self.n = scale_points
         # Pages are built ONCE, here, with the stems substituted -- rather than
         # patching the module-level PAGES, which would make the instrument
         # depend on import order and leak between two instances.
@@ -236,6 +271,11 @@ class Questionnaire(object):
         self.pages = tuple(
             (k, t, items, stems.get(k, stem))
             for k, t, items, stem in PAGES)
+        # Per-page point count. VDL is never intui_scale_points, no matter what
+        # was passed -- see VDL_SCALE_POINTS.
+        self._n_by_page = tuple(
+            VDL_SCALE_POINTS if key == "vdl" else intui_scale_points
+            for key, _t, _items, _stem in self.pages)
         self.quit_requested = False
         w, h = screen.get_size()
         self.dim = (w, h)
@@ -250,8 +290,20 @@ class Questionnaire(object):
         self.focus = 0
         self.started = time.time()
         self.done = False
-        self._rows = []          # (rect, page, item, value) rebuilt each frame
+        self._rows = []          # (rect, page, item, value) -- dot pages
+        self._sliders = []       # (track_rect, page, item) -- slider pages
+        self._dragging = None    # item index mid-drag on the CURRENT page, or None
         self._nav = {}
+
+    @property
+    def n(self):
+        """This page's point count. VDL_SCALE_POINTS on the VDL page, else
+        whatever --scale-points gave INTUI."""
+        return self._n_by_page[self.page]
+
+    @property
+    def is_slider_page(self):
+        return self.pages[self.page][0] == "vdl"
 
     # -- geometry ------------------------------------------------------------
 
@@ -262,7 +314,8 @@ class Questionnaire(object):
         top = MARGIN + self.f_title.get_height() + 18
         if stem:
             top += self.f_item.get_height() + 14
-        # Dots occupy the middle third; labels take the outer thirds.
+        # The control band occupies the middle third; labels take the outer
+        # thirds -- true whether that band holds N dots or a 5-stop slider.
         dot_lo, dot_hi = int(w * 0.40), int(w * 0.66)
         step = (dot_hi - dot_lo) / float(self.n - 1)
         rows = []
@@ -273,6 +326,19 @@ class Questionnaire(object):
             rows.append((y, centers))
         return top, rows, dot_lo, dot_hi
 
+    @staticmethod
+    def _nearest_stop(x, dot_lo, dot_hi, n):
+        """Pixel x -> the closest of the n evenly-spaced stops, as 1..n.
+
+        Shared by a click ANYWHERE on the track and by dragging: both just ask
+        "which stop is closest to this x", clamped to the track's own ends so
+        an overshoot past either edge still lands on stop 1 or n rather than
+        being ignored.
+        """
+        step = (dot_hi - dot_lo) / float(n - 1)
+        x = max(dot_lo, min(dot_hi, x))
+        return int(round((x - dot_lo) / step)) + 1
+
     # -- input ---------------------------------------------------------------
 
     def handle(self, ev):
@@ -280,6 +346,10 @@ class Questionnaire(object):
             self._key(ev)
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             self._click(ev.pos)
+        elif ev.type == pygame.MOUSEMOTION and self._dragging is not None:
+            self._drag(ev.pos)
+        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            self._dragging = None
 
     def _key(self, ev):
         _, _, items, _ = self.pages[self.page]
@@ -307,6 +377,17 @@ class Questionnaire(object):
             self.answers[self.page][self.focus] = None
 
     def _click(self, pos):
+        # Sliders hit-test against the WHOLE track (a click anywhere on the bar
+        # jumps to the nearest stop, same as a drag would settle there), not
+        # per-stop circles the way the dot pages do -- a slider with 5 tiny
+        # click targets and dead space between them would not read as a slider.
+        for rect, page, item, dot_lo, dot_hi, n in self._sliders:
+            if rect.collidepoint(pos):
+                self.answers[page][item] = self._nearest_stop(
+                    pos[0], dot_lo, dot_hi, n)
+                self.focus = item
+                self._dragging = item
+                return
         for rect, page, item, val in self._rows:
             if rect.collidepoint(pos):
                 self.answers[page][item] = val
@@ -321,9 +402,24 @@ class Questionnaire(object):
                     self.focus = 0
                 return
 
+    def _drag(self, pos):
+        """Follow the mouse while a slider handle is held.
+
+        Re-reads the CURRENT page's track bounds from ``_layout()`` rather than
+        caching them at mousedown: cheap (13 rows), and correct even in the
+        pathological case of the window resizing mid-drag.
+        """
+        item = self._dragging
+        if item is None or not self.is_slider_page:
+            return
+        _top, _rows, dot_lo, dot_hi = self._layout()
+        self.answers[self.page][item] = self._nearest_stop(
+            pos[0], dot_lo, dot_hi, self.n)
+
     def _advance(self):
         if self.missing():
             return
+        self._dragging = None       # belongs to the page being left, if any
         if self.page < len(self.pages) - 1:
             self.page += 1
             self.focus = 0
@@ -350,7 +446,9 @@ class Questionnaire(object):
             s.blit(self.f_item.render(stem, True, COL_DIM),
                    (MARGIN, MARGIN + self.f_title.get_height() + 10))
 
+        is_slider = self.is_slider_page
         self._rows = []
+        self._sliders = []
         for i, (lo, hi, _pos_right, _sub) in enumerate(items):
             y, centers = rows[i]
             if i == self.focus:
@@ -367,17 +465,10 @@ class Questionnaire(object):
             s.blit(rt, (dot_hi + 26, y + ROW_H // 2 - rt.get_height() // 2))
 
             chosen = self.answers[self.page][i]
-            for k, (cx, cy) in enumerate(centers):
-                val = k + 1
-                rect = pygame.Rect(cx - DOT_R - 4, cy - DOT_R - 4,
-                                   2 * (DOT_R + 4), 2 * (DOT_R + 4))
-                self._rows.append((rect, self.page, i, val))
-                on = chosen == val
-                pygame.draw.circle(s, COL_ACCENT if on else COL_DIM, (cx, cy),
-                                   DOT_R, 0 if on else 2)
-                lab = self.f_small.render(str(val), True,
-                                          COL_BG if on else COL_DIM)
-                s.blit(lab, (cx - lab.get_width() // 2, cy - lab.get_height() // 2))
+            if is_slider:
+                self._render_slider(s, i, y, chosen, dot_lo, dot_hi)
+            else:
+                self._render_dots(s, i, centers, chosen)
 
         self._nav = {}
         miss = self.missing()
@@ -409,27 +500,92 @@ class Questionnaire(object):
             self._nav["back"] = bb
 
         s.blit(self.f_small.render(msg, True, colour), (MARGIN, bar_y + 56))
-        hint = ("Click a circle, or use the number keys 1-%d.  "
-                "Up/Down or Tab moves between rows.  Enter continues." % self.n)
-        s.blit(self.f_small.render(hint, True, COL_DIM), (MARGIN, bar_y + 12))
+        hint = ("Click or drag the slider, or use the number keys 1-5."
+                if is_slider else
+                "Click a circle, or use the number keys 1-%d." % self.n)
+        hint += "  Up/Down or Tab moves between rows.  Enter continues."
+        # ABOVE the button row, not blit at bar_y + 12: that sat INSIDE the
+        # Back button's own rect (MARGIN, bar_y, 130, 46) whenever page > 0,
+        # so the two overlapped -- invisible in a page-1 screenshot (no Back
+        # button yet to collide with) and only visible once a later page was
+        # actually rendered.
+        hint_h = self.f_small.get_height()
+        s.blit(self.f_small.render(hint, True, COL_DIM),
+              (MARGIN, bar_y - hint_h - 10))
+
+    def _render_dots(self, s, item, centers, chosen):
+        """INTUI's widget: N numbered circles, unchanged from before this
+        change -- VDL is the one that moved."""
+        for k, (cx, cy) in enumerate(centers):
+            val = k + 1
+            rect = pygame.Rect(cx - DOT_R - 4, cy - DOT_R - 4,
+                               2 * (DOT_R + 4), 2 * (DOT_R + 4))
+            self._rows.append((rect, self.page, item, val))
+            on = chosen == val
+            pygame.draw.circle(s, COL_ACCENT if on else COL_DIM, (cx, cy),
+                               DOT_R, 0 if on else 2)
+            lab = self.f_small.render(str(val), True, COL_BG if on else COL_DIM)
+            s.blit(lab, (cx - lab.get_width() // 2, cy - lab.get_height() // 2))
+
+    def _render_slider(self, s, item, y, chosen, dot_lo, dot_hi):
+        """VDL's widget: a track with VDL_SCALE_POINTS unlabelled stops.
+
+        Deliberately NO number is ever drawn here -- that is the entire point
+        of switching off the dot widget for this page. A stop is a small
+        square (echoing the printed form's "|_|" boxes), open when unanswered
+        and filled when it is the current answer; nothing else marks position,
+        so a participant reading the row has no digit to anchor a numeric
+        judgement to that Van der Laan's five UNlabelled boxes never offered
+        them either.
+        """
+        cy = y + ROW_H // 2
+        pygame.draw.line(s, COL_DIM, (dot_lo, cy), (dot_hi, cy), TRACK_H)
+        step = (dot_hi - dot_lo) / float(self.n - 1)
+        # ONE hit region spans the whole track -- see _click -- so only the
+        # visual ticks are per-stop; the click/drag target is the full bar.
+        self._sliders.append((
+            pygame.Rect(dot_lo - TICK_R - 4, cy - ROW_H // 2,
+                        (dot_hi - dot_lo) + 2 * (TICK_R + 4), ROW_H),
+            self.page, item, dot_lo, dot_hi, self.n))
+        for k in range(self.n):
+            val = k + 1
+            cx = int(dot_lo + k * step)
+            on = chosen == val
+            r = TICK_R + 2 if on else TICK_R
+            rect = pygame.Rect(cx - r, cy - r, 2 * r, 2 * r)
+            if on:
+                pygame.draw.rect(s, COL_ACCENT, rect, 0, border_radius=3)
+            else:
+                pygame.draw.rect(s, COL_DIM, rect, 2, border_radius=3)
 
 
 def collect_row(q: Questionnaire, args, duration_s: float):
-    """Everything that goes in the CSV, derived once, here."""
-    n = q.n
-    mid = (n + 1) / 2.0
+    """Everything that goes in the CSV, derived once, here.
+
+    Two point counts, not one: q._n_by_page[pi] is VDL_SCALE_POINTS on the vdl
+    page and args.scale_points on the intui page, and `score()`/the midpoint
+    each use the count for the page the item actually came from. Using ONE n
+    for both (the pre-slider behaviour) would score 5-point VDL answers as if
+    they were on a 7-point scale -- silently, since every raw value 1-5 is
+    also a valid 1-7 raw value, just the wrong scale's.
+    """
     row = {
         "logged_ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "session_id": args.session_id or "",
         "participantid": args.participantid,
         "block_idx": args.block_idx,
         "k_condition": args.condition,
-        "scale_points": n,
+        "vdl_scale_points": VDL_SCALE_POINTS,
+        "intui_scale_points": q._n_by_page[1],
         "duration_s": round(duration_s, 1),
         "notes": args.notes or "",
     }
     bucket = {"usefulness": [], "satisfying": [], "magical": []}
+    mid_for = {"usefulness": (VDL_SCALE_POINTS + 1) / 2.0,
+              "satisfying": (VDL_SCALE_POINTS + 1) / 2.0,
+              "magical": (q._n_by_page[1] + 1) / 2.0}
     for pi, (tag, _t, items, _s) in enumerate(PAGES):
+        n = q._n_by_page[pi]
         for i, (_lo, _hi, pos_right, sub) in enumerate(items):
             raw = q.answers[pi][i]
             sc = score(raw, pos_right, n)
@@ -446,7 +602,7 @@ def collect_row(q: Questionnaire, args, duration_s: float):
         row[prefix + "_mean"] = m
         # Centred on the scale midpoint: Van der Laan is conventionally read
         # symmetrically, where 0 is indifference and the SIGN is the finding.
-        row[prefix + "_centered"] = round(m - mid, 4) if m != "" else ""
+        row[prefix + "_centered"] = round(m - mid_for[sub], 4) if m != "" else ""
     return row
 
 
@@ -489,11 +645,12 @@ def main() -> None:
                     help="Drive session id, to join this row to call_events.csv.")
     ap.add_argument("--out", default=DEFAULT_CSV)
     ap.add_argument("--scale-points", dest="scale_points", type=int, default=7,
-                    help="Points per item (default: %(default)s). Van der Laan "
-                         "is PUBLISHED as 5-point; 7 matches INTUI so the "
-                         "participant meets one format, at the cost of "
-                         "comparability with published norms. Keep it FIXED "
-                         "across every participant and block.")
+                    help="Points per INTUI item (default: %(default)s). Does "
+                         "NOT touch Van der Laan -- VDL is fixed at "
+                         "VDL_SCALE_POINTS=%d (its published form, an "
+                         "unlabelled 5-stop slider) regardless of this flag. "
+                         "Keep it FIXED across every participant and block."
+                         % VDL_SCALE_POINTS)
     ap.add_argument("--vdl-stem", dest="vdl_stem", default=VDL_STEM,
                     help="Shared instruction above the Van der Laan items "
                          "(default: %(default)r, the published wording). Note "
