@@ -164,10 +164,13 @@ VDL_SCALE_POINTS = 5
 #
 # NOT part of Van der Laan or INTUI -- a single study-specific item, added
 # after both because neither instrument asks about the thing this study
-# actually manipulates: how MUCH the assistant did on its own. It reuses the
-# same "one item, numbered dots" machinery as INTUI (agree/disagree poles are
-# a standard Likert, unlike VDL's unlabelled boxes, so there is no reason to
-# invent a third widget).
+# actually manipulates: how MUCH the assistant did on its own. Rendered as a
+# SLIDER (see SLIDER_PAGES below), the same unlabelled-track widget VDL uses,
+# rather than INTUI's numbered dots -- an analogue judgement rather than a
+# discrete pick from 5 labelled options suits a single global item better.
+# The agree/disagree poles are still printed (they are not published-form
+# boxes that must stay bare the way VDL's are); only the 5 stops between them
+# go unlabelled.
 #
 # Wording was chosen from three candidates the operator was asked to pick
 # between, on 2026-08-26: this one trades the originally-requested
@@ -190,6 +193,16 @@ PROACTIVITY_ITEM = (
 # not a choice). This one is fixed because it was specified that way, not
 # because of an external instrument's form.
 PROACTIVITY_SCALE_POINTS = 5
+
+# Which pages render as the unlabelled slider rather than numbered dots. VDL is
+# here because that is its published form (see the module docstring);
+# proactivity is here by request -- an unlabelled slider reads as a single
+# analogue judgement rather than a discrete pick from 5 numbered options,
+# which suits a global "how did this feel" item better than a Likert grid
+# does. Nothing about its scoring changes: it is still 5 stops, still
+# positive-right, still `score()` unmodified -- only the widget differs, the
+# same way it does for VDL.
+SLIDER_PAGES = frozenset({"vdl", "proactivity"})
 
 PAGES = (
     ("vdl",         "Acceptance of the assistant", VDL_ITEMS, VDL_STEM),
@@ -268,7 +281,7 @@ def write_codebook(path: str, intui_scale_points: int) -> None:
                 w.writerow(["%s%d" % (tag, i), tag, i, lo, hi,
                             "right" if pos_right else "left",
                             int(not pos_right), sub, sp,
-                            "slider (unlabelled)" if tag == "vdl" else "dots (numbered)",
+                            "slider (unlabelled)" if tag in SLIDER_PAGES else "dots (numbered)",
                             "scored = raw" if pos_right
                             else "scored = %d - raw" % (sp + 1)])
     print("[questionnaire] wrote codebook -> %s" % path)
@@ -343,7 +356,7 @@ class Questionnaire(object):
 
     @property
     def is_slider_page(self):
-        return self.pages[self.page][0] == "vdl"
+        return self.pages[self.page][0] in SLIDER_PAGES
 
     # -- geometry ------------------------------------------------------------
 
@@ -568,15 +581,15 @@ class Questionnaire(object):
             s.blit(lab, (cx - lab.get_width() // 2, cy - lab.get_height() // 2))
 
     def _render_slider(self, s, item, y, chosen, dot_lo, dot_hi):
-        """VDL's widget: a track with VDL_SCALE_POINTS unlabelled stops.
+        """The slider widget -- SLIDER_PAGES (VDL, proactivity): a track with
+        this page's N unlabelled stops.
 
         Deliberately NO number is ever drawn here -- that is the entire point
-        of switching off the dot widget for this page. A stop is a small
-        square (echoing the printed form's "|_|" boxes), open when unanswered
-        and filled when it is the current answer; nothing else marks position,
-        so a participant reading the row has no digit to anchor a numeric
-        judgement to that Van der Laan's five UNlabelled boxes never offered
-        them either.
+        of switching off the dot widget for these pages. A stop is a small
+        square (echoing VDL's printed "|_|" boxes, which is where this widget
+        started), open when unanswered and filled when it is the current
+        answer; nothing else marks position, so a participant reading the row
+        has no digit to anchor a numeric judgement to.
         """
         cy = y + ROW_H // 2
         pygame.draw.line(s, COL_DIM, (dot_lo, cy), (dot_hi, cy), TRACK_H)
