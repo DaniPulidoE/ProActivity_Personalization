@@ -160,9 +160,41 @@ VDL_STEM = "I find such a system..."
 # docstring. INTUI keeps its own, adjustable, --scale-points (default 7).
 VDL_SCALE_POINTS = 5
 
+# --- The proactivity item -----------------------------------------------------
+#
+# NOT part of Van der Laan or INTUI -- a single study-specific item, added
+# after both because neither instrument asks about the thing this study
+# actually manipulates: how MUCH the assistant did on its own. It reuses the
+# same "one item, numbered dots" machinery as INTUI (agree/disagree poles are
+# a standard Likert, unlike VDL's unlabelled boxes, so there is no reason to
+# invent a third widget).
+#
+# Wording was chosen from three candidates the operator was asked to pick
+# between, on 2026-08-26: this one trades the originally-requested
+# not-happy/happy poles for agree/disagree, the more standard Likert
+# convention, keeping "happy" and "proactive" in the statement itself.
+#
+# Implements HALF of docs/live_study_setup.md section 4A.2's per-block pair --
+# item 1, "overall satisfaction", reworded to name the construct (proactivity)
+# rather than ask generically "how the calls were handled", which is what that
+# section itself warns a bare satisfaction question invites. Item 2, the
+# just-about-right "far too little...far too much" item, is NOT implemented
+# here -- do not read this as that section being complete.
+PROACTIVITY_STEM = ("I was happy with how proactive the assistant was during "
+                    "this block.")
+PROACTIVITY_ITEM = (
+    ("Strongly disagree", "Strongly agree", True, "proactivity"),
+)
+# FIXED at 5, matching the 1-5 scale asked for -- not tied to --scale-points
+# (INTUI's knob) or VDL_SCALE_POINTS (a fact about a published instrument,
+# not a choice). This one is fixed because it was specified that way, not
+# because of an external instrument's form.
+PROACTIVITY_SCALE_POINTS = 5
+
 PAGES = (
-    ("vdl",   "Acceptance of the assistant", VDL_ITEMS, VDL_STEM),
-    ("intui", "Your experience",             INTUI_ITEMS, INTUI_STEM),
+    ("vdl",         "Acceptance of the assistant", VDL_ITEMS, VDL_STEM),
+    ("intui",       "Your experience",             INTUI_ITEMS, INTUI_STEM),
+    ("proactivity", "Overall",                     PROACTIVITY_ITEM, PROACTIVITY_STEM),
 )
 
 DEFAULT_CSV = os.path.join("data", "study_1_questionnaire.csv")
@@ -171,14 +203,14 @@ DEFAULT_CSV = os.path.join("data", "study_1_questionnaire.csv")
 def build_columns(intui_scale_points: int):
     """The CSV header. Fixed and explicit, in the style of call_events.csv.
 
-    TWO scale-point columns, not one: VDL is fixed at VDL_SCALE_POINTS and
-    INTUI is whatever --scale-points was for this run. A single shared column
-    stopped being able to describe the questionnaire once the two pages could
-    disagree.
+    THREE scale-point columns: VDL is fixed at VDL_SCALE_POINTS, the
+    proactivity item at PROACTIVITY_SCALE_POINTS, and INTUI is whatever
+    --scale-points was for this run. A single shared column stopped being
+    able to describe the questionnaire once the pages could disagree.
     """
     cols = ["logged_ts", "session_id", "participantid", "block_idx",
             "k_condition", "vdl_scale_points", "intui_scale_points",
-            "duration_s"]
+            "proactivity_scale_points", "duration_s"]
     for i in range(len(VDL_ITEMS)):
         cols.append("vdl%d_raw" % (i + 1))
     for i in range(len(VDL_ITEMS)):
@@ -189,7 +221,12 @@ def build_columns(intui_scale_points: int):
         cols.append("intui%d_raw" % (i + 1))
     for i in range(len(INTUI_ITEMS)):
         cols.append("intui%d_scored" % (i + 1))
-    cols += ["intui_magical_mean", "intui_magical_centered", "notes"]
+    cols += ["intui_magical_mean", "intui_magical_centered"]
+    for i in range(len(PROACTIVITY_ITEM)):
+        cols.append("proactivity%d_raw" % (i + 1))
+    for i in range(len(PROACTIVITY_ITEM)):
+        cols.append("proactivity%d_scored" % (i + 1))
+    cols += ["proactivity_mean", "proactivity_centered", "notes"]
     return tuple(cols)
 
 
@@ -217,13 +254,15 @@ def write_codebook(path: str, intui_scale_points: int) -> None:
     """
     if os.path.exists(path):
         return
-    points_for = {"vdl": VDL_SCALE_POINTS, "intui": intui_scale_points}
+    points_for = {"vdl": VDL_SCALE_POINTS, "intui": intui_scale_points,
+                 "proactivity": PROACTIVITY_SCALE_POINTS}
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["column", "instrument", "item_no", "left_pole", "right_pole",
                     "positive_pole", "reverse_coded", "subscale", "scale_points",
                     "widget", "scoring"])
-        for tag, items in (("vdl", VDL_ITEMS), ("intui", INTUI_ITEMS)):
+        for tag, items in (("vdl", VDL_ITEMS), ("intui", INTUI_ITEMS),
+                          ("proactivity", PROACTIVITY_ITEM)):
             sp = points_for[tag]
             for i, (lo, hi, pos_right, sub) in enumerate(items, start=1):
                 w.writerow(["%s%d" % (tag, i), tag, i, lo, hi,
@@ -273,8 +312,9 @@ class Questionnaire(object):
             for k, t, items, stem in PAGES)
         # Per-page point count. VDL is never intui_scale_points, no matter what
         # was passed -- see VDL_SCALE_POINTS.
+        _fixed_n = {"vdl": VDL_SCALE_POINTS, "proactivity": PROACTIVITY_SCALE_POINTS}
         self._n_by_page = tuple(
-            VDL_SCALE_POINTS if key == "vdl" else intui_scale_points
+            _fixed_n.get(key, intui_scale_points)
             for key, _t, _items, _stem in self.pages)
         self.quit_requested = False
         w, h = screen.get_size()
@@ -562,12 +602,13 @@ class Questionnaire(object):
 def collect_row(q: Questionnaire, args, duration_s: float):
     """Everything that goes in the CSV, derived once, here.
 
-    Two point counts, not one: q._n_by_page[pi] is VDL_SCALE_POINTS on the vdl
-    page and args.scale_points on the intui page, and `score()`/the midpoint
-    each use the count for the page the item actually came from. Using ONE n
-    for both (the pre-slider behaviour) would score 5-point VDL answers as if
-    they were on a 7-point scale -- silently, since every raw value 1-5 is
-    also a valid 1-7 raw value, just the wrong scale's.
+    THREE point counts, not one: q._n_by_page[pi] is VDL_SCALE_POINTS on the
+    vdl page, PROACTIVITY_SCALE_POINTS on the proactivity page, and
+    args.scale_points on the intui page, and `score()`/the midpoint each use
+    the count for the page the item actually came from. Using ONE n for all
+    of them (the pre-slider behaviour) would score 5-point answers as if they
+    were on a 7-point scale -- silently, since every raw value 1-5 is also a
+    valid 1-7 raw value, just the wrong scale's.
     """
     row = {
         "logged_ts": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -577,13 +618,15 @@ def collect_row(q: Questionnaire, args, duration_s: float):
         "k_condition": args.condition,
         "vdl_scale_points": VDL_SCALE_POINTS,
         "intui_scale_points": q._n_by_page[1],
+        "proactivity_scale_points": PROACTIVITY_SCALE_POINTS,
         "duration_s": round(duration_s, 1),
         "notes": args.notes or "",
     }
-    bucket = {"usefulness": [], "satisfying": [], "magical": []}
+    bucket = {"usefulness": [], "satisfying": [], "magical": [], "proactivity": []}
     mid_for = {"usefulness": (VDL_SCALE_POINTS + 1) / 2.0,
               "satisfying": (VDL_SCALE_POINTS + 1) / 2.0,
-              "magical": (q._n_by_page[1] + 1) / 2.0}
+              "magical": (q._n_by_page[1] + 1) / 2.0,
+              "proactivity": (PROACTIVITY_SCALE_POINTS + 1) / 2.0}
     for pi, (tag, _t, items, _s) in enumerate(PAGES):
         n = q._n_by_page[pi]
         for i, (_lo, _hi, pos_right, sub) in enumerate(items):
@@ -597,11 +640,14 @@ def collect_row(q: Questionnaire, args, duration_s: float):
         return round(sum(v) / float(len(v)), 4) if v else ""
     for sub, prefix in (("usefulness", "vdl_usefulness"),
                         ("satisfying", "vdl_satisfying"),
-                        ("magical", "intui_magical")):
+                        ("magical", "intui_magical"),
+                        ("proactivity", "proactivity")):
         m = mean(bucket[sub])
         row[prefix + "_mean"] = m
         # Centred on the scale midpoint: Van der Laan is conventionally read
         # symmetrically, where 0 is indifference and the SIGN is the finding.
+        # Applied to every subscale here, proactivity included, for the same
+        # reading -- 0 = neither agree nor disagree.
         row[prefix + "_centered"] = round(m - mid_for[sub], 4) if m != "" else ""
     return row
 
@@ -663,6 +709,12 @@ def main() -> None:
                          "the published wording). Changing it to name the "
                          "assistant is a wording change to record in the "
                          "write-up, not a formatting choice.")
+    ap.add_argument("--proactivity-stem", dest="proactivity_stem",
+                    default=PROACTIVITY_STEM,
+                    help="The final item's statement (default: %(default)r). "
+                         "This is OUR wording, not a published instrument's, "
+                         "so it is overridable -- but keep it FIXED across "
+                         "every participant and block like the other two.")
     ap.add_argument("--notes", default="", help="Free text stored with the row.")
     ap.add_argument("--fullscreen", action="store_true")
     ap.add_argument("--width", type=int, default=1400)
@@ -709,7 +761,8 @@ def main() -> None:
                                % (args.participantid, args.block_idx))
 
     q = Questionnaire(screen, args.scale_points,
-                      {"vdl": args.vdl_stem, "intui": args.intui_stem})
+                      {"vdl": args.vdl_stem, "intui": args.intui_stem,
+                       "proactivity": args.proactivity_stem})
 
     clock = pygame.time.Clock()
     started = time.time()
@@ -740,6 +793,8 @@ def main() -> None:
              row["vdl_usefulness_centered"], row["vdl_satisfying_centered"]))
     print("  INTUI magical experience %.2f   (centred %+.2f)"
           % (row["intui_magical_mean"], row["intui_magical_centered"]))
+    print("  Proactivity happiness %.2f   (centred %+.2f)"
+          % (row["proactivity_mean"], row["proactivity_centered"]))
     print("  completed in %.0f s" % row["duration_s"])
 
 
