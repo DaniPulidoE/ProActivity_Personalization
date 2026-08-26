@@ -1342,17 +1342,16 @@ class CallEvent(object):
             # rows stayed on screen through ANSWERING and CONNECTED, offering
             # controls for a question the driver had already answered.
             #
-            # STACKED, at the supervisor's request (was side by side). No
-            # first, Yes second -- same order the side-by-side layout read in
-            # (left-to-right becomes top-to-bottom), so this isn't a new
-            # convention, just the same one turned 90 degrees. The paddle
-            # mapping is unchanged -- left paddle is still "No", right paddle
-            # still "Yes" -- the label just no longer sits on the side of the
-            # panel matching its paddle, which the horizontal layout had going
-            # for it and this one gives up.
-            y = self._blit(display, self._font_text, '%s No' % self.no_key,
+            # STACKED, at the supervisor's request (was side by side). Yes
+            # first, No second -- inverted from the first stacked version,
+            # which read No-then-Yes to mirror the old left-to-right order;
+            # that mirroring is dropped in favour of putting the affirmative
+            # option on top. The paddle mapping is unchanged either way --
+            # left paddle is still "No", right paddle still "Yes" -- only the
+            # on-screen row order moved.
+            y = self._blit(display, self._font_text, '%s Yes' % self.yes_key,
                            COL_WHITE, x, y + 4)
-            return self._blit(display, self._font_text, '%s Yes' % self.yes_key,
+            return self._blit(display, self._font_text, '%s No' % self.no_key,
                               COL_WHITE, x, y)
         return y
 
