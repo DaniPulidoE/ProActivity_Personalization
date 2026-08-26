@@ -634,6 +634,15 @@ LOA_WHEEL_BUTTON_NEXT = 4
 # and during an LoA prompt — not only while a selection is open.
 WHEEL_BUTTON_QUIT = 7
 
+# WHILE DRIVING ONLY (KeyboardControl.parse_events — not the start screen or
+# the LoA popup, which are single-press by design), button 7 needs a SECOND
+# press within this window to actually end the session. A single stray hit
+# next to the paddles used for steering/LoA input is now cheap; ending the
+# whole study by accident is not. Confirmed elsewhere (start screen, LoA
+# popup) stays a single press: those are deliberate, momentary screens, not
+# the hours of ordinary driving where an accidental touch is the risk.
+WHEEL_QUIT_CONFIRM_WINDOW_MS = 1000
+
 # Index == the LoA value that gets logged.
 LOA_LABELS = (
     '1: No assistive action is taken',
@@ -1987,6 +1996,10 @@ class KeyboardControl(object):
         self._control_mode = control_mode  # 'test' or 'full'
         self._wheel = None
         self._wheel_pedals_combined = False
+        # First (unconfirmed) press of WHEEL_BUTTON_QUIT, in the parse_events
+        # `now_ms` clock; None when no press is pending. See
+        # WHEEL_QUIT_CONFIRM_WINDOW_MS.
+        self._wheel_quit_armed_ms = None
         if use_wheel:
             self._init_wheel()
         if isinstance(world.player, carla.Vehicle):
@@ -2043,7 +2056,36 @@ class KeyboardControl(object):
             print("[WARN] Steering wheel init failed (%s) — using keyboard control." % e)
             self._wheel = None
 
-    def parse_events(self, client, world, clock, sync_mode, events=None):
+    def parse_events(self, client, world, clock, sync_mode, events=None,
+                     suppress_wheel_quit=False, now_ms=None):
+        """Consume one frame's events; True means the session should end.
+
+        ``suppress_wheel_quit``: True while a call panel is on screen. Button 7
+        (WHEEL_BUTTON_QUIT) sits next to the paddles a driver is reaching for to
+        answer a call (CALL_WHEEL_BUTTON_AFFIRM/NEGATIVE in call_event.py), and
+        an accidental hit there does not mean "end the session" the way it does
+        the rest of the time -- it means a participant reached one button too
+        far while under time pressure from an 8 s cap. Ending the whole study
+        on that mistake is a far worse outcome than the mistake itself, so the
+        button is dropped ENTIRELY for as long as the call is up: it neither
+        arms nor confirms the double-press below, and any press pending from
+        just before the call started is cleared rather than left to be
+        completed once the call ends.
+
+        Otherwise (ordinary driving) button 7 needs a SECOND press within
+        ``WHEEL_QUIT_CONFIRM_WINDOW_MS`` to end the session -- see that
+        constant. The first press only arms it and shows a HUD hint; nothing
+        ends until the second press lands inside the window, and a press
+        arriving after the window has elapsed re-arms rather than confirms, so
+        two unrelated taps minutes apart can never combine into a quit.
+
+        Only the wheel-quit branch has any of this gating: window-close
+        (pygame.QUIT) and the keyboard quit shortcuts stay a single press
+        throughout, since those are the experimenter's controls, not something
+        a participant reaches for by accident.
+        """
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
         if isinstance(self._control, carla.VehicleControl):
             current_lights = self._lights
         event_list = events if events is not None else pygame.event.get()
@@ -2053,8 +2095,26 @@ class KeyboardControl(object):
             elif (event.type == pygame.JOYBUTTONDOWN
                     and WHEEL_BUTTON_QUIT is not None
                     and event.button == WHEEL_BUTTON_QUIT):
-                # Same effect as closing the window.
-                return True
+                if suppress_wheel_quit:
+                    # Fully inert during a call: does not arm, does not
+                    # confirm, and drops any press armed just before the call
+                    # started so it cannot be completed once the call ends.
+                    self._wheel_quit_armed_ms = None
+                elif (self._wheel_quit_armed_ms is not None
+                        and now_ms - self._wheel_quit_armed_ms
+                        <= WHEEL_QUIT_CONFIRM_WINDOW_MS):
+                    # Second press, in time: same effect as closing the window.
+                    self._wheel_quit_armed_ms = None
+                    return True
+                else:
+                    # First press (or the window on a previous one elapsed):
+                    # arm it and say so, rather than quitting silently on a
+                    # press the driver may not even have meant as the first of
+                    # two.
+                    self._wheel_quit_armed_ms = now_ms
+                    world.hud.notification(
+                        "Press EXIT again within 1s to end the session",
+                        seconds=WHEEL_QUIT_CONFIRM_WINDOW_MS / 1000.0)
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
@@ -3720,7 +3780,17 @@ def game_loop(args):
             # No tick or wait here: the wait moved to the TOP of the loop so that
             # input is drained fresh off a tick and the control applied just below
             # lands on the very next one. See the comment there.
-            if controller.parse_events(client, world, clock, args.sync, events):
+            #
+            # suppress_wheel_quit=call_preview.active: while the call panel is
+            # up, button 7 sits one paddle away from the ones the driver is
+            # actually reaching for (CALL_WHEEL_BUTTON_AFFIRM/NEGATIVE), and a
+            # mis-press there must not end the whole study out from under a
+            # participant answering a phone call.
+            if controller.parse_events(
+                    client, world, clock, args.sync, events,
+                    suppress_wheel_quit=(call_preview is not None
+                                         and call_preview.active),
+                    now_ms=now_ms):
                 return
             world.tick(clock)
             # After world.tick, which is what refreshes hud.speed_kmh (it does so
