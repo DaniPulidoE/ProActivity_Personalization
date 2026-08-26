@@ -516,6 +516,38 @@ def _load_sound(path):
         return None
 
 
+def outcome_matches_proposal(outcome, proposed_action):
+    """Did the call end up in the state the assistant proposed?
+
+    This is the agreement contrast the spam call exists to create (docs/
+    live_study_setup.md §5.5, §9) -- but ``outcome`` (answered/not_answered)
+    and ``proposed_action`` (answer/reject/none), both written by
+    ``CallEvent.outcome`` below, are DIFFERENT vocabularies, so a literal
+    ``outcome == proposed_action`` can never be true. This function is the
+    one place that translation happens, so an analysis script imports it
+    instead of reconstructing the mapping from memory.
+
+    LoA 0 (``proposed_action == 'none'``) always agrees, regardless of
+    ``outcome``: the assistant did not act, so whatever the driver did cannot
+    disagree with a proposal that was never made. Above LoA 0, 'answered'
+    agrees only with a proposal to 'answer', and 'not_answered' agrees only
+    with a proposal to 'reject' (spam correctly rejected).
+
+    Returns False for any other input, including the 'unknown' sentinel a
+    skipped call writes for ``proposed_action`` (study_session.py ``_skip``)
+    -- a skip has no ``outcome`` either, so it should never register as
+    either an agreement or a disagreement; filter skipped rows out before
+    applying this rather than relying on this function to do it.
+    """
+    if proposed_action == 'none':
+        return outcome in ('answered', 'not_answered')
+    if outcome == 'answered':
+        return proposed_action == 'answer'
+    if outcome == 'not_answered':
+        return proposed_action == 'reject'
+    return False
+
+
 class CallEvent(object):
     """One incoming-call event per window, rendered according to a served LoA.
 
@@ -1035,9 +1067,11 @@ class CallEvent(object):
         # `proposed_action` is stored rather than re-derived in analysis. It is a
         # function of (loa, spam) and could be recomputed -- but the whole point
         # of the spam call is that agreement and passivity finally come apart,
-        # and that contrast is `outcome == proposed_action`. Leaving it implicit
-        # invites someone to reconstruct the mapping from memory and get LoA 3's
-        # veto backwards.
+        # and that contrast is `outcome_matches_proposal(outcome, proposed_action)`
+        # (see that function above -- outcome and proposed_action are written in
+        # different vocabularies, so a literal `==` is never true). Leaving
+        # proposed_action implicit invites someone to reconstruct the mapping
+        # from memory and get LoA 3's veto backwards.
         proposed = ('none' if self.loa == 0
                     else ('reject' if self.spam else 'answer'))
         return {

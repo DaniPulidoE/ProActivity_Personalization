@@ -153,61 +153,76 @@ session-sourced baseline, and any session whose median ``hr_delta`` sits too far
 from zero to be a real difference between the calibration window and the drive.
 
 
-RELATIONSHIP TO THE LIVE FILTER
-===============================
+RELATIONSHIP TO THE LIVE PATHS
+==============================
 
-The two are ALIGNED where they can be and DIFFERENT where the live path is
-structurally unable to follow. Shared by construction, AST-read out of
-``data_collector.py`` rather than restated (importing ProVoice would pull in
-torch and fastapi for four numbers):
+There are three callers of the heart-rate filter, and only two of them can be
+made equivalent. The algorithm and every constant it uses live in
+``src/ProVoice/hr_filter.py``, which this script and ``data_collector.py`` both
+IMPORT -- not a copy, not an AST-parsed set of numbers, the same functions.
 
-  ``_HR_HARMONIC_LO/HI``  the 2f band -- "harmonic" means the same in both
-  ``_HR_REF_MIN``         readings needed before a reference is trusted
-  ``_MAD_TO_SIGMA``       MAD -> sigma conversion
-  ``_HR_DELTA_CLIP``      the ``hr_delta`` bound, applied identically by
-                          ``_standardized_delta`` and ``standardized_delta``
+**(A) This script.** Sees every session of every participant at once. Resolves
+the octave over all of a participant's readings, and repairs a non-harmonic hole
+from the readings on BOTH sides of it.
 
-The BASELINE is shared too, for any participant this script has processed:
-``load_calibration`` reads ``calibration_<pid>_preprocessed.json``, so the
-octave-corrected mean and the floored std reach the live path with no code
-change at all.
+**(B) ``DataCollector.compute_calibration``.** Computes the stored baseline at
+the END of the calibration phase. Crucially this is a BATCH step -- it runs once,
+with all ~28 readings already collected -- so it runs the SAME
+``clean_calibration`` and the SAME ``baseline_from_readings`` this script does.
 
-What the live filter CANNOT do, because it only ever sees the past:
+  Measured: feeding both the identical calibration readings, the live baseline
+  reproduces the dataset's baseline EXACTLY for 10 of 12 participants. The two
+  exceptions are the two degenerate ones -- 001, whose log holds a single usable
+  reading, and 010, discussed below.
 
-  * resolve the octave -- that needs the whole session at once;
-  * interpolate a hole -- that needs the readings after it. Live carries the
-    previous value forward instead.
+  What (B) still lacks is EVIDENCE, not algorithm. This script pools the
+  calibration readings with every session reading before voting on the octave
+  (~530 values); (B) has only the ~28 calibration readings. Measured over the
+  study cohort with the external override disabled, the octave voted from the
+  calibration alone agrees with the pooled vote for **10 of 11** participants.
+  The exception is 010, whose calibration is 26/28 harmonics: alone it votes
+  114 bpm, pooled it votes 52. So a driver whose CALIBRATION is itself mostly 2f
+  can still be resolved to the wrong octave live, and only a post-hoc run of this
+  script fixes it -- it rewrites ``calibration_<pid>_preprocessed.json``, and the
+  next session loads the corrected value.
 
-What it merely does NOT do yet, and could:
+**(C) ``DataCollector._capture_loop``.** Per reading, during a session. STRICTLY
+CAUSAL, and therefore permanently different:
 
-  * FOLD a harmonic rather than drop it (halving against the running median is
-    perfectly causal);
-  * bound readings to 40-180 bpm -- live has no range check at all;
-  * apply any distance gate -- live has only the harmonic band, no drift test;
-  * floor the baseline scale for a driver with no stored calibration:
-    ``_ROBUST_SCALE_FLOOR`` is defined, but the line applying it in
-    ``compute_calibration`` is still commented out.
+  * it cannot resolve an octave -- that needs the whole recording at once;
+  * it cannot interpolate a hole -- that needs the readings after it, so it folds
+    what it can identify and carries the previous value forward otherwise.
 
-The gap is measurable: of the 646 readings this script flags, the live filter
-caught 173. A model trained on this output and then served against the live
-filter would meet, in roughly a fifth of readings, values that training never
-saw -- the same class of train/serve skew that hid in ``ear`` for weeks (see
-CLAUDE.md). Worth closing before the live follow-up study rather than after.
+  It does share the range gate, the 2f band and the fold rule, and it seeds its
+  reference from the stored (octave-corrected) baseline so it is anchored from
+  the first reading rather than disarmed for three.
+
+  The residual gap is measurable: of the 646 readings this script flags, the live
+  filter caught 173 under the code that recorded the study data. About a fifth of
+  readings therefore reach a served model as values training never saw -- the
+  same class of train/serve skew that hid in ``ear`` for weeks (see CLAUDE.md).
+  That figure predates the fold/range-gate/baseline-seed changes and has not been
+  re-measured on data recorded under them.
 
 Usage::
 
     python data_preprocessing/heart_rate_preprocessing.py --dry-run
     python data_preprocessing/heart_rate_preprocessing.py
     python data_preprocessing/heart_rate_preprocessing.py --participants 010 --verbose
+
+--participants scopes processing AND reporting to the listed drivers, but never
+writes --out-data -- it would otherwise overwrite the full cohort file with a copy
+where every other driver's frames are unrepaired. Use it to inspect one driver's
+flags/report; re-run without --participants to actually write the repaired file.
 """
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import json
 import math
 import statistics as st
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -227,87 +242,32 @@ REQUIRED_SCHEMA: Dict[str, Tuple[str, ...]] = {
     "perclos": ("mean", "std"),
 }
 
-# Absolute floor on the outlier gate. Without it, a driver whose readings are
-# nearly constant gets a MAD near zero and every small wobble is "an outlier".
-HR_MIN_DEVIATION = 15.0
-# Deviation from the reference, in MADs, beyond which a reading is dropped.
-HR_MAD_K = 3.5
-# CEILING on that MAD-scaled gate. Without one the rule is self-defeating: the
-# gate is widened by the very contamination it exists to reject. MAD is robust to
-# a MINORITY of bad readings, and in a noisy participant's local window they are
-# not a minority -- participant 009's local MAD reaches 13.5 bpm, inflating the
-# gate to 70 and admitting everything from 20 to 150 around a reference of 81.
-# 25 bpm is generous for the quantity actually being bounded: the deviation of
-# one reading from the MEDIAN of its ~50 s neighbourhood, for a seated driver.
-HR_MAX_GATE = 25.0
-# A gate-flagged reading is treated as a 2f lock when halving brings it at least
-# this many bpm CLOSER to the local reference. The margin stops a reading that is
-# merely a bit high from being halved on a coin-flip.
-HR_FOLD_MARGIN = 5.0
-
-
-def _module_constants(path: Path, names: Sequence[str]) -> Dict[str, Any]:
-    """Read module-level literal constants without importing the module.
-
-    Importing ProVoice pulls in torch + fastapi and arms the faulthandler log
-    for four numbers. AST-parsing keeps this script a single source of truth
-    with data_collector.py while staying dependency-free.
-    """
-    wanted = set(names)
-    tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    found: Dict[str, Any] = {}
-    for node in tree.body:
-        targets = []
-        if isinstance(node, ast.Assign):
-            targets = [t for t in node.targets if isinstance(t, ast.Name)]
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            targets = [node.target]
-        for t in targets:
-            if t.id in wanted:
-                try:
-                    found[t.id] = ast.literal_eval(node.value)
-                except ValueError:
-                    pass
-    missing = wanted - set(found)
-    if missing:
-        raise SystemExit(
-            f"{path.name} no longer defines {sorted(missing)}. These are the live "
-            "filter's own constants; refusing to guess replacements, because an "
-            "offline pass built on different thresholds than the serving path "
-            "uses is worse than none."
-        )
-    return found
-
-
-_C = _module_constants(
-    DATA_COLLECTOR,
-    ("_MAD_TO_SIGMA", "_HR_HARMONIC_LO", "_HR_HARMONIC_HI", "_HR_REF_MIN",
-     "_HR_DELTA_CLIP", "_HR_RANGE"))
-MAD_TO_SIGMA: float = float(_C["_MAD_TO_SIGMA"])
-# Band, as a multiple of the reference, in which a reading is treated as the 2nd
-# harmonic. The same numbers the live filter rejects on, so "harmonic" means
-# offline exactly what it means live.
-HARMONIC_LO: float = float(_C["_HR_HARMONIC_LO"])
-HARMONIC_HI: float = float(_C["_HR_HARMONIC_HI"])
-# Minimum neighbours needed before a local reference is trusted enough to reject
-# anything -- the offline counterpart of the live filter's warm-up guard.
-HR_REF_MIN: int = int(_C["_HR_REF_MIN"])
-# Bound on the emitted z-score. Read from data_collector.py rather than restated,
-# so the column this script writes for TRAINING and the column
-# _standardized_delta emits at SERVING cannot drift apart.
-HR_DELTA_CLIP: float = float(_C["_HR_DELTA_CLIP"])
-# Physiologically defensible range for a seated adult. Read from
-# data_collector.py, which now gates on it live too, so a reading discarded here
-# is a reading discarded there.
-HR_RANGE: Tuple[float, float] = (float(_C["_HR_RANGE"][0]), float(_C["_HR_RANGE"][1]))
-# Floor on the baseline std. The calibration std is a 180 s estimate from ~25
-# noisy readings and only weakly predicts the driver's real range (Spearman 0.55,
-# n=12, not significant), while underestimating it ~1.9x on average. Below this
-# it is measuring estimator noise, not the driver, and hr_delta divides by it.
-# 5.0 is also the value the live code's own commented-out _ROBUST_SCALE_FLOOR
-# chose for bpm. A driver who genuinely varies more keeps their own std, so this
-# degrades gracefully rather than imposing one scale on everyone.
-HR_MIN_SCALE = 5.0
+# The cleaning algorithm and every constant it uses live in ProVoice.hr_filter,
+# which DataCollector.compute_calibration also imports. That shared import is
+# what makes the offline baseline and the live baseline the same computation
+# rather than two that happen to agree. Importing a ProVoice submodule is cheap
+# (PEP 562 lazy __init__): measured 0.03 s and no torch, cv2 or fastapi.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from ProVoice.hr_filter import (           # noqa: E402
+    DEFAULT_WINDOW,
+    HARMONIC_HI,
+    HARMONIC_LO,
+    HR_DELTA_CLIP,
+    HR_FOLD_MARGIN,
+    HR_MAD_K,
+    HR_MAX_GATE,
+    HR_MIN_DEVIATION,
+    HR_MIN_SCALE,
+    HR_RANGE,
+    HR_REF_MIN,
+    MAD_TO_SIGMA,
+    VERIFIED_FUNDAMENTAL,
+    baseline_from_readings,
+    clean_calibration,
+    flag_readings,
+    session_fundamental,
+    standardized_delta,
+)
 
 
 def read_calibration_log(path: Path) -> Tuple[List[float], List[float]]:
@@ -357,22 +317,7 @@ def validate_calibration(cal: Dict[str, Any]) -> Optional[str]:
         return "'perclos.std' is not positive"
     return None
 
-# Readings on each side that form a reading's reference window. Readings land
-# every ~6 s, so +-8 spans ~1.5 min -- long enough to average out estimator
-# jitter, short enough to follow a real trend.
-DEFAULT_WINDOW = 8
 
-# Octave calls confirmed against evidence OUTSIDE this pipeline. Recorded rather
-# than left to the support threshold, because a tuning parameter that happens to
-# land on the right answer is not the same as knowing the answer -- and a later
-# change to that threshold must not silently overturn a measurement.
-#
-#   '010' -- the low mode is the true pulse, confirmed by the participant's own
-#            smartwatch. This is also the ONLY participant whose octave depends
-#            on --octave-min-support at all (every other one is stable across
-#            0.10-0.30), so the confirmation validates the default rather than
-#            being papered over by it.
-VERIFIED_FUNDAMENTAL: Dict[str, str] = {"010": "low"}
 
 
 # ── reading extraction ────────────────────────────────────────────────────────
@@ -431,207 +376,6 @@ def reading_spans(frames: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ── offline filter ────────────────────────────────────────────────────────────
-
-def session_fundamental(
-    values: Sequence[float],
-    hr_range: Tuple[float, float] = HR_RANGE,
-    rel_tol: float = 0.25,
-    min_support: float = 0.15,
-    verified: Optional[str] = None,
-) -> Tuple[Optional[float], float, float]:
-    """Pick the session's fundamental rate; return ``(f0, share, margin)``.
-
-    **Why this cannot be left to a local median.** Sessions 010 and 012 are
-    BIMODAL -- a cluster near 55-65 and another near 110-130 -- and in 012's
-    first session the split is 53/55, so the session median (86) lands in the
-    empty gap between the modes and is not a rate the driver ever had. A local
-    window inside the high cluster then has a harmonic majority, makes the
-    harmonic its reference, and flags the CORRECT low readings as subharmonics.
-    Before the octave is settled, no drift-tracking reference can be trusted.
-
-    **The tie is broken by physics, not preference.** The toolbox takes the
-    largest FFT peak in 36-198 bpm. A real BVP carries genuine energy at 2f, so
-    a true rate below 99 bpm can be reported DOUBLED -- but nothing in that
-    pipeline can report a rate HALVED, since there is no subharmonic to lock on
-    to. Given two modes at x and ~2x, the fundamental is therefore x.
-
-    Mechanically this is harmonic folding, the standard octave-error fix in
-    pitch tracking: each candidate f0 is scored by how many readings it explains
-    either as itself or as its 2f, and the best-scoring candidate wins with ties
-    broken DOWNWARD (the octave-down convention, which is the same physical
-    argument).
-
-    **The octave-down preference needs a floor, or it runs away.** Halving ANY
-    candidate explains the same readings just as well, purely as 2f: participant
-    001's readings are a single tight mode at ~88 bpm, and an unconstrained
-    search happily returns 44 -- a rate the driver never had, explaining 100% of
-    the session as harmonics of nothing. A candidate is therefore only eligible
-    if its own fundamental band holds at least ``min_support`` of the readings.
-    The low mode has to EXIST before it can win.
-
-    ``share`` is the fraction of readings explained; ``margin`` is the lead over
-    the best candidate that is not an octave-relative of the winner. A small
-    margin means the session did not actually decide, and the caller warns.
-    """
-    lo, hi = hr_range
-    vals = [v for v in values if math.isfinite(v) and lo <= v <= hi]
-    if len(vals) < HR_REF_MIN:
-        return None, 0.0, 0.0
-
-    def at(centre: float, v: float) -> bool:
-        return abs(v - centre) <= rel_tol * centre
-
-    def mode_at(centre: float) -> Tuple[int, float]:
-        """Population and refined centre of the mode around ``centre``."""
-        members = [v for v in vals if at(centre, v)]
-        return len(members), (float(st.median(members)) if members else centre)
-
-    # Step 1: the dominant mode -- the best-supported rate in the session.
-    # Refined to the MEDIAN of its own members, not left at whichever reading
-    # seeded it: with a +-25% tolerance many seeds cover the same mode, and
-    # taking the smallest of them would put f0 at the mode's lower edge (it put
-    # participant 003 at 84 bpm for a mode centred on 98).
-    n_dom, dominant = max((mode_at(c)[0], c) for c in vals)
-    _, dominant = mode_at(dominant)
-
-    # Step 2: the octave question, and ONLY the octave question. Is there also a
-    # mode near half the dominant rate? If so it is the fundamental and the
-    # dominant mode is its 2f, because the estimator can double a rate but has
-    # no mechanism to halve one. The support floor is what stops this from
-    # running away: halving ANY rate explains the same readings just as well as
-    # harmonics of nothing, so participant 001's single tight mode at 88 would
-    # otherwise return 44. The low mode has to EXIST before it can win.
-    n_half, half = mode_at(dominant / 2.0)
-    if verified == "low" and half >= lo:
-        f0, n_f0 = half, n_half          # external ground truth; no vote needed
-    elif verified == "high":
-        f0, n_f0 = dominant, n_dom
-    elif half >= lo and n_half >= min_support * len(vals):
-        f0, n_f0 = half, n_half
-    else:
-        f0, n_f0 = dominant, n_dom
-
-    # How decisive the octave call was = how far the low mode's support sits
-    # from the threshold that decided it. Comparing the two hypotheses' total
-    # explanatory power instead would call every session undecided, since both
-    # explain the SAME readings -- one as fundamentals, the other as 2f. The
-    # support level is the quantity the decision actually turned on.
-    margin = abs(n_half / len(vals) - min_support)
-    return f0, n_f0 / len(vals), margin
-
-
-def _local_reference(
-    values: Sequence[float], good: Sequence[bool], i: int, window: int,
-) -> Tuple[Optional[float], float]:
-    """Median and MAD of the good readings around ``i``, excluding ``i`` itself.
-
-    Excluding the candidate is what makes the test a test: included, a lone
-    harmonic contributes to the very reference it is being compared against, and
-    at small windows that is enough to pull the median toward it.
-    """
-    lo, hi = max(0, i - window), min(len(values), i + window + 1)
-    neigh = [values[j] for j in range(lo, hi) if j != i and good[j]]
-    if len(neigh) < HR_REF_MIN:
-        return None, 0.0
-    ref = float(st.median(neigh))
-    mad = float(st.median([abs(v - ref) for v in neigh]))
-    return ref, mad
-
-
-def flag_readings(
-    values: Sequence[float],
-    f0: Optional[float],
-    window: int = DEFAULT_WINDOW,
-    hr_range: Tuple[float, float] = HR_RANGE,
-    mad_k: float = HR_MAD_K,
-    min_deviation: float = HR_MIN_DEVIATION,
-    max_gate: float = HR_MAX_GATE,
-    fold_margin: float = HR_FOLD_MARGIN,
-    max_iter: int = 10,
-) -> Tuple[List[bool], List[Optional[str]]]:
-    """Return ``(good, reason)`` per reading -- index-aligned with ``values``.
-
-    Index alignment is the point: a baseline only needs a filtered LIST of
-    readings, but repairing a time series needs to know *where* each hole is so
-    the neighbours either side of it can be found.
-
-    Two stages, in this order for a reason:
-
-    1. **Octave, decided once per session against ``f0``.** Anything in
-       ``[1.7*f0, 2.3*f0]`` is a 2f lock and anything above ``2.3*f0`` is not a
-       rate this driver had. Settling this globally is what stops a harmonic
-       burst from capturing a local window (see ``session_fundamental``).
-    2. **Drift, decided locally among the survivors.** A driver's pulse really
-       does move over a 30-minute drive (007 spans 58-100), so the remaining
-       spikes are judged against the median of their ``window`` neighbours, not
-       against ``f0``. Only stage-1 survivors form that reference.
-
-       The gate is CAPPED at ``max_gate``. Uncapped it is self-defeating: it is
-       widened by the very contamination it exists to reject, and 009's local MAD
-       of 13.5 inflated it to 70 bpm, admitting everything from 20 to 150 around
-       a reference of 81. A reading that fails the gate is then re-labelled a 2f
-       lock when HALVING brings it closer to the local reference. That is how
-       harmonics of the low end of a drifting driver's range are caught: stage 1
-       cannot see them, because its band is anchored on a single participant-wide
-       ``f0``, so 009's 130/132/137 (2f of 65/66/68, rates they demonstrably
-       have) fall below the [138, 186] band that f0=81 implies.
-
-    There is deliberately NO subharmonic rule, unlike the calibration pass. For
-    a location estimate, discarding a low outlier costs nothing; for a time
-    series it was the rule that inverted -- in 012's bimodal session it flagged
-    the true 56-60 bpm readings and repaired them UP to ~110-135, laundering the
-    harmonic into the output. With the octave settled the rule is also
-    unnecessary: a genuine low reading is now simply a stage-2 spike.
-
-    Iterative for the same reason as the calibration pass: removing a spike
-    moves the local medians, which can expose readings the first pass hid. Flags
-    are only ever ADDED, so the good-set shrinks monotonically and the loop
-    terminates; ``max_iter`` only bounds pathological input.
-    """
-    n = len(values)
-    good = [True] * n
-    reason: List[Optional[str]] = [None] * n
-
-    lo, hi = hr_range
-    for i, v in enumerate(values):
-        if not math.isfinite(v):
-            good[i], reason[i] = False, "not finite"
-        elif not (lo <= v <= hi):
-            good[i], reason[i] = False, f"outside {lo:.0f}-{hi:.0f} bpm"
-        elif f0 is not None and HARMONIC_LO * f0 <= v <= HARMONIC_HI * f0:
-            good[i], reason[i] = False, f"2f harmonic of session {f0:.0f}"
-        elif f0 is not None and v > HARMONIC_HI * f0:
-            good[i], reason[i] = False, f"{v:.0f} > 2.3x session {f0:.0f}"
-
-    for _ in range(max_iter):
-        newly: List[Tuple[int, str]] = []
-        for i, v in enumerate(values):
-            if not good[i]:
-                continue
-            ref, mad = _local_reference(values, good, i, window)
-            if ref is None or ref <= 0.0:
-                continue                 # too few neighbours to judge against
-            gate = min(max(min_deviation, mad_k * MAD_TO_SIGMA * mad), max_gate)
-            if abs(v - ref) > gate:
-                # Does HALVING explain it? The stage-1 band is anchored on one
-                # participant-level f0, but a driver's pulse drifts, so a 2f lock
-                # on the LOW end of their range falls under that band: 009's f0
-                # is 81, giving a band of [138, 186], while their 130/132/137
-                # readings are 2f of 65/66/68 -- rates they demonstrably have.
-                # Comparing against the LOCAL reference catches those, and lets
-                # them be folded (recovering the measurement) rather than
-                # interpolated (discarding it).
-                half = v / 2.0
-                if half >= lo and abs(half - ref) < abs(v - ref) - fold_margin:
-                    newly.append((i, f"2f harmonic of local {ref:.0f}"))
-                else:
-                    newly.append((i, f"|{v:.0f}-{ref:.0f}| > {gate:.0f}"))
-        if not newly:
-            break
-        for i, why in newly:
-            good[i], reason[i] = False, why
-    return good, reason
-
 
 def repair(
     values: Sequence[float],
@@ -769,53 +513,6 @@ def load_stored_baselines(calib_dir: Path, suffix: str) -> Dict[str, Tuple[float
     return out
 
 
-def clean_calibration(
-    readings: Sequence[float], f0: Optional[float], args: argparse.Namespace,
-) -> List[float]:
-    """Filter the calibration readings onto ``f0``'s octave, FOLDING harmonics.
-
-    Unlike the session pass, a reading identified as a 2f lock is HALVED rather
-    than discarded. The two cases differ in what is available to replace a bad
-    reading with: a session has ~200 readings and good neighbours either side of
-    any hole, so dropping and interpolating loses nothing. A calibration has
-    ~28 readings and no neighbours worth borrowing from, so dropping is
-    expensive -- and for participant 010 it is fatal. Their calibration is
-    almost entirely 2f, and discarding it leaves TWO usable readings (47 and
-    49), below any threshold at which a baseline means anything.
-
-    Halving is only safe because the octave is settled FIRST, per participant,
-    over all of their evidence at once -- and for 010 by external measurement.
-    Halve before that is decided and a mis-diagnosed fold injects a wrong value
-    at full confidence, which is why the session pass still drops rather than
-    folds. Measured effect: 010 goes from 2 usable readings to 18, at
-    54.5 +- 3.05 bpm; eight participants are unchanged to the decimal; 009 and
-    012 improve slightly.
-
-    A second pass then catches whatever the fold did not explain, using the
-    local drift gate only -- the octave question is already answered.
-    """
-    vals = [float(v) for v in readings if v is not None]
-    if not vals:
-        return []
-    good, why = flag_readings(
-        vals, f0, window=args.window, hr_range=(args.hr_min, args.hr_max),
-        mad_k=args.mad_k, min_deviation=args.min_deviation,
-        max_gate=args.max_gate, fold_margin=args.fold_margin)
-    folded: List[float] = []
-    for v, ok, reason in zip(vals, good, why):
-        if ok:
-            folded.append(v)
-        elif reason and reason.startswith("2f harmonic"):
-            folded.append(v / 2.0)
-    if len(folded) < 2:
-        return folded
-    good2, _ = flag_readings(
-        folded, None, window=args.window, hr_range=(args.hr_min, args.hr_max),
-        mad_k=args.mad_k, min_deviation=args.min_deviation,
-        max_gate=args.max_gate, fold_margin=args.fold_margin)
-    return [v for v, ok in zip(folded, good2) if ok]
-
-
 def derive_baseline(
     repaired: Sequence[float],
     calib_readings: Sequence[float],
@@ -854,7 +551,11 @@ def derive_baseline(
     produced a 0.74 bpm figure for participant 003 -- an estimator artefact that
     ``hr_delta`` would then divide by.
     """
-    cleaned = clean_calibration(calib_readings, f0, args)
+    cleaned = clean_calibration(
+        calib_readings, f0, window=args.window,
+        hr_range=(args.hr_min, args.hr_max), mad_k=args.mad_k,
+        min_deviation=args.min_deviation, max_gate=args.max_gate,
+        fold_margin=args.fold_margin)
     order = (("calibration", cleaned), ("session", repaired))
     if args.baseline == "session":
         order = order[::-1]
@@ -862,11 +563,12 @@ def derive_baseline(
         readings = [v for v in readings if v is not None]
         if len(readings) < args.min_kept:
             continue
-        mean = float(st.median(readings))
-        std = float(st.pstdev(readings))
-        if std <= 0.0:
-            std = args.degenerate_scale
-        return (mean, max(std, args.min_scale)), source
+        stats = baseline_from_readings(
+            readings, min_scale=args.min_scale,
+            degenerate_scale=args.degenerate_scale)
+        if stats is None:
+            continue
+        return stats, source
     return None, "none"
 
 
@@ -936,22 +638,6 @@ def write_calibration_baseline(
         return None, None
     dest.write_text(json.dumps(cal, indent=4) + "\n", encoding="utf-8")
     return dest, None
-
-
-def standardized_delta(value: float, mean: float, std: float,
-                       clip: float = HR_DELTA_CLIP) -> float:
-    """``DataCollector._standardized_delta``, reproduced for the bpm channel.
-
-    Same degenerate-case collapse to a unit scale, the same clip, and the same
-    rounding to one decimal -- ``hr_delta`` is a model input, so what this writes
-    must be bit-for-bit what the serving path would emit for the same reading.
-    The clip bound itself is AST-read from ``data_collector.py`` (see
-    ``HR_DELTA_CLIP``) so the two cannot be changed independently.
-    """
-    baseline = mean if mean > 0.0 else 0.0
-    scale = std if std > 0.0 else 1.0
-    z = (value - baseline) / scale
-    return round(max(-clip, min(clip, z)), 1)
 
 
 # ── per-session driver ────────────────────────────────────────────────────────
@@ -1200,7 +886,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             repaired_all.extend(fixed)
 
         baseline, source = derive_baseline(repaired_all, calib_readings, f0, args)
-        n_kept = len(clean_calibration(calib_readings, f0, args))
+        n_kept = len(clean_calibration(
+            calib_readings, f0, window=args.window,
+            hr_range=(args.hr_min, args.hr_max), mad_k=args.mad_k,
+            min_deviation=args.min_deviation, max_gate=args.max_gate,
+            fold_margin=args.fold_margin))
         pid_state[pid] = {
             "f0": f0, "share": share, "margin": margin,
             "baseline": baseline, "baseline_source": source,
@@ -1227,6 +917,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.dry_run:
         print(f"[hr][dry-run] would write {len(frames)} frames to {args.out_data}")
+    elif args.participants:
+        # `frames`/`groups` only ever held the OTHER participants' data in
+        # memory unfiltered -- writing here would overwrite --out-data's
+        # existing (possibly already-repaired) copy of them with untouched
+        # data, silently undoing prior repair work for everyone not in
+        # --participants. A scoped run reports what it found; it does not
+        # write until re-run without --participants over the full cohort.
+        print(f"[hr] --participants={sorted(args.participants)} scopes this run to "
+              f"{len(groups)} session(s); skipping the write to {args.out_data} so "
+              f"the other participants' repaired data isn't overwritten with "
+              f"unrepaired frames. Re-run without --participants to write the full "
+              f"cohort file.")
     else:
         args.out_data.parent.mkdir(parents=True, exist_ok=True)
         with args.out_data.open("w", encoding="utf-8", newline="\n") as fh:

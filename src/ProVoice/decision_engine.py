@@ -249,7 +249,8 @@ class StateLevelsLoAStrategy(BaseStrategy):
 class StateXLSTMLoAStrategy(BaseStrategy):
     def __init__(self, model_path: Optional[str], default_function: str, window: int = 256,
                  fcd_fallback: Optional[BaseStrategy] = None, log_path: Optional[str] = None,
-                 window_seconds: Optional[float] = None):
+                 window_seconds: Optional[float] = None,
+                 participantid: Optional[str] = None):
         # FIRST statement: __del__ runs on any partially-constructed instance,
         # and it reads this attribute. `load_checkpoint` below can raise (a
         # corrupt or arch-incompatible .pt), and while that is caught here, an
@@ -268,6 +269,26 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         try:
             if model_path and os.path.exists(model_path):
                 self.model, arch = load_checkpoint(model_path)
+                # Live-study checkpoints (minted by build_study_checkpoints.py)
+                # carry provenance in arch['study'], including which driver
+                # they were held out for. Serving one to the wrong driver is
+                # silent and unrecoverable once the session has run, so this
+                # must be a hard refusal, not a warning -- see CLAUDE.md
+                # "Checkpoint naming and provenance". Checkpoints with no
+                # 'study' key (population / plain LODO checkpoints) carry no
+                # such claim and are unaffected by this check.
+                study_meta = arch.get("study")
+                if study_meta:
+                    held_out = str(study_meta.get("held_out_pid"))
+                    pid_str = str(participantid) if participantid else ""
+                    if not pid_str or held_out != pid_str:
+                        raise RuntimeError(
+                            f"REFUSING to serve {model_path!r}: this checkpoint "
+                            f"was held out for participant {held_out!r}, but this "
+                            f"session's participantid is {pid_str!r}. Serving it "
+                            f"anyway would silently give this driver another "
+                            f"driver's personalized head."
+                        )
                 self.context_length = int(arch.get("context_length", self.context_length))
                 # 'corn' checkpoints emit K-1 conditional logits; logits_to_probs
                 # turns either head type into a 5-class PMF. Old checkpoints

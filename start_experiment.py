@@ -174,6 +174,16 @@ import subprocess
 import argparse
 from pathlib import Path
 
+# ONLY for study_blocks (the counterbalancing table) and folds (ALL_PIDS) --
+# both stdlib-only, so this costs nothing at import time and pulls in none of
+# ProVoice's ML dependencies. Every OTHER src/ module stays reached exclusively
+# by subprocess, per this launcher's process-per-machine architecture; this is
+# the one exception, because the counterbalancing check below has to run
+# BEFORE anything is spawned -- a subprocess's exit code cannot fail a session
+# early enough, since CARLA and ProVoice would already be up by the time it
+# reported back.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
 
 # =========================
 # CONFIG
@@ -2221,6 +2231,43 @@ def main():
                          "separates the K effect from order effects. Blank in "
                          "the log is unrecoverable once the sessions are "
                          "done.")
+        # THE COUNTERBALANCING CHECK. --condition and --block-idx are each
+        # validated for PRESENCE just above, but nothing yet checks that their
+        # PAIR matches this participant's planned order -- so an operator who
+        # types --condition 0 out of habit for every block would silently run
+        # every session unbalanced, and nothing downstream would ever notice:
+        # each individual block still looks completely valid on its own.
+        #
+        # src/drive/study_blocks.py is the ONE table this order is decided in
+        # (docs/live_study_setup.md section 2); this is that table's one
+        # consumer. A participant absent from it is refused for the same
+        # reason an absent TRAFFIC_SEED_PLAN entry already is: silently
+        # improvising here would run a real session outside the design the
+        # study's power analysis assumes.
+        try:
+            from drive.study_blocks import condition_for_block
+            planned = condition_for_block(
+                _canonical_participant(args.participantid), args.block_idx)
+        except KeyError as e:
+            parser.error(str(e))
+        except ImportError as e:
+            parser.error(
+                f"could not load the counterbalancing table "
+                f"(src/drive/study_blocks.py): {e}. Fix the import before "
+                f"running a study session -- --condition cannot be checked "
+                f"against the planned order without it.")
+        if args.condition != planned:
+            parser.error(
+                "--condition %d for participant %s block %s CONTRADICTS the "
+                "counterbalancing table, which plans condition %d for this "
+                "participant's block %s (src/drive/study_blocks.py). Running "
+                "as typed would desynchronise this participant from the "
+                "order their consent and their K-effect comparison assume. "
+                "If the table is wrong, fix it there -- not by overriding "
+                "here, which would leave the table wrong for their remaining "
+                "blocks too."
+                % (args.condition, args.participantid, args.block_idx,
+                   planned, args.block_idx))
         model = study_model_path(args.participantid, args.condition)
         # THE MODEL DOES NOT LIVE ON THIS MACHINE under --remote, and Drive
         # never opens a checkpoint at all -- it reads a served LoA off the

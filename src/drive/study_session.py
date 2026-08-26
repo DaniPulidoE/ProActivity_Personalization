@@ -406,6 +406,14 @@ class StudySession(object):
             'call_idx': idx,
             'served_loa': '',
             'call_kind': 'spam' if was_spam else 'genuine',
+            # Genuinely undefined, not merely unrecorded: proposed_action is a
+            # function of (served_loa, call_kind), and a skip fires either
+            # before the LoA lookup runs at all (_gate held it) or when the
+            # lookup returned no decision -- so unlike outcome() there is no
+            # loa to compute it from. Written explicitly as 'unknown' rather
+            # than left to _write()'s blank default, so the CSV distinguishes
+            # "no LoA was ever served for this row" from a forgotten field.
+            'proposed_action': 'unknown',
             'skipped_reason': reason,
             'speed_kmh_at_onset': round(speed_kmh, 1) if speed_kmh is not None else '',
         })

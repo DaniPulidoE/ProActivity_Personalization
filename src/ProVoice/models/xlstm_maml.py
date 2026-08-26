@@ -555,6 +555,17 @@ def evaluate_adaptation(model, segs: List[Segment], K: int, collate, device: str
     ``loss_fn`` is unused now that the shared adapter derives it from
     ``head_type``; it is kept in the signature so callers stay unchanged and the
     two cannot silently disagree about which loss adaptation used.
+
+    Runs the ``adapt_head_tensors`` steps on ``device`` (GPU when meta-training
+    runs on one), unlike ``train_XLSTM.py``'s ``evaluate_adaptation_val`` and
+    the deployed sweep, which deliberately move to CPU first because that
+    adaptation is kernel-launch-bound and gains nothing from CUDA. Left on
+    GPU here on purpose: this call sits inside the meta-training loop, so its
+    tensors are already GPU-resident and round-tripping ~54s/epoch worth of
+    calls through the CPU would add its own transfer overhead on the machine
+    where meta-training time matters most. Unmeasured -- if meta-validation
+    cost ever becomes worth shaving, benchmark the CPU move here specifically
+    before assuming the other script's finding transfers.
     """
     xs, ls, vs = collate(segs[:K])
     Zs = embed(model, xs, ls, device)
@@ -606,6 +617,10 @@ def evaluate_adaptation_multi_k(model, segs: List[Segment], ks: List[int],
     Effective K is returned because it is CLIPPED to leave at least one query
     segment; a caller averaging over the grid needs to know when two requested
     K values collapsed onto the same evaluation and are being double-counted.
+
+    Like :func:`evaluate_adaptation`, the per-K ``adapt_head_tensors`` calls
+    stay on ``device`` (GPU under meta-training) rather than moving to CPU --
+    intentional here, see that function's docstring for why.
     """
     n = len(segs)
     x, l, v = collate(segs)

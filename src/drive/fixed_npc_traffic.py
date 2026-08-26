@@ -991,10 +991,10 @@ def main():
         #    order, so vehicle k gets the same speed and following distance at
         #    every fleet size. Density changes HOW MUCH traffic there is and
         #    nothing about how any individual car drives.
-        #  - the eleven original vehicles keep their spawn points, so
+        #  - the original vehicles keep their spawn points, so
         #    VEHICLE_TM_OVERRIDES still addresses the cars it was written for,
-        #    and the study scenario (seed 42, eleven cars) stays bit-identical
-        #    to every session run so far.
+        #    and the study scenario (seed 42, SCENARIO_FLEET_SIZE[42] cars)
+        #    stays bit-identical to every session run so far.
         #
         # Inserting an entry above this line would break both.
         #
@@ -1050,12 +1050,12 @@ def main():
     # described completely by the value already on every raw_data.jsonl frame,
     # with nothing else to join against.
     #
-    # 42 IS PINNED AT 11 AND MUST STAY THERE. It is the calibration/adaptation
+    # 42 IS PINNED AT 25 AND MUST STAY THERE. It is the calibration/adaptation
     # condition; those participants are compared against each other, and it has
-    # run at eleven vehicles for every session so far. Leaving it out of this
-    # table would have silently promoted the study arm to forty cars the moment
-    # the list grew, changing a fixed condition mid-study without a single line
-    # of output saying so.
+    # run at twenty-five vehicles for every session so far. Leaving it out of
+    # this table would have silently promoted the study arm to forty cars the
+    # moment the list grew, changing a fixed condition mid-study without a
+    # single line of output saying so.
     #
     # THE DENSITIES ARE ORDERED, which changes what the collection scenarios
     # are: not interchangeable draws but a dose series from 15 to 40 vehicles.

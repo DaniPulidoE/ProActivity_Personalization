@@ -4244,6 +4244,29 @@ def main():
     if args.spam_call is not None and not args.study:
         argparser.error('--spam-call only has an effect on a study block. Add '
                         '--study (or --short-trial), or drop it.')
+    # A real participant block, as opposed to the dev/test configurations that
+    # also set args.study (--short-trial, --test-calls, --test-spam,
+    # --random-loa) and explicitly are NOT study data. Those are exempt so a
+    # quick two-minute walkthrough doesn't need meaningless K/order values;
+    # a real block does, because nothing else in the drive process knows
+    # them, and a forgotten flag would silently write blank k_condition /
+    # block_idx into every call_events.csv row for the block.
+    if args.study and not (args.short_trial or args.test_calls
+                            or args.test_spam or args.random_loa):
+        if not args.k_condition:
+            argparser.error('--k-condition is required for a real --study '
+                            'block: it is the independent variable and '
+                            'nothing else in the drive process knows it. '
+                            'Pass e.g. --k-condition k010, or use '
+                            '--short-trial/--test-calls/--test-spam/'
+                            '--random-loa for a dev run that does not need it.')
+        if not args.block_idx:
+            argparser.error('--block-idx is required for a real --study '
+                            'block: it is needed to model order effects and '
+                            'nothing else in the drive process knows it. '
+                            'Pass e.g. --block-idx 1, or use --short-trial/'
+                            '--test-calls/--test-spam/--random-loa for a dev '
+                            'run that does not need it.')
 
     if args.test_popup and args.no_popup:
         argparser.error('--test-popup and --no-popup contradict each other: one is '

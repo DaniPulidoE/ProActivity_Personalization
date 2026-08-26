@@ -311,9 +311,14 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--study-checkpoint-id", dest="study_checkpoint_id", default="",
                    help="Identifier of the served head, recorded with every "
                         "published decision and written into the drive's "
-                        "call_events.csv. Use the checkpoint filename, e.g. "
-                        "p001_l2sp_tau0.05_k010 -- it is what ties a call back "
-                        "to the exact model that produced its LoA.")
+                        "call_events.csv -- it is what ties a call back to the "
+                        "exact model that produced its LoA. Leave unset: it is "
+                        "derived automatically from --xlstm-model's filename "
+                        "(the resolved one, after any --remote bridge "
+                        "adoption), which already IS the checkpoint's identity "
+                        "under the trained_models/user_study/ naming "
+                        "convention. Only pass this explicitly to label an ad "
+                        "hoc checkpoint outside that convention.")
     p.add_argument("--status-url", dest="status_url", default=None,
                    help="Reverse bridge on the CARLA machine "
                         "(scripts/provoice_status_server.py): this process posts "
@@ -843,6 +848,43 @@ def main():
                     print(f"[main] WARNING that checkpoint does NOT EXIST on "
                           f"this machine. It is named by the CARLA machine but "
                           f"must be present HERE -- copy it before the session.")
+
+    # --- The served checkpoint's identifier, for the study bridge -----------
+    #
+    # --study-checkpoint-id has always been read at the DecisionBridge call
+    # site below, but nothing ever SET it under --remote: the
+    # --study-satisfaction-provoice-remote preset (start_experiment.py) takes
+    # no participant, condition or model path on purpose -- all three are meant
+    # to arrive from this machine adopting xlstm_model_path above -- and that
+    # preset never passes --study-checkpoint-id either. So every
+    # call_events.csv row on the CARLA machine was logging checkpoint_id="",
+    # for every block, with nothing to say which file actually served it.
+    # (Found auditing the 2026-08-25 trial run; both real blocks used the
+    # correct model per decisions.csv's LoA/level/action mapping and the
+    # absence of any fallback row -- this was a missing LOG, not a wrong
+    # SERVE.)
+    #
+    # Derived from xlstm_model_path itself rather than published separately by
+    # the bridge: xlstm_model_path is already the single resolved fact (operand
+    # explicit flag, or bridge-adopted, in that priority), so deriving from it
+    # cannot disagree with what was actually loaded -- a second published field
+    # could drift from the first if only one of the two were updated.
+    #
+    # An explicit --study-checkpoint-id still wins outright. That is the escape
+    # hatch for a checkpoint whose filename does not carry the information an
+    # analyst needs (e.g. running an ad hoc file outside the
+    # trained_models/user_study/xlstm_p<pid>_k<n>.pt convention) --
+    # participant/condition/K are exactly what that convention's filename
+    # already encodes, so the derived form is the right default rather than a
+    # placeholder pending something better.
+    study_checkpoint_id = args.study_checkpoint_id
+    if not study_checkpoint_id and xlstm_model_path:
+        study_checkpoint_id = os.path.splitext(
+            os.path.basename(xlstm_model_path))[0]
+        if getattr(args, "study_bridge", False):
+            print(f"[main] study_checkpoint_id={study_checkpoint_id!r} "
+                  f"(derived from xlstm_model_path; pass "
+                  f"--study-checkpoint-id to override).")
         # Probed here rather than trusted: an address that only fails at
         # shutdown fails at the one moment nothing can be done about it.
         if args.status_url:
@@ -944,6 +986,7 @@ def main():
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
                     window_seconds=window_seconds,
+                    participantid=participantid,
                 )
                 print(f"[main] xLSTM served from {xlstm_model_path} (window={state_engine.window_seconds}s)")
             else:
@@ -981,6 +1024,7 @@ def main():
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
                     window_seconds=window_seconds,
+                    participantid=participantid,
                 )
                 print(f"[main] Combined-STATE (xLSTM) part loaded successfully (window={state_engine.window_seconds}s).")
             else:
@@ -1147,8 +1191,11 @@ def main():
 
             decision_bridge = DecisionBridge(
                 status_url, session_id=session_id, participantid=participantid,
-                checkpoint_id=getattr(args, "study_checkpoint_id", ""),
-                on_drive_ended=_drive_ended)
+                # NOT args.study_checkpoint_id directly -- see the resolution
+                # block above main() where this local is derived from
+                # xlstm_model_path when the flag was left unset, which is the
+                # normal case under --remote.
+                checkpoint_id=study_checkpoint_id, on_drive_ended=_drive_ended)
             if decision_bridge.start():
                 data_collector.on_decision = decision_bridge.publish
             else:
