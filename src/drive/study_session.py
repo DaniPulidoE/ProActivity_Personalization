@@ -110,9 +110,11 @@ _SPAM_SEED_OFFSET = 7919
 FULL_TRIAL = dict(duration_s=600.0, n_calls=5, interval_s=120.0, jitter_s=20.0)
 SHORT_TRIAL = dict(duration_s=120.0, n_calls=5, interval_s=24.0, jitter_s=4.0)
 
-# How long a due call waits for the motion gate before it is written off. A
-# driver stopped this long is not driving, and the call would land on a
-# stationary car -- which measures something other than what the study asks.
+# How long a due call waits for `_gate()` before it is written off -- in
+# practice, for another call to finish resolving. Retained as a safety net,
+# not because either remaining gate condition should normally take anywhere
+# near this long: a call resolves in well under a minute, so 45s is slack, not
+# a design tolerance being exercised.
 MAX_DEFER_S = 45.0
 DEFER_RETRY_S = 1.0
 
@@ -124,9 +126,6 @@ DEFER_RETRY_S = 1.0
 # `duration_s` therefore sets the NOMINAL length (and the schedule that fills
 # it); this is the runaway guard on top.
 OVERRUN_FACTOR = 1.5
-
-MIN_SPEED_KMH = 5.0        # "moving" for the gate
-MIN_MOVING_S = 3.0         # ...and for at least this long
 
 
 class LoASource(object):
@@ -249,7 +248,6 @@ class StudySession(object):
         self.call_idx = 0
         self._due_ms = None
         self._due_since_ms = None
-        self._moving_since_ms = None
         self._pending = None
         self.overran = False
 
@@ -288,18 +286,30 @@ class StudySession(object):
     # -- arming --------------------------------------------------------------
 
     def _gate(self, now_ms, speed_kmh, popup_active, call_active):
-        """None if clear to fire, else the reason it is being held."""
+        """None if clear to fire, else the reason it is being held.
+
+        NOT a proxy for "is the driver actually driving": a call fires on
+        schedule regardless of speed, including a driver stopped at a red
+        light or in stop-start traffic -- that is a normal, expected part of
+        driving and exactly the kind of moment the study wants a call to be
+        able to land in, not a condition to filter out. An earlier version of
+        this method also refused to fire below 5 km/h (unless sustained for
+        3s), on reasoning nobody asked for and that contradicted the
+        deferral-vs-cut tradeoff argued for two paragraphs up in this file:
+        "a driver stopped at a light" was given THERE as the textbook example
+        of a deferral worth accepting, and refused HERE. It cost three real
+        calls across three participants before being removed -- state that as
+        a limitation, not as the gate correctly excluding invalid trials.
+
+        The two conditions still checked are the ones with no such judgement
+        call attached: a call cannot fire on top of one still resolving, and
+        must not fire while the labelling popup has the scene frozen (moot in
+        a study block, where the popup is disabled, but cheap to keep true).
+        """
         if call_active or self._pending is not None:
             return 'call_in_progress'
         if popup_active:
             return 'popup_open'
-        if speed_kmh is None or speed_kmh < MIN_SPEED_KMH:
-            self._moving_since_ms = None
-            return 'stationary'
-        if self._moving_since_ms is None:
-            self._moving_since_ms = now_ms
-        if (now_ms - self._moving_since_ms) < MIN_MOVING_S * 1000.0:
-            return 'just_started_moving'
         return None
 
     def _is_spam(self, idx):

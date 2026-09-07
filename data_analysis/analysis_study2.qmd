@@ -1,0 +1,916 @@
+---
+title: "Live Study Data Analysis (R / Quarto port)"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    fig-width: 7.2
+    fig-height: 4.2
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+
+if (!requireNamespace("psych", quietly = TRUE)) install.packages("psych")
+library(psych)
+
+pids <- NULL  # populated in 2.1
+
+# --- palette -- same constants as analysis_study2.ipynb, so a figure here should
+# not look like it came from a different document. -----------------------------
+SERIES_BLUE   <- "#2a78d6"
+SERIES_ORANGE <- "#eb6834"
+SERIES_AQUA   <- "#1baf7a"
+SURFACE   <- "#fcfcfb"
+INK       <- "#0b0b0b"
+INK_2     <- "#52514e"
+INK_MUTED <- "#8f8e88"
+GRID      <- "#e6e5e1"
+
+# K CONDITION -> (label, colour). Condition is a filename index; K is the fact that
+# index encodes 0->K=0, 1->K=4, 2->K=8. Colour assigned by CONDITION, fixed across
+# every figure, so a colour never means a different K on two different plots.
+K_ORDER  <- c(0, 1, 2)
+K_LABEL  <- c(`0` = "condition 0\n(K=0, population)", `1` = "condition 1\n(K=4)",
+              `2` = "condition 2\n(K=8)")
+K_COLOUR <- c(`0` = SERIES_BLUE, `1` = SERIES_ORANGE, `2` = SERIES_AQUA)
+
+# BLOCK ORDER (session position 1st/2nd/3rd, independent of K by design --
+# counterbalancing puts every K at every position). A single-hue sequential ramp on
+# purpose, unlike K's categorical hues: position is genuinely ordinal.
+BLOCK_ORDER  <- c(1, 2, 3)
+BLOCK_LABEL  <- c(`1` = "1st block\n(session position 1)", `2` = "2nd block\n(session position 2)",
+                   `3` = "3rd block\n(session position 3)")
+BLOCK_COLOUR <- c(`1` = "#b9afe0", `2` = "#7a68c9", `3` = "#3d2e8c")
+
+DATA_DIR <- "../data/study2_data"
+QUESTIONNAIRE_PATH <- file.path(DATA_DIR, "study_2_questionnaire.csv")
+
+# A ggplot object only auto-renders when it is the literal top-level value of a
+# chunk. Inside a for-loop or a helper function's body it does NOT (unlike
+# matplotlib's plt.show(), which renders explicitly wherever it's called) -- so
+# every plot call below that sits inside a loop or a function is wrapped in
+# print(). This is the single biggest Python/R idiom gap in this port.
+theme_live_study <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.background   = element_rect(fill = SURFACE, colour = NA),
+      panel.background  = element_rect(fill = SURFACE, colour = NA),
+      strip.background  = element_rect(fill = SURFACE, colour = NA),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_line(colour = GRID, linewidth = 0.4),
+      axis.ticks   = element_blank(),
+      axis.text    = element_text(colour = INK_2),
+      axis.title   = element_text(colour = INK_2, size = rel(0.9)),
+      plot.title    = element_text(colour = INK, hjust = 0, size = rel(1.15)),
+      plot.subtitle = element_text(colour = INK_MUTED, hjust = 0, size = rel(0.85)),
+      strip.text    = element_text(colour = INK, size = rel(0.85)),
+      legend.background = element_rect(fill = SURFACE, colour = NA),
+      legend.key         = element_rect(fill = SURFACE, colour = NA)
+    )
+}
+```
+
+## 1. Live study data analysis
+
+### 1.1 Load the questionnaire
+
+```{r 2-1-load}
+if (!file.exists(QUESTIONNAIRE_PATH)) {
+  stop(sprintf(
+    "%s not found -- this notebook reads the live study's per-block questionnaire, not the population-collection labels.",
+    QUESTIONNAIRE_PATH))
+}
+
+# participantid as character: readr would otherwise infer "001".."012" as a
+# number and silently drop the leading zeros, which would then fail to match
+# call_events.csv's zero-padded ids on any later join.
+q <- read_csv(QUESTIONNAIRE_PATH,
+              col_types = cols(participantid = col_character(),
+                               k_condition = col_integer(),
+                               block_idx = col_integer(),
+                               .default = col_guess()))
+
+# One row per (participant, block) is the contract this file is written under
+# (src/drive/questionnaire.py's duplicate guard refuses a second row for the same
+# pair). Verified rather than assumed, since a silently-duplicated or
+# silently-missing block would bias every mean below without ever raising.
+dup <- q %>% count(participantid, block_idx) %>% filter(n > 1)
+if (nrow(dup) > 0) {
+  stop(paste0("duplicate (participant, block) rows:\n",
+              paste(capture.output(print(q %>% semi_join(dup, by = c("participantid", "block_idx")))),
+                    collapse = "\n")))
+}
+
+pids <- sort(unique(q$participantid))
+counts <- table(q$k_condition)
+cat(sprintf("%d blocks over %d participants: %s\n", nrow(q), length(pids), paste(pids, collapse = ", ")))
+cat("rows per K condition:\n")
+print(counts)
+
+missing <- list()
+for (p in pids) {
+  for (b in c(1, 2, 3)) {
+    if (!any(q$participantid == p & q$block_idx == b)) missing[[length(missing) + 1]] <- c(p, b)
+  }
+}
+if (length(missing) > 0) {
+  cat("[WARN] missing (participant, block) pairs:\n")
+  print(missing)
+} else {
+  cat("every participant has all 3 blocks -- n is balanced across K.\n")
+}
+head(q)
+```
+
+### 1.2 Helper: one histogram per group, shared axes
+
+`grouped_histograms()` is generic over the grouping column; `condition_histograms()` (2.3, 2.4) and `block_order_histograms()` (2.6) are wrappers around it with K- or position-specific labels/colours bound in.
+
+```{r 2-2-helper}
+grouped_histograms <- function(data, value_col, group_col, group_order, group_label, group_colour,
+                                value_range, bin_width, title, xlabel,
+                                ylabel = "number of blocks", suptitle_note = NULL) {
+  lo <- value_range[1]; hi <- value_range[2]
+  breaks <- seq(lo - bin_width / 2, hi + bin_width / 2 + bin_width, by = bin_width)
+
+  df <- data %>%
+    filter(.data[[group_col]] %in% group_order) %>%
+    mutate(group_factor = factor(.data[[group_col]], levels = group_order))
+
+  n_by_group <- df %>% count(group_factor)
+  means <- df %>% group_by(group_factor) %>%
+    summarise(mean = mean(.data[[value_col]]), .groups = "drop")
+
+  # match() on a factor `table` can key off factor codes rather than labels,
+  # so go through as.character() explicitly rather than matching group_order
+  # (numeric) against n_by_group$group_factor (factor) directly.
+  n_lookup <- setNames(n_by_group$n, as.character(n_by_group$group_factor))
+  strip_labels <- setNames(
+    paste0(str_replace_all(group_label[as.character(group_order)], "\n", " "),
+           "  (n=", n_lookup[as.character(group_order)], ")"),
+    as.character(group_order))
+  xticks <- seq(lo, hi, by = if ((hi - lo) <= 6) 1 else 2)
+
+  ggplot(df, aes(x = .data[[value_col]])) +
+    geom_histogram(aes(fill = group_factor), breaks = breaks, colour = SURFACE,
+                    linewidth = 0.5, show.legend = FALSE) +
+    geom_vline(data = means, aes(xintercept = mean), colour = INK,
+               linetype = "42", linewidth = 0.6) +
+    geom_text(data = means, aes(x = mean, y = Inf, label = sprintf("mean %.2f", mean)),
+              vjust = 1.4, size = 3, colour = INK_2) +
+    facet_wrap(~group_factor, nrow = 1, labeller = as_labeller(strip_labels)) +
+    scale_fill_manual(values = group_colour) +
+    scale_x_continuous(breaks = xticks, limits = c(lo - bin_width, hi + bin_width)) +
+    labs(title = title, subtitle = suptitle_note, x = xlabel, y = ylabel) +
+    theme_live_study()
+}
+
+condition_histograms <- purrr::partial(
+  grouped_histograms, group_col = "k_condition", group_order = K_ORDER,
+  group_label = K_LABEL, group_colour = K_COLOUR)
+
+block_order_histograms <- purrr::partial(
+  grouped_histograms, group_col = "block_idx", group_order = BLOCK_ORDER,
+  group_label = BLOCK_LABEL, group_colour = BLOCK_COLOUR)
+```
+
+### 1.3 How happy were drivers with each condition's proactivity?
+
+The questionnaire's last item: *"I was happy with how proactive the assistant was during this block."* 1 (Strongly disagree) to 5 (Strongly agree). One block, one answer; n=12 per condition.
+
+```{r 2-3-proactivity}
+condition_histograms(
+  q, value_col = "proactivity_mean", value_range = c(1, 5), bin_width = 1,
+  title = "Proactivity happiness by K condition",
+  xlabel = "1 = strongly disagree … 5 = strongly agree",
+  suptitle_note = '“I was happy with how proactive the assistant was during this block.”')
+
+q %>% group_by(k_condition) %>%
+  summarise(mean = mean(proactivity_mean), sd = sd(proactivity_mean),
+            min = min(proactivity_mean), max = max(proactivity_mean), .groups = "drop")
+```
+
+### 1.4 The other three questionnaire scores, same treatment
+
+-   **VDL usefulness** -- items 1,3,5,7,9 (useful/good/effective/assisting/raising alertness), 1-5.
+-   **VDL satisfying** -- items 2,4,6,8 (pleasant/nice/likeable/desirable), 1-5.
+-   **INTUI magical experience** -- 4-item Magical Experience subscale, 1-7.
+
+```{r 2-4-subscales}
+SUBSCALES <- list(
+  list(col = "vdl_usefulness_mean", range = c(1, 5), title = "VDL usefulness by K condition",
+       xlabel = "1 = useless … 5 = useful (polarity-corrected mean of 5 items)"),
+  list(col = "vdl_satisfying_mean", range = c(1, 5), title = "VDL satisfying by K condition",
+       xlabel = "1 = unpleasant … 5 = pleasant (polarity-corrected mean of 4 items)"),
+  list(col = "intui_magical_mean", range = c(1, 7), title = "INTUI magical experience by K condition",
+       xlabel = "1 = insignificant … 7 = magical (polarity-corrected mean of 4 items)")
+)
+
+summaries <- list()
+for (s in SUBSCALES) {
+  bin_width <- if ((s$range[2] - s$range[1]) <= 5) 0.5 else 1.0
+  print(condition_histograms(q, value_col = s$col, value_range = s$range, bin_width = bin_width,
+                              title = s$title, xlabel = s$xlabel))
+  summaries[[s$col]] <- q %>% group_by(k_condition) %>%
+    summarise(mean = mean(.data[[s$col]]), sd = sd(.data[[s$col]]),
+              min = min(.data[[s$col]]), max = max(.data[[s$col]]), .groups = "drop")
+}
+
+for (col in names(summaries)) {
+  print(summaries[[col]])
+}
+```
+
+### 1.5 All four scores side by side, one summary table
+
+```{r 2-5-summary-table}
+ALL_SCORES <- c("proactivity_mean", "vdl_usefulness_mean", "vdl_satisfying_mean", "intui_magical_mean")
+
+summary_tbl <- q %>%
+  group_by(k_condition) %>%
+  summarise(across(all_of(ALL_SCORES), list(mean = mean, sd = sd), .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  mutate(k_condition = str_replace_all(K_LABEL[as.character(k_condition)], "\n", " ")) %>%
+  mutate(across(where(is.numeric), ~round(.x, 2)))
+
+summary_tbl
+```
+
+### 1.6 Same four scores, but by block order (session position) instead of K
+
+Counterbalancing (all 3! = 6 orders x 2 replicates) makes K and session position independent by design.
+
+```{r 2-6-block-order}
+print(block_order_histograms(
+  q, value_col = "proactivity_mean", value_range = c(1, 5), bin_width = 1,
+  title = "Proactivity happiness by session position (block order, not K)",
+  xlabel = "1 = strongly disagree … 5 = strongly agree"))
+
+order_summaries <- list(
+  proactivity_mean = q %>% group_by(block_idx) %>%
+    summarise(mean = mean(proactivity_mean), sd = sd(proactivity_mean),
+              min = min(proactivity_mean), max = max(proactivity_mean), .groups = "drop"))
+
+for (s in SUBSCALES) {
+  bin_width <- if ((s$range[2] - s$range[1]) <= 5) 0.5 else 1.0
+  title <- paste0(str_to_title(str_replace_all(str_remove(s$col, "_mean"), "_", " ")),
+                   " by session position")
+  print(block_order_histograms(q, value_col = s$col, value_range = s$range, bin_width = bin_width,
+                                title = title, xlabel = s$xlabel))
+  order_summaries[[s$col]] <- q %>% group_by(block_idx) %>%
+    summarise(mean = mean(.data[[s$col]]), sd = sd(.data[[s$col]]),
+              min = min(.data[[s$col]]), max = max(.data[[s$col]]), .groups = "drop")
+}
+
+for (col in names(order_summaries)) {
+  print(order_summaries[[col]])
+  cat("\n")
+}
+```
+
+### 1.7 By participant
+
+One panel per participant, x-axis fixed to **K** so every panel is directly comparable to the K-condition figures above.
+
+```{r 2-7-participant-grid}
+participant_grid <- function(data, score_col, value_range, title, xlabel, ncols = 4) {
+  lo <- value_range[1]; hi <- value_range[2]
+  df <- data %>%
+    select(participantid, k_condition, all_of(score_col)) %>%
+    mutate(k_condition = factor(k_condition, levels = K_ORDER))
+
+  ggplot(df, aes(x = k_condition, y = .data[[score_col]], fill = k_condition)) +
+    geom_col(width = 0.7, colour = SURFACE, show.legend = FALSE) +
+    facet_wrap(~participantid, ncol = ncols, labeller = as_labeller(function(x) paste0("p", x))) +
+    scale_fill_manual(values = K_COLOUR) +
+    scale_x_discrete(labels = c("K=0", "K=4", "K=8")) +
+    coord_cartesian(ylim = c(lo, hi)) +
+    labs(title = title, subtitle = xlabel, x = NULL, y = NULL) +
+    theme_live_study() +
+    theme(strip.text = element_text(size = rel(0.8)))
+}
+
+print(participant_grid(
+  q, "proactivity_mean", c(1, 5), "Proactivity happiness by participant",
+  "each bar = one participant's score at that K; colour matches the K palette above"))
+
+for (s in SUBSCALES) {
+  title <- paste0(str_to_title(str_replace_all(str_remove(s$col, "_mean"), "_", " ")), " by participant")
+  print(participant_grid(q, s$col, s$range, title, s$xlabel))
+}
+```
+
+### 1.8 Stacked distribution, one histogram instead of three panels
+
+Same four scores as 2.3/2.4, redrawn as a single **stacked** histogram per score -- all three K conditions in one set of bars -- instead of the side-by-side panels above.
+
+```{r 2-10-stacked}
+stacked_histogram <- function(data, value_col, value_range, bin_width, title, xlabel,
+                               ylabel = "number of blocks") {
+  lo <- value_range[1]; hi <- value_range[2]
+  breaks <- seq(lo - bin_width / 2, hi + bin_width / 2 + bin_width, by = bin_width)
+  labels <- str_replace_all(K_LABEL[as.character(K_ORDER)], "\n", " ")
+  df <- data %>% mutate(k_factor = factor(k_condition, levels = K_ORDER, labels = labels))
+
+  ggplot(df, aes(x = .data[[value_col]], fill = k_factor)) +
+    geom_histogram(breaks = breaks, position = "stack", colour = SURFACE, linewidth = 0.5) +
+    scale_fill_manual(values = setNames(K_COLOUR, labels), name = NULL) +
+    scale_x_continuous(breaks = seq(lo, hi, by = if ((hi - lo) <= 6) 1 else 2),
+                        limits = c(lo - bin_width, hi + bin_width)) +
+    labs(title = title, x = xlabel, y = ylabel) +
+    theme_live_study() +
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1))
+}
+
+print(stacked_histogram(q, "proactivity_mean", value_range = c(1, 5), bin_width = 1,
+  title = "Proactivity happiness -- stacked by K condition",
+  xlabel = "1 = strongly disagree … 5 = strongly agree"))
+
+for (s in SUBSCALES) {
+  bin_width <- if ((s$range[2] - s$range[1]) <= 5) 0.5 else 1.0
+  print(stacked_histogram(q, s$col, value_range = s$range, bin_width = bin_width,
+    title = str_replace(s$title, "by K condition", "-- stacked by K condition"),
+    xlabel = s$xlabel))
+}
+```
+
+### 1.9 Per-participant trajectories
+
+Two spaghetti plots per score: one line per participant. The x-axis differs between the two -- **session position** in the first, **K** in the second.
+
+```{r 2-11-trajectories}
+PARTICIPANT_COLOUR <- setNames(grDevices::hcl.colors(length(pids), palette = "Dark 3"), pids)
+
+trajectory_plot <- function(data, value_col, x_col, x_order, x_labels, value_range, title, xlabel) {
+  df <- data %>% mutate(x_factor = factor(.data[[x_col]], levels = x_order, labels = x_labels))
+  ggplot(df, aes(x = x_factor, y = .data[[value_col]], group = participantid, colour = participantid)) +
+    geom_line(linewidth = 0.7, alpha = 0.85) +
+    geom_point(size = 1.6) +
+    scale_colour_manual(values = PARTICIPANT_COLOUR, name = "participant",
+                         labels = function(x) paste0("p", x)) +
+    coord_cartesian(ylim = value_range) +
+    labs(title = title, x = xlabel, y = value_col) +
+    theme_live_study()
+}
+
+trajectory_by_block <- function(col, value_range, title) {
+  trajectory_plot(q, col, "block_idx", BLOCK_ORDER, paste0("block ", BLOCK_ORDER), value_range,
+                   title, "session position (block order, not K)")
+}
+trajectory_by_k <- function(col, value_range, title) {
+  trajectory_plot(q, col, "k_condition", K_ORDER, c("K=0", "K=4", "K=8"), value_range,
+                   title, "K condition")
+}
+
+print(trajectory_by_block("proactivity_mean", c(1, 5), "Proactivity happiness -- trajectory by session position"))
+print(trajectory_by_k("proactivity_mean", c(1, 5), "Proactivity happiness -- trajectory by K condition"))
+
+for (s in SUBSCALES) {
+  label <- str_to_title(str_replace_all(str_remove(s$col, "_mean"), "_", " "))
+  print(trajectory_by_block(s$col, s$range, paste0(label, " -- trajectory by session position")))
+  print(trajectory_by_k(s$col, s$range, paste0(label, " -- trajectory by K condition")))
+}
+```
+
+### 1.10 Median and IQR by K
+
+```{r 2-12-median-iqr}
+median_iqr_table <- q %>%
+  group_by(k_condition) %>%
+  summarise(across(all_of(ALL_SCORES),
+                    list(median = median, IQR = ~quantile(.x, 0.75) - quantile(.x, 0.25)),
+                    .names = "{.col}: {.fn}"),
+            .groups = "drop") %>%
+  mutate(k_condition = str_replace_all(K_LABEL[as.character(k_condition)], "\n", " ")) %>%
+  column_to_rownames("k_condition") %>%
+  round(2)
+
+median_iqr_table
+```
+
+### 1.11 Cliff's delta for each pair of K values
+
+Paired dominance over the SAME participants (matching the within-subject design), reported alongside the standard independent-samples definition's usual magnitude thresholds (Romano et al. 2006).
+
+```{r 2-13-cliffs-delta}
+cliffs_delta_paired <- function(x, y) {
+  d <- x - y
+  (sum(d > 0) - sum(d < 0)) / length(d)
+}
+
+cliffs_magnitude <- function(d) {
+  ad <- abs(d)
+  if (ad < 0.147) return("negligible")
+  if (ad < 0.33) return("small")
+  if (ad < 0.474) return("medium")
+  "large"
+}
+
+K_PAIRS <- combn(K_ORDER, 2, simplify = FALSE)
+
+cliffs_rows <- list()
+for (col in ALL_SCORES) {
+  wide <- q %>% select(participantid, k_condition, all_of(col)) %>%
+    pivot_wider(names_from = k_condition, values_from = all_of(col))
+  for (pair in K_PAIRS) {
+    k1 <- pair[1]; k2 <- pair[2]
+    both <- wide %>% select(all_of(as.character(c(k1, k2)))) %>% drop_na()
+    d <- cliffs_delta_paired(both[[as.character(k1)]], both[[as.character(k2)]])
+    cliffs_rows[[length(cliffs_rows) + 1]] <- tibble(
+      score = col, pair = sprintf("K%d vs K%d", k1, k2), n = nrow(both),
+      cliffs_delta = round(d, 3), magnitude = cliffs_magnitude(d))
+  }
+}
+cliffs_df <- bind_rows(cliffs_rows)
+cliffs_df
+```
+
+### 1.12 Bootstrap confidence interval for each K's mean
+
+Percentile bootstrap: resample each K's 12 scores with replacement, 10,000 times, take the 2.5th/97.5th percentile of the resampled means.
+
+```{r 2-14-bootstrap}
+bootstrap_ci_mean <- function(values, n_boot = 10000, ci = 0.95) {
+  n <- length(values)
+  boot_means <- replicate(n_boot, mean(sample(values, n, replace = TRUE)))
+  probs <- c((1 - ci) / 2, (1 + ci) / 2)
+  qs <- quantile(boot_means, probs)
+  c(mean = mean(values), lo = unname(qs[1]), hi = unname(qs[2]))
+}
+
+set.seed(1)
+boot_rows <- list()
+for (col in ALL_SCORES) {
+  for (k in K_ORDER) {
+    v <- q %>% filter(k_condition == k) %>% pull(.data[[col]])
+    res <- bootstrap_ci_mean(v, n_boot = 10000)
+    boot_rows[[length(boot_rows) + 1]] <- tibble(
+      score = col, k_condition = str_replace_all(K_LABEL[as.character(k)], "\n", " "),
+      mean = round(res[["mean"]], 3),
+      `95% CI low` = round(res[["lo"]], 3),
+      `95% CI high` = round(res[["hi"]], 3))
+  }
+}
+boot_df <- bind_rows(boot_rows)
+boot_df
+```
+
+## 2. Detailed statistical analysis of each questionnaire: Friedman + Kendall's W + McDonald's omega + repeated-measures ANOVA
+
+One function, applied to each of the three VDL measures below and to magicality in section 4, so the same test, same effect sizes, same ANOVA formula and same residual definition are used everywhere.
+
+**Friedman + Kendall's W.** `friedman.test()`/base R has no permutation option, so `permutation_friedman_p` below builds the null by permuting each subject's own rank vector across conditions independently, `n_perm` times, rather than trusting the chi-square approximation at n=12 (asymptotic friedman test is not reliable at low sample sizes). Kendall's W has no base-R or tidyverse equivalent either, so it's computed directly.
+
+**McDonald's omega (ω)** -- a scale-*reliability* coefficient. Computed once per scale, via `psych::omega()`
+
+**ANOVA** is a one-way repeated-measures ANOVA fit with `stats::aov(y ~ condition + Error(subject/condition))` -- R's built-in multistratum ANOVA. The condition effect and its error term both live in the `subject:condition` stratum; F, p, df and partial eta-squared are read straight off that stratum's ANOVA table. It is **not** Greenhouse-Geisser-corrected for sphericity: at k=3 conditions sphericity is a single correlation-pair comparison, and normality/sphericity aren't really checkable at n=12 regardless. The QQ-plot uses base R's `qqnorm()`/`qqline()` directly on that stratum's raw residuals (`residuals(fit)`) -- not `plot(fit, which = 2)`, which fails on an `aovlist` stratum: that panel needs studentized residuals, which need `model.matrix()` for leverage, and a per-stratum `Error()` fit doesn't carry a model matrix `model.matrix()` can reconstruct.
+
+```{r 3-1-helpers}
+# ---- Friedman machinery ----
+
+friedman_stat_raw <- function(ranks) {
+  n <- nrow(ranks); k <- ncol(ranks)
+  rank_sums <- colSums(ranks)
+  (12 / (n * k * (k + 1))) * sum(rank_sums ^ 2) - 3 * n * (k + 1)
+}
+
+tie_correction <- function(data) {
+  n <- nrow(data); k <- ncol(data)
+  ties <- 0
+  for (i in seq_len(n)) {
+    counts <- table(data[i, ])
+    ties <- ties + sum(counts * (counts ^ 2 - 1))
+  }
+  1 - ties / (k * (k ^ 2 - 1) * n)
+}
+
+permutation_friedman_p <- function(data, n_perm = 5000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  ranks <- t(apply(data, 1, rank))
+  stat_obs_raw <- friedman_stat_raw(ranks)
+  count <- 0
+  for (b in seq_len(n_perm)) {
+    perm_ranks <- t(apply(ranks, 1, sample))
+    if (friedman_stat_raw(perm_ranks) >= stat_obs_raw - 1e-9) count <- count + 1
+  }
+  list(stat = stat_obs_raw / tie_correction(data), p = (count + 1) / (n_perm + 1))
+}
+
+kendalls_w <- function(data) {
+  n <- nrow(data); k <- ncol(data)
+  ranks <- t(apply(data, 1, rank))
+  rank_sums <- colSums(ranks)
+  s <- sum((rank_sums - n * (k + 1) / 2) ^ 2)
+  12 * s / (n ^ 2 * k * (k ^ 2 - 1))
+}
+
+# ---- McDonald's omega (psych::omega(), single congeneric factor) ----
+
+mcdonalds_omega <- function(item_df) {
+  fit <- suppressWarnings(suppressMessages(
+    psych::omega(item_df, nfactors = 1, fm = "pa", sl = TRUE, plot = FALSE,
+                 n.obs = nrow(item_df))
+  ))
+  list(omega = fit$omega.tot, fit = fit)
+}
+
+# ---- Repeated-measures ANOVA, via stats::aov() ----
+#
+# Error(subject/condition) splits the response into strata; the condition
+# effect and its residual both live in the "subject:condition" stratum. That
+# stratum's element of the aovlist IS an lm fit, so residuals(fit) gives its
+# residuals directly -- no hand-rolled residual matrix needed. NOTE:
+# plot(fit, which = 2) does NOT work here -- plot.lm()'s Q-Q panel needs
+# STUDENTIZED residuals, which requires model.matrix(fit) to get leverage,
+# and the per-stratum fits inside an aovlist (from Error()) don't carry a
+# model matrix that's reconstructible that way (errors inside predict.lm()
+# with "objeto no es una matriz" / "object is not a matrix"). qqnorm()/
+# qqline() on the raw residuals sidesteps that broken path entirely.
+
+rm_anova_via_aov <- function(data, value_col, factor_col = "k_condition", term = NULL) {
+  if (is.null(term)) term <- sprintf("factor(%s)", factor_col)
+  form <- as.formula(sprintf(
+    "%s ~ factor(%s) + Error(factor(participantid) / factor(%s))",
+    value_col, factor_col, factor_col))
+  fit <- aov(form, data = data)
+
+  for (nm in names(fit)) {
+    tbl <- as.data.frame(summary(fit)[[paste0("Error: ", nm)]][[1]])
+    if (term %in% rownames(tbl) && !is.na(tbl[term, "F value"])) {
+      resid_row <- setdiff(rownames(tbl), term)
+      return(list(
+        F = tbl[term, "F value"], p = tbl[term, "Pr(>F)"],
+        df_conditions = tbl[term, "Df"], df_error = tbl[resid_row, "Df"],
+        partial_eta2 = tbl[term, "Sum Sq"] / (tbl[term, "Sum Sq"] + tbl[resid_row, "Sum Sq"]),
+        stratum_fit = fit[[nm]]))
+    }
+  }
+  stop(sprintf("term '%s' not found with an F value", term))
+}
+
+# ---- Bringing it together ----
+
+analyze_scale <- function(col, label, items = NULL) {
+  cat(sprintf("===== %s  (%s) =====\n", label, col))
+  means <- q %>% group_by(k_condition) %>%
+    summarise(mean = round(mean(.data[[col]]), 3), sd = round(sd(.data[[col]]), 3), .groups = "drop") %>%
+    mutate(k_condition = str_replace_all(K_LABEL[as.character(k_condition)], "\n", " "))
+  print(means)
+  cat("\n")
+
+  wide <- q %>% select(participantid, k_condition, all_of(col)) %>%
+    pivot_wider(names_from = k_condition, values_from = all_of(col)) %>%
+    arrange(participantid)
+  wide_mat <- as.matrix(wide[, as.character(K_ORDER)])
+
+  perm <- permutation_friedman_p(wide_mat, n_perm = 5000, seed = 0)
+  w <- kendalls_w(wide_mat)
+  cat(sprintf("Friedman Q=%.3f  permutation p=%.4f (n_perm=5000)  Kendall's W=%.3f\n",
+              perm$stat, perm$p, w))
+
+  omega <- NA_real_
+  if (!is.null(items)) {
+    om <- mcdonalds_omega(q[items])
+    omega <- om$omega
+    cat(sprintf("McDonald's omega (n=%d items, pooled n=%d blocks) = %.3f\n",
+                length(items), nrow(q), omega))
+  }
+
+  anova <- rm_anova_via_aov(q, col)
+  cat(sprintf("RM-ANOVA: F(%d, %d)=%.3f  p=%.4f  partial eta2=%.3f\n",
+              anova$df_conditions, anova$df_error, anova$F, anova$p, anova$partial_eta2))
+  cat("\n")
+
+  qqnorm(residuals(anova$stratum_fit), main = paste0(label, "\nNormal Q-Q (aov residuals)"))
+  qqline(residuals(anova$stratum_fit))
+  anova$omega <- omega
+  anova$w <- w   # Kendall's W, kept for reuse (e.g. the power analysis in 2.4)
+  anova
+}
+```
+
+### 2.1. Van der Laan acceptance scale
+
+An **overall** VDL score (mean of all 9 items) alongside its two dimensions
+
+-   **usefulness** = `vdl_usefulness_mean` (useful, effective, assisting, alertness-raising, good)
+-   **satisfaction** = `vdl_satisfying_mean` (pleasant, nice, likeable, desirable)
+
+```{r 3-vdl-overall}
+VDL_ITEMS <- paste0("vdl", 1:9, "_scored")
+VDL_USEFULNESS_ITEMS <- c("vdl1_scored", "vdl3_scored", "vdl5_scored", "vdl7_scored", "vdl9_scored")
+VDL_SATISFACTION_ITEMS <- c("vdl2_scored", "vdl4_scored", "vdl6_scored", "vdl8_scored")
+INTUI_MAGICAL_ITEMS <- c("intui1_scored", "intui2_scored", "intui3_scored", "intui4_scored")
+
+q <- q %>% mutate(vdl_overall_mean = rowMeans(across(all_of(VDL_ITEMS))))
+
+VDL_MEASURES <- list(
+  list(col = "vdl_overall_mean", range = c(1, 5), label = "VDL overall (all 9 items)", items = VDL_ITEMS),
+  list(col = "vdl_usefulness_mean", range = c(1, 5), label = "VDL usefulness",
+       items = VDL_USEFULNESS_ITEMS),
+  list(col = "vdl_satisfying_mean", range = c(1, 5), label = "VDL satisfying",
+       items = VDL_SATISFACTION_ITEMS)
+)
+
+vdl_summary <- q %>% group_by(k_condition) %>%
+  summarise(across(all_of(purrr::map_chr(VDL_MEASURES, "col")), list(mean = mean, sd = sd),
+                    .names = "{.col}_{.fn}"), .groups = "drop") %>%
+  mutate(k_condition = str_replace_all(K_LABEL[as.character(k_condition)], "\n", " ")) %>%
+  mutate(across(where(is.numeric), ~round(.x, 2)))
+print(vdl_summary)
+
+print(condition_histograms(q, "vdl_overall_mean", value_range = c(1, 5), bin_width = 0.5,
+  title = "VDL overall acceptance by K condition",
+  xlabel = "1 = low acceptance … 5 = high acceptance (mean of all 9 items)"))
+```
+
+```{r 3-2-apply-vdl}
+vdl_anova_results <- list()
+for (m in VDL_MEASURES) {
+  vdl_anova_results[[m$col]] <- analyze_scale(m$col, label = m$label, items = m$items)
+}
+```
+
+### 2.2. INTUI magical experience
+
+```{r 4-magicality}
+magicality_anova <- analyze_scale("intui_magical_mean", label = "INTUI magical experience",
+                                   items = INTUI_MAGICAL_ITEMS)
+```
+
+### 2.3. Proactivity happiness -- Friedman + Kendall's W only
+
+`proactivity_mean` is a single 5-point item, not a multi-item scale, so only Friedman + Kendall's W are run here -- both only need one score per (participant, K condition), which a single-item measure gives just as well as a multi-item mean. RM-ANOVA and McDonald's omega are deliberately skipped: omega is undefined for one item (there's no inter-item structure to estimate reliability from), and a raw 5-level item is a much shakier fit for the F-test's normal-residuals assumption than the averaged VDL/INTUI scores -- Friedman's rank-based, no-normality-assumed test is the honest choice here instead.
+
+```{r 2-3-proactivity-friedman}
+proactivity_wide <- q %>% select(participantid, k_condition, proactivity_mean) %>%
+  pivot_wider(names_from = k_condition, values_from = proactivity_mean) %>%
+  arrange(participantid)
+proactivity_wide_mat <- as.matrix(proactivity_wide[, as.character(K_ORDER)])
+
+proactivity_perm <- permutation_friedman_p(proactivity_wide_mat, n_perm = 5000, seed = 0)
+proactivity_w <- kendalls_w(proactivity_wide_mat)
+
+cat(sprintf("Friedman Q=%.3f  permutation p=%.4f (n_perm=5000)  Kendall's W=%.3f\n",
+            proactivity_perm$stat, proactivity_perm$p, proactivity_w))
+```
+
+### 2.4. Power analysis: how many participants would the observed effect have needed?
+
+Friedman's statistic and Kendall's W are the same quantity up to a constant: `Q_raw = n(k-1)*W`. Asymptotically, under H0, `Q_raw` follows a chi-square distribution with `df = k-1`. Under an alternative with true concordance `W_true`, it's approximately chi-square with the same df and noncentrality `lambda = n(k-1)*W_true`.
+
+Plugging in `proactivity_w` as a stand-in for `W_true` gives, for any candidate n, `power(n) = P(noncentral chi-sq(df, lambda(n)) > qchisq(1-alpha, df))`; searching over n for the smallest one clearing a target power answers "how many participants would this effect have needed."
+
+```{r 2-4-power-analysis}
+friedman_power <- function(n, k, w, alpha = 0.05) {
+  df <- k - 1
+  lambda <- n * df * w
+  crit <- qchisq(1 - alpha, df)
+  pchisq(crit, df, ncp = lambda, lower.tail = FALSE)
+}
+
+friedman_required_n <- function(k, w, alpha = 0.05, power_target = 0.80, n_max = 1000) {
+  n <- k + 1   # smallest n for which df_error-style reasoning still makes sense
+  while (n <= n_max && friedman_power(n, k, w, alpha) < power_target) n <- n + 1
+  if (n > n_max) return(NA_integer_)
+  n
+}
+
+k <- length(K_ORDER)
+alpha <- 0.05
+
+achieved_power <- friedman_power(n = nrow(proactivity_wide_mat), k = k, w = proactivity_w, alpha = alpha)
+n_for_80 <- friedman_required_n(k = k, w = proactivity_w, alpha = alpha, power_target = 0.80)
+n_for_90 <- friedman_required_n(k = k, w = proactivity_w, alpha = alpha, power_target = 0.90)
+
+cat(sprintf("Observed Kendall's W = %.3f (k = %d conditions)\n", proactivity_w, k))
+cat(sprintf("Power actually achieved at n = %d: %.3f\n", nrow(proactivity_wide_mat), achieved_power))
+cat(sprintf("Participants needed for 80%% power at this effect size: %s\n",
+            ifelse(is.na(n_for_80), paste0("> ", 1000), n_for_80)))
+cat(sprintf("Participants needed for 90%% power at this effect size: %s\n",
+            ifelse(is.na(n_for_90), paste0("> ", 1000), n_for_90)))
+
+power_curve <- tibble(n = k:100) %>%
+  mutate(power = purrr::map_dbl(n, friedman_power, k = k, w = proactivity_w, alpha = alpha))
+
+ggplot(power_curve, aes(x = n, y = power)) +
+  geom_line(colour = SERIES_BLUE, linewidth = 0.9) +
+  geom_hline(yintercept = c(0.80, 0.90), colour = INK_MUTED, linetype = "42", linewidth = 0.5) +
+  geom_vline(xintercept = nrow(proactivity_wide_mat), colour = INK, linetype = "solid", linewidth = 0.5) +
+  annotate("text", x = nrow(proactivity_wide_mat), y = 0.05,
+           label = paste0("actual n=", nrow(proactivity_wide_mat)), hjust = -0.1, size = 3, colour = INK_2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Friedman power vs. sample size, at the observed proactivity W",
+       subtitle = sprintf("W = %.3f, alpha = %.2f, k = %d conditions", proactivity_w, alpha, k),
+       x = "n (participants)", y = "power") +
+  theme_live_study()
+```
+
+**The same calculation, applied to the other four questionnaire measures.** `friedman_power()`/`friedman_required_n()` are generic in `w`, and every measure's own Kendall's W is already sitting in `vdl_anova_results[[...]]$w` / `magicality_anova$w` (returned by `analyze_scale()` for exactly this reuse) alongside `proactivity_w` above -- no new statistics, just the same plug-in noncentral-chi-square substitution run once per measure. The same retrospective/plug-in caveat from above applies to every row here.
+
+```{r 2-4b-power-analysis-all}
+power_inputs <- tibble(
+  measure = c("Proactivity happiness", "VDL overall", "VDL usefulness",
+              "VDL satisfying", "INTUI magical experience"),
+  w = c(proactivity_w,
+        vdl_anova_results[["vdl_overall_mean"]]$w,
+        vdl_anova_results[["vdl_usefulness_mean"]]$w,
+        vdl_anova_results[["vdl_satisfying_mean"]]$w,
+        magicality_anova$w))
+
+power_summary <- purrr::pmap_dfr(power_inputs, function(measure, w) {
+  tibble(measure = measure,
+         kendalls_w = round(w, 3),
+         n_actual = length(pids),
+         power_at_n = round(friedman_power(length(pids), k, w, alpha), 3),
+         n_for_80 = friedman_required_n(k, w, alpha, power_target = 0.80),
+         n_for_90 = friedman_required_n(k, w, alpha, power_target = 0.90))
+})
+power_summary
+
+power_curves_all <- purrr::pmap_dfr(power_inputs, function(measure, w) {
+  tibble(measure = measure, n = k:100, power = friedman_power(n = k:100, k = k, w = w, alpha = alpha))
+})
+
+ggplot(power_curves_all, aes(x = n, y = power, colour = measure)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = c(0.80, 0.90), colour = INK_MUTED, linetype = "42", linewidth = 0.5) +
+  geom_vline(xintercept = length(pids), colour = INK, linetype = "solid", linewidth = 0.5) +
+  annotate("text", x = length(pids), y = 0.05, label = paste0("actual n=", length(pids)),
+           hjust = -0.1, size = 3, colour = INK_2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_colour_manual(values = c(SERIES_BLUE, SERIES_ORANGE, SERIES_AQUA, "#eda100", "#e87ba4")) +
+  labs(title = "Friedman power vs. sample size, all five questionnaire measures",
+       subtitle = sprintf("alpha = %.2f, k = %d conditions, at each measure's own observed W", alpha, k),
+       x = "n (participants)", y = "power", colour = NULL) +
+  theme_live_study()
+```
+
+## 3. Questionnaire completion time across blocks
+
+Grouped by **session position** (`block_idx`), not K. `duration_s` is a continuous measurement, so ANOVA is run as the main test. Friedman's test is also used as a non-parametric alternative.
+
+```{r 3-1-duration-descriptives}
+n_items <- length(VDL_ITEMS) + length(INTUI_MAGICAL_ITEMS) + 1  # VDL + INTUI + the single proactivity item
+
+duration_by_block <- q %>% group_by(block_idx) %>%
+  summarise(mean = round(mean(duration_s), 1), median = round(median(duration_s), 1),
+            sd = round(sd(duration_s), 1), min = min(duration_s), max = max(duration_s),
+            .groups = "drop")
+print(duration_by_block)
+
+duration_per_item <- q %>% mutate(seconds_per_item = duration_s / n_items) %>%
+  group_by(block_idx) %>%
+  summarise(median_s_per_item = round(median(seconds_per_item), 2), .groups = "drop")
+cat(sprintf("%d items/block; median seconds/item:\n", n_items))
+print(duration_per_item)
+
+print(trajectory_by_block("duration_s", c(0, 250),
+  "Questionnaire completion time -- trajectory by session position"))
+```
+
+```{r 3-2-duration-tests}
+duration_wide <- q %>% select(participantid, block_idx, duration_s) %>%
+  pivot_wider(names_from = block_idx, values_from = duration_s) %>%
+  arrange(participantid)
+duration_wide_mat <- as.matrix(duration_wide[, as.character(BLOCK_ORDER)])
+
+duration_perm <- permutation_friedman_p(duration_wide_mat, n_perm = 5000, seed = 0)
+duration_w <- kendalls_w(duration_wide_mat)
+cat(sprintf("Friedman Q=%.3f  permutation p=%.4f (n_perm=5000)  Kendall's W=%.3f\n",
+            duration_perm$stat, duration_perm$p, duration_w))
+
+duration_anova <- rm_anova_via_aov(q, "duration_s", factor_col = "block_idx")
+cat(sprintf("RM-ANOVA (uncorrected): F(%d, %d)=%.3f  p=%.5f  partial eta2=%.3f\n",
+            duration_anova$df_conditions, duration_anova$df_error,
+            duration_anova$F, duration_anova$p, duration_anova$partial_eta2))
+
+# Greenhouse-Geisser sphericity correction. Unlike the K-condition scales
+# (section 2, deliberately left uncorrected -- sphericity is barely checkable
+# at n=12 there), sphericity for duration is a visible, substantial
+# violation: per-block SD drops from ~54s to ~30s to ~9s across blocks, so
+# the naive (uncorrected) F-test's reference distribution is a poor fit.
+# epsilon is estimated from the eigenvalues of the covariance matrix
+# restricted to the (k-1)-dim contrast space orthogonal to the constant
+# vector (the classic Greenhouse & Geisser 1959 estimator) -- basis-invariant,
+# any orthonormal contrast set spanning that space gives the same value.
+greenhouse_geisser_epsilon <- function(wide_mat) {
+  k <- ncol(wide_mat)
+  S <- cov(wide_mat)
+  centering <- diag(k) - matrix(1, k, k) / k   # eigenvalues: 1 (x k-1), 0 (x1)
+  contrast_basis <- eigen(centering, symmetric = TRUE)$vectors[, seq_len(k - 1), drop = FALSE]
+  C <- t(contrast_basis) %*% S %*% contrast_basis
+  sum(diag(C))^2 / ((k - 1) * sum(C^2))
+}
+
+duration_eps_gg <- greenhouse_geisser_epsilon(duration_wide_mat)
+df1_gg <- duration_anova$df_conditions * duration_eps_gg
+df2_gg <- duration_anova$df_error * duration_eps_gg
+p_gg <- pf(duration_anova$F, df1_gg, df2_gg, lower.tail = FALSE)
+cat(sprintf("Greenhouse-Geisser epsilon = %.3f\n", duration_eps_gg))
+cat(sprintf("RM-ANOVA (GG-corrected): F(%.2f, %.2f)=%.3f  p=%.5f\n",
+            df1_gg, df2_gg, duration_anova$F, p_gg))
+
+qqnorm(residuals(duration_anova$stratum_fit),
+       main = "Completion time\nNormal Q-Q (aov residuals)")
+qqline(residuals(duration_anova$stratum_fit))
+```
+
+## 4. Stated phone-call LoA preference vs. revealed study-1 selections
+
+### 4.1 Per-driver table
+
+```{r 4-1-pref-vs-behaviour-table}
+DEMOG_PATH  <- file.path(DATA_DIR, "demographics_questionnaire_study2.csv")
+LABELS_PATH <- "../data/study1_data/user_loa_labels.csv"
+PHONE_FN    <- "Respond to a phone call"
+
+# Qualtrics export: row 1 = machine names (kept), row 2 = question text,
+# row 3 = ImportId JSON -- drop rows 2-3, everything as character then coerce.
+demog <- read_csv(DEMOG_PATH, col_types = cols(.default = col_character())) %>%
+  slice(-(1:2)) %>%
+  transmute(
+    participantid = str_pad(str_trim(Q1), 3, pad = "0"),
+    pref_loa      = as.integer(str_extract(Q2, "(?<=Level )\\d")) - 1L,  # UI label -> 0..4 code
+    context_dep   = as.integer(Q5_1))
+
+phone_labels <- read_csv(
+  LABELS_PATH,
+  col_types = cols(participantid = col_character(), .default = col_guess())) %>%
+  filter(functionname == PHONE_FN) %>%
+  mutate(win_loa = map_dbl(str_split(user_selected_loa, ";"),
+                           ~ mean(as.numeric(.x))))   # set rule: mean of the marked set
+
+behaviour <- phone_labels %>%
+  group_by(participantid) %>%
+  summarise(n_calls    = n(),
+            loa_mean   = mean(win_loa),
+            loa_median = median(win_loa),
+            loa_var    = var(win_loa),
+            .groups = "drop")
+
+pref_beh <- demog %>%
+  left_join(behaviour, by = "participantid") %>%
+  arrange(participantid)
+
+pref_beh %>% mutate(across(where(is.double), ~round(.x, 3)))
+```
+
+### 4.2 Association test
+
+**Kendall's tau-b, permutation p.**
+
+```{r 4-2-kendall-permutation}
+kendall_perm <- function(x, y, n_perm = 20000, seed = 0) {
+  ok <- is.finite(x) & is.finite(y); x <- x[ok]; y <- y[ok]
+  obs <- cor(x, y, method = "kendall")   # tau-b (tie-corrected)
+  set.seed(seed)
+  perm <- replicate(n_perm, cor(x, sample(y), method = "kendall"))
+  asymp <- suppressWarnings(cor.test(x, y, method = "kendall"))$p.value
+  tibble(tau_b = obs,
+         p_perm  = (sum(abs(perm) >= abs(obs) - 1e-12) + 1) / (n_perm + 1),
+         p_asymp = asymp,
+         n = length(x))
+}
+
+pref_beh_pairs <- tribble(
+  ~item,         ~behaviour,   ~hypothesis,
+  "pref_loa",    "loa_mean",   "pre-specified",
+  "pref_loa",    "loa_median", "pre-specified",
+  "context_dep", "loa_var",    "pre-specified",
+  "pref_loa",    "loa_var",    "exploratory",
+  "context_dep", "loa_mean",   "exploratory",
+  "context_dep", "loa_median", "exploratory")
+
+pref_beh_kendall <- pmap_dfr(pref_beh_pairs, function(item, behaviour, hypothesis) {
+  kendall_perm(pref_beh[[item]], pref_beh[[behaviour]]) %>%
+    mutate(item = item, behaviour = behaviour, hypothesis = hypothesis, .before = 1)
+})
+pref_beh_kendall %>% mutate(across(where(is.double), ~round(.x, 3)))
+```
+
+```{r 4-3-pref-vs-behaviour-plot, fig.height=3.4}
+pref_beh %>%
+  select(participantid, pref_loa, context_dep, loa_mean, loa_var) %>%
+  pivot_longer(c(pref_loa, context_dep), names_to = "item", values_to = "answer") %>%
+  mutate(behaviour = if_else(item == "pref_loa", loa_mean, loa_var),
+         panel = if_else(item == "pref_loa",
+                         "Q2 preferred LoA  vs  mean selected LoA",
+                         "Q5_1 'depends on context'  vs  variance of selections")) %>%
+  ggplot(aes(answer, behaviour)) +
+  geom_smooth(method = "lm", se = FALSE, colour = INK_MUTED, linewidth = 0.5, linetype = "42") +
+  geom_text(aes(label = str_remove(participantid, "^0+")), size = 3, colour = SERIES_BLUE) +
+  facet_wrap(~panel, scales = "free") +
+  labs(title = "Stated preference (study 2) vs. revealed phone-call behaviour (study 1)",
+       subtitle = "one number per driver; dashed line = OLS fit (visual aid only, test is Kendall's tau-b)",
+       x = "questionnaire answer", y = "study-1 phone-call LoA statistic") +
+  theme_live_study()
+```
+
+**Interpretation.** With n = 12 this is underpowered by construction -- tau-b needs roughly \|tau\| \> 0.45 to clear p \< .05 here , and Q2's near-constant answers restrict its range further.
