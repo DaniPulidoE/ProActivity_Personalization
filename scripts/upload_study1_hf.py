@@ -239,9 +239,7 @@ def load_env_token(env_path: Path) -> Optional[str]:
 def git_commit() -> str:
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
-        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
-                               cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
-        return out.stdout.strip()[:12] + ("-dirty" if dirty else "")
+        return out.stdout.strip()[:12]
     except Exception:
         return "unknown"
 

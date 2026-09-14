@@ -267,3 +267,20 @@ tfm_venv_UE5_P12/
 prueba.*
 data/
 message.md
+results/*.pdf
+results/*.png
+*.7z
+# Run outputs. Nothing under results/ is tracked, and committing it once already
+# cost a pull that deleted two finished tau sweeps on the other machine (85e2494).
+# Only *.pdf/*.png were ignored before, so CSVs and JSONs slipped in.
+# Use `git add -f <path>` if a specific artifact ever needs to be versioned.
+results/
+.RData
+.Rhistory
+docs/READMEImages/*
+docs/local_docs/*
+interviews/*.mp4
+latex/
+src/ProVoice/training_analysis/full_versions/
+
+

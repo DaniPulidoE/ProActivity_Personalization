@@ -57,6 +57,7 @@ dependencies = [
     "dacite",
     "omegaconf",
     "autogluon>=1.6.1",
+    "piper-tts>=1.7.0",
 ]
 
 [tool.uv]
@@ -113,6 +114,12 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[dependency-groups]
+dev = [
+    "nbconvert>=7.17.1",
+    "statsmodels>=0.14.6",
+]
+
 [project.scripts]
-provoice = "ProVoice:main"
+provoice = "ProVoice.main:main"
 drive = "drive:main"
