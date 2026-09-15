@@ -1,0 +1,33 @@
+{
+  "function": "startaphonecall",
+  "tau": 1.0,
+  "val_frac": 0.3,
+  "steps": 6000,
+  "embed_fcd": 1,
+  "n_drivers": 12,
+  "k_common": 13,
+  "k_max_any": 22,
+  "tail_min": 5,
+  "tail_median": 7.5,
+  "tail_max": 10,
+  "floors": {
+    "l2sp": 0.9482142857142858,
+    "anil": 0.8184523809523809
+  },
+  "anil_vs_l2sp": {
+    "mean_mae_delta": 0.0089,
+    "se": 0.046968079102146114,
+    "wilcoxon_p": 0.7333984375,
+    "better_on": 4,
+    "n": 12,
+    "verdict": "indistinguishable (|delta| < 1 SE)"
+  },
+  "lookup_vs_l2sp": {
+    "mean_mae_delta": -0.03869999999999999,
+    "se": 0.0787653986868792,
+    "wilcoxon_p": 1.0,
+    "better_on": 6,
+    "n": 12,
+    "verdict": "indistinguishable (|delta| < 1 SE)"
+  }
+}

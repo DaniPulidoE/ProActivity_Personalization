@@ -1156,13 +1156,15 @@ def main():
     ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=20.0,
                     help="Truncate each segment to its LAST k seconds before encoding "
                          "(by frame timestamps, so it is robust to the actual sampling "
-                         "rate). Default 10 = the second HALF of the 20 s label window; "
-                         "20 would be the whole window. 0 disables. Stored in the "
+                         "rate). Default 20 = the whole 20 s label window, the setting "
+                         "the population sweep selected (results/pop_adapt_full/corn_w20) "
+                         "and the served checkpoints were trained with; 10 would be the "
+                         "second HALF of the window. 0 disables. Stored in the "
                          "checkpoint so fine-tuning and inference inherit it. "
                          "NOTE this is the model's INPUT window, not the label cadence: "
                          "the drive UI still asks once per 20 s, so one segment is still "
                          "one label and scripts/sweep_train_frac.SEGMENT_SECONDS stays 20. "
-                         "At the default resample_hz this makes context_length 100, so a "
+                         "At the default resample_hz this makes context_length 200, so a "
                          "checkpoint trained at 20 s is not interchangeable with one "
                          "trained at 10 s — the stored arch keeps them apart.")
     ap.add_argument("--resample-hz", dest="resample_hz", type=float, default=DEFAULT_RESAMPLE_HZ,

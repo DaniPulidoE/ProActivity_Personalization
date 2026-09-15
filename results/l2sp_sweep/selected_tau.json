@@ -1,0 +1,19 @@
+{
+  "tau": 1.0,
+  "mean_set_mae": 1.0221166214875435,
+  "between_driver_sd": 0.41164121373483203,
+  "se": 0.11883058277967479,
+  "selection_estimator": "driver-blocked",
+  "mean_set_mae_blocked": 1.0221166214875432,
+  "se_blocked": 0.01159256684178878,
+  "n_tau_within_1se": 5,
+  "n_drivers": 12,
+  "k_cap": 60,
+  "unadapted_floor_set_mae": 1.498551309775164,
+  "beats_floor": true,
+  "val_frac": 0.3,
+  "embed_fcd": 1,
+  "adapt_steps": 2000,
+  "adapt_lr": 0.005,
+  "note": "Single prior precision for ALL K, all drivers and BOTH study arms. lambda = tau/(2K) is derived per adaptation by head_adapt. Selected on mean set-MAE over K <= k_cap, averaged within driver then across drivers; ties broken toward the larger tau."
+}

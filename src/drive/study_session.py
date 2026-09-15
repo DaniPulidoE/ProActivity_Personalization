@@ -118,7 +118,7 @@ SHORT_TRIAL = dict(duration_s=120.0, n_calls=5, interval_s=24.0, jitter_s=4.0)
 MAX_DEFER_S = 45.0
 DEFER_RETRY_S = 1.0
 
-# legacy code - no longer used
+# stop run if it lasts for too long (should not fire at any time)
 OVERRUN_FACTOR = 1.5
 
 
@@ -334,7 +334,7 @@ class StudySession(object):
         if self._due_since_ms is None:
             self._due_since_ms = now_ms
 
-        held = self._gate(now_ms, speed_kmh, popup_active, call_active)
+        held = self._gate(popup_active, call_active)
         if held is not None:
             if (now_ms - self._due_since_ms) >= MAX_DEFER_S * 1000.0:
                 self._skip(now_ms, held, speed_kmh)

@@ -267,14 +267,11 @@ tfm_venv_UE5_P12/
 prueba.*
 data/
 message.md
-results/*.pdf
-results/*.png
 *.7z
 # Run outputs. Nothing under results/ is tracked, and committing it once already
 # cost a pull that deleted two finished tau sweeps on the other machine (85e2494).
 # Only *.pdf/*.png were ignored before, so CSVs and JSONs slipped in.
 # Use `git add -f <path>` if a specific artifact ever needs to be versioned.
-results/
 .RData
 .Rhistory
 docs/READMEImages/*
@@ -283,4 +280,27 @@ interviews/*.mp4
 latex/
 src/ProVoice/training_analysis/full_versions/
 
-
+# results/: keep ONLY the summary tables the thesis tables (latex/scripts) and the
+# notebooks read -- each sweep's *_results.csv / selected_*.json, the k-curve and
+# paired CSVs, lodo_population.csv, committed_tau.json, user_study_checkpoints.csv.
+# Everything else is regenerable or bulk: per-run epoch curves (runs/, ~1,400
+# CSVs / 21 MB, only the sweep-analysis notebooks want them -- published as a
+# release asset instead), pipeline smoke tests, plots, checkpoints.
+# Whitelist form: exclude all, re-include directories so git keeps descending,
+# then re-include the two summary types, then re-exclude the bulk subtrees.
+results/**
+!results/**/
+!results/**/*.csv
+!results/**/*.json
+results/**/runs/
+results/**/_smoke/
+results/**/ckpt/
+# superseded / draft runs (v2 and the non-draft sweeps are the cited ones)
+results/anil_sweep/
+results/anil_sweep_draft/
+results/l2sp_sweep_draft/
+results/arm_comparison/
+results/arm_comparison_fullgrad/
+results/pop_pipeline_adapt/
+results/tau_quick/
+results/within_driver/

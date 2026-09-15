@@ -176,9 +176,8 @@ def main() -> None:
                          "--adapt-eval path enforces, so each (driver, K) point rested on "
                          "a query set too small to be stable. At 0.3 it is 28-41 (median "
                          "36) and every driver still reaches K=60, the shortest pool being "
-                         "66. MUST match run_lodo_population, sweep_l2sp_tau and "
-                         "probe_embeddings, or the K=0 floor and these curves are measured "
-                         "on different segments.")
+                         "66. MUST match run_lodo_population and sweep_l2sp_tau, or the "
+                         "K=0 floor and these curves are measured on different segments.")
     ap.add_argument("--steps", type=int, default=6000,
                     help="Full-batch adaptation steps per (driver, K) cell, passed to "
                          "sweep_l2sp_tau for BOTH arms. Default 6000, matching the "

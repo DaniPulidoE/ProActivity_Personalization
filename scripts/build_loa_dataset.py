@@ -28,7 +28,7 @@ It writes two files, matching exactly what the trainers expect:
       (feed to ``python -m ProVoice.models.train_XLSTM --in labeled_data.jsonl``)
 
       All raw frame fields are passed through verbatim, including:
-        - xLSTM model features: perclos, gaze_score, hr_delta, rr_delta,
+        - xLSTM model features: perclos, gaze_score, hr_delta,
           blink_rate, yawn_rate, emotion, lab, eye_ar, mar.
         - STATE_CARLA model features: speed_ratio_max,
           brake, steer, is_junction, throttle, lead_distance_m
@@ -36,7 +36,7 @@ It writes two files, matching exactly what the trainers expect:
           speed_kmh, speed_limit_kmh, gear, hand_brake, reverse,
           acceleration, fog_density, traffic_light_state, headlight,
           fog_light, left_indicator, right_indicator, is_night,, environment, 
-          secondary_task, speed_ratio_limit, precipitation
+          secondary_task, speed_ratio_limit, precipitation, rr_delta
 
   * ``fcd_out.csv``        — per-segment aggregated FCD features + ``Level_1..5``
       (feed to ``ProVoice.train_fcd_loa`` / ``data/processed_data/fcd_out.csv``)

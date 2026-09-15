@@ -29,7 +29,7 @@ webcam ──► DataCollector (~20 Hz collection loop, worker threads for captu
                    ▼
            Decision engine (own thread, --decision-hz 4)
             ├─ fcd:      XGBoost on the task's 12 FCD dimensions
-            ├─ state:    xLSTM over the last 10 s resampled to 10 Hz (33 dims)
+            ├─ state:    xLSTM over the last 20 s resampled to 10 Hz (33 dims)
             └─ combined: w_fcd · P_fcd + (1 − w_fcd) · P_state
                    │
                    ▼
@@ -92,7 +92,7 @@ Decoding of the 5-class distribution to a single LoA is controlled by
 | `study_bridge.py` | Fire-and-forget publisher of each decision to the CARLA machine during a live-study block |
 | `webui/` | FastAPI + Dash + Socket.IO dashboard at `http://127.0.0.1:8001` |
 | `models/xlstm_model.py` | Single source of truth for the xLSTM architecture and the 33-feature encoding (`FEATURE_NAMES`, sentinels, aliases, 10 Hz resampling grid), soft-CORN loss and decoding |
-| `models/train_XLSTM.py` | Population model training (`--loss corn` default, `--window-seconds 10`) |
+| `models/train_XLSTM.py` | Population model training (`--loss corn` default, `--window-seconds 20`) |
 | `models/head_adapt.py` | The ONE per-driver head adaptation optimizer (full-batch, K-independent budget, L2-SP anchor specified as prior precision τ) |
 | `models/fine_tune_XLSTM.py` | Per-driver head fine-tuning on a frozen backbone; produces the head that gets served |
 | `models/laplace_head.py` | Laplace posterior over the adapted CORN head (offline uncertainty analysis) |
@@ -126,8 +126,8 @@ two into `data/labeled_data.jsonl`.
 trained_models/
 ├── fcd_levels.pkl                 XGBoost FCD → LoA
 ├── state_levels.pkl               classic MLP state → LoA
-├── state_xlstm.pt                 population xLSTM (arch dict carries head_type,
-│                                  context_length, window_seconds, resample_hz)
+├── state_xlstm.pt                 default served checkpoint (arch dict carries head_type,
+│                                  context_length, window_seconds, resample_hz) — see note below
 ├── lodo/pop_heldout_<pid>.pt      leave-one-driver-out population models (offline)
 └── user_study/xlstm_p<pid>_k<c>.pt  the live study's served heads, condition c ∈ {0,1,2}
 ```
@@ -145,6 +145,14 @@ soft-CORN; metrics are set-aware (set-MAE, set-accuracy, QWK) and reduce to the
 single-label forms when one level is marked. xLSTM inference runs on CPU (the
 pure-PyTorch `xLSTMBlockStack` path; no triton). If `state_xlstm.pt` is
 missing, the state strategy falls back and the row is marked `fallback=True`.
+
+The committed `state_xlstm.pt` is **not** an all-12-driver population model:
+it is a copy of `user_study/xlstm_p001_k0.pt` — participant 001's unadapted
+LODO checkpoint (trained on the other 11 drivers, FCD-augmented 76-wide head),
+placed there so the default serving path has a file to load. Its
+`arch['study']` names participant `001`, so `StateXLSTMLoAStrategy` refuses it
+for any other `--participantid` and that session runs on the fallback. Retrain
+with the command above for a genuine population model.
 
 The YOLO distraction weights, the EmotiEffLib emotion model and the MMRPhys
 checkpoint are downloaded on first use and cached; the MediaPipe landmarker

@@ -1,0 +1,41 @@
+{
+  "dropout": 0.2,
+  "lr": 0.005,
+  "epochs": 8,
+  "window_seconds": 20.0,
+  "loss": "corn",
+  "embed_fcd": 1,
+  "rank_on": "adapt_set_mae",
+
+  "_what_this_is": "The settled population-model configuration for the thesis pipeline. Hand-written because no single sweep directory contains the winning row: the (dropout, lr) grid was extended in a second run, and sweep_population_hparams --resummarize reads ONE --outdir, so every per-stage selected_population.json still records the pre-extension pick (lr 0.002, epochs 4). Point --selected-population at THIS file, not at those.",
+
+  "_source_runs": [
+    "results/pop_adapt_full/corn_w20      (12 configs: dropout .1/.15/.2 x lr .001/.002 x fcd 0/1)",
+    "results/pop_adapt_full_ext/corn_w20  (8 configs: dropout .2/.25/.3 x lr .002/.003/.005/.01, fcd 1)"
+  ],
+  "_merged_grid": "19 configurations, 6 folds x 2 seeds = 12 blocks each, fully crossed. The 12 cells the two runs share are bit-identical (max |diff| 0.00e+00), so the merge is a concatenation, not a reconciliation.",
+
+  "_selection": {
+    "estimator": "fold-blocked (training_scripts/blocked_stats.blocked_effects), ranked on smoothed_best_adapt_mae",
+    "blocked_mean": 0.8761,
+    "blocked_se": 0.0145,
+    "n_within_1se": "1/19",
+    "grid_edge": "none - interior optimum on both dropout and lr, unlike the pre-extension pick which sat on the boundary of both",
+    "why_not_unadapted": "Ranking on the unadapted validation set-MAE correlates with the post-adaptation ranking at Spearman ~ +0.02, i.e. essentially not at all. The population model is never served unadapted, so adapt_set_mae is the criterion."
+  },
+
+  "_why_these_values": {
+    "window_seconds": "20 s matches the label window - the driver rates a 20 s segment, so the model sees exactly what was rated. Also ~15% less sensitive to hyperparameters (sd across configs 0.036 vs 0.042 at 10 s) and 0.0085 AHEAD of 10 s at the best config (0.8761 vs 0.8846; the same (0.2, 0.005, fcd 1) cell wins at both window lengths), well inside one SE, so the two are empirically indistinguishable and the decision rests on the label-window argument. CORRECTED 2026-09-03: this field previously read 'only 0.0085 behind 10 s', which had the sign backwards - lower set-MAE is better, so 20 s is ahead, not behind. Paired across the 12 configurations of the initial grid, 20 s also beats 10 s in 11 of 12 (range -0.048 to +0.017); results/pop_adapt_full/corn_w10 carries the full 19-config grid at 10 s. Costs double context_length (200 vs 100); accepted.",
+    "lr": "0.005 is an interior optimum. It contributes about two thirds of the total gain over the previous config (-0.093 of -0.147, paired within fold and seed). 0.010 is past the peak and unstable - SE 0.075, the worst cell in either sweep.",
+    "dropout": "0.2. The weakest of the four factors: +0.15 -> +0.2 is worth only -0.012 +/- 0.016 (t = -0.78).",
+    "embed_fcd": "-0.024 paired within (dropout, lr, fold, seed), t = -3.21. NOTE it is read by the ADAPTATION stages, not by training: in train_XLSTM it only touches the adapt-eval path, so the population checkpoint is identical either way. run_lodo_population is therefore called WITHOUT --embed-fcd; sweep_l2sp_tau and the ANIL sweep are called WITH it, and they must agree or the two study arms adapt different objects.",
+    "epochs": "8, chosen mid-plateau rather than at the argmin. The K-averaged curve is flat from 6 to 14 (span 0.008) with the argmin at 14, but 14 is the last point before a collapse: +0.012 by epoch 16, +0.046 by 18, +0.136 by 20, +0.39 by 24 - larger than the entire grid's spread. Stage 3 applies E* to 12 LODO folds with no validation and no early stopping, and those folds train on 11 drivers rather than the sweep's 10, so the knee will move by an unknown amount. Averaged over a symmetric +/-4 epoch error, E*=8 scores 0.9305 and E*=14 scores 0.9364. The sweep's own rule gives E1se=6 and Eargmin=10, both also inside the plateau."
+  },
+
+  "_verified_downstream": {
+    "stage_2": "run_lodo_population built 12 checkpoints with window_seconds=20 confirmed in the arch. Unadapted tail set-MAE 1.4986, consistent with the sweep curve read AT epoch 8 (1.6324 on 10 training drivers) once the extra training driver is accounted for; the sweep's headline 1.3155 is a minimum over ~30 epochs and is optimistically biased by +0.32, so it is not the comparable number.",
+    "stage_3": "sweep_l2sp_tau on these checkpoints reproduces base_set_mae = 1.4986 exactly, and beats the previous checkpoints by -0.2542 +/- 0.0250 set-MAE at matched tau=0.05 (t = -10.16, better on 11/12 drivers) - larger than the -0.147 the sweep predicted."
+  },
+
+  "_caveat": "results/ is gitignored, so this file is not version-controlled. It is the only record of the merged-grid selection; copy it somewhere tracked, or regenerate it from section H of src/ProVoice/training_analysis/pop_model_training_analysis.ipynb, which carries the same numbers and a self-check that fires if the data stops supporting them."
+}

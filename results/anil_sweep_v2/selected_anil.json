@@ -1,0 +1,21 @@
+{
+  "outer_lr": 0.0001,
+  "crop_frac": 0.2,
+  "jitter_std": 0.02,
+  "meta_epochs": 18,
+  "tau": 1.0,
+  "order": "imaml",
+  "meta_epochs_rule": "median over runs of the earliest epoch within 1 SE of the smoothed meta-val minimum",
+  "meta_epochs_argmin_median": 19,
+  "mean_val_set_mae": 0.8253425964492705,
+  "se": 0.00907812961195102,
+  "n_runs": 12,
+  "ranking_estimator": "fold-blocked",
+  "n_blocks": 12,
+  "raw_mean_val_set_mae": 0.8253425964492704,
+  "raw_se": 0.0645761537055627,
+  "mean_query_loss_drop": 0.3724697117499696,
+  "worst_inner_residual": 0.00035213245428167284,
+  "outer_lr_on_grid_edge": true,
+  "note": "tau is FROZEN from the L2-SP sweep \u2014 both arms run the identical adaptation, so only theta_init differs. M* is applied by run_lodo_anil with NO meta-validation, hence the 1-SE rule. Selection is on the prefix-based meta-val MAE; query_loss is reported only to show whether meta-training progressed, and the two are computed on different episode distributions by design."
+}

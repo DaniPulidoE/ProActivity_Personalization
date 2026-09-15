@@ -1,0 +1,12 @@
+{
+  "tau": 1.0,
+  "k_cap": 60,
+  "unadapted_floor_set_mae": 1.498551309775164,
+  "n_drivers": 12,
+  "mean_mae_delta_anil_minus_l2sp": 0.02058333333333333,
+  "se": 0.04782750228422424,
+  "wilcoxon_p": 0.6220703125,
+  "anil_better_on": 6,
+  "verdict": "indistinguishable (|delta| < 1 SE)",
+  "caveats": []
+}

@@ -15,7 +15,7 @@ This repository adds a **personalization layer** on top of the base LoA model
 and evaluates it in two studies:
 
 1. **Population study** — 12 drivers × 2 sessions, ~1,450 labels. Trains the
-   base model (an xLSTM over a 10 s driver-state window with a rank-consistent
+   base model (an xLSTM over a 20 s driver-state window with a rank-consistent
    ordinal head) and compares two ways of adapting it to an individual driver
    from a handful of their labels: **head fine-tuning with an L2-SP anchor** vs.
    **ANIL-style meta-learning (iMAML)**, in leave-one-driver-out cross-validation.
@@ -359,7 +359,7 @@ the actuator. Which inputs it uses is chosen with `--modeltype`:
 | `--modeltype` | Inputs | Model | Notes |
 |---|---|---|---|
 | `fcd` | the 12 **Functional Context Dimensions** of the active task (`src/ProVoice/fcd_config.py`; static per function, 1–5 scale) | XGBoost (`trained_models/fcd_levels.pkl`) | Task context only, independent of the driver |
-| `state` | the driver-state stream | `--state-model xlstm` (default): xLSTM over the last 10 s resampled to 10 Hz, 33 features (`trained_models/state_xlstm.pt`); `--state-model classic`: MLP on per-frame features (`trained_models/state_levels.pkl`) | **What the live study serves** (`--modeltype state --state-model xlstm`), so the personalized head is the only thing that moves the output |
+| `state` | the driver-state stream | `--state-model xlstm` (default): xLSTM over the last 20 s resampled to 10 Hz, 33 features (`trained_models/state_xlstm.pt`); `--state-model classic`: MLP on per-frame features (`trained_models/state_levels.pkl`) | **What the live study serves** (`--modeltype state --state-model xlstm`), so the personalized head is the only thing that moves the output |
 | `combined` (default) | both | `LoA = w_fcd · P_fcd + (1 − w_fcd) · P_state`, `--w-fcd` default 0.7 | Note FCD is static per task, so at 0.7 it dominates: the state model cannot move the served LoA by more than 0.3 |
 | `collection` | — | none | Data collection only: ProVoice records `raw_data.jsonl` and makes no decisions |
 
@@ -402,7 +402,7 @@ Level of Automation over 5 classes (LoA 0–4).
 The `corn` option is soft-CORN, an extension to `corn` allowing for multiple marked labels at the same time.
 
 ```bash
-uv run python -m ProVoice.models/train_XLSTM --in data/labeled_data.jsonl \
+uv run python -m ProVoice.models.train_XLSTM --in data/labeled_data.jsonl \
     --out trained_models/state_xlstm.pt --loss corn
 ```
 
@@ -421,6 +421,15 @@ It uses the CPU-compatible mLSTM `xLSTMBlockStack` path (pure PyTorch); the
 triton-based `xlstm.xlstm_large` / `mlstm_kernels` path is **not** used
 (triton is unavailable on Windows). xLSTM inference therefore runs on CPU.
 If `trained_models/state_xlstm.pt` is absent, the decision engine falls back to FCD / LoA 0.
+
+> **Note on the committed `trained_models/state_xlstm.pt`.** It is not a model
+> trained on all 12 drivers: it is a copy of participant 001's *unadapted*
+> live-study checkpoint (`user_study/xlstm_p001_k0.pt`, i.e. the LODO model
+> trained on the other 11 drivers, with the FCD-augmented 76-wide head), placed
+> there so the default serving path has something to load. Its `arch['study']`
+> names participant `001`, so the decision engine's provenance check refuses to
+> serve it to any other `--participantid` and the session then runs on the
+> fallback. Retrain with the command above to get a genuine population model.
 
 ## Reproducing the offline results
 

@@ -17,13 +17,6 @@ import torch
 
 
 # LoA -> (action, level).
-#
-# There used to be a second, more aggressive mapping selected by a
-# `conservative` parameter that every caller passed as True and no CLI flag
-# ever set — dead configuration that made the policy look variable when it was
-# not. Removed rather than wired up: a study comparing personalization arms
-# needs the LoA->action mapping held FIXED across participants and arms, so a
-# switch here would be a confound, not a feature.
 _LOA_POLICY: Dict[int, Tuple[str, str]] = {
     0: ("none",           "low"),
     1: ("suggest",        "low"),

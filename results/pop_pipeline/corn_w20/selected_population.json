@@ -1,0 +1,23 @@
+{
+  "dropout": 0.2,
+  "lr": 0.001,
+  "window_seconds": 20.0,
+  "loss": "corn",
+  "epochs": 7,
+  "epochs_rule": "median over runs of the earliest epoch within 1 SE of the smoothed minimum",
+  "epochs_argmin_median": 10,
+  "epochs_1se_iqr": [
+    3,
+    12
+  ],
+  "n_train_drivers_at_selection": 10,
+  "selected_on": "mean smoothed validation set-MAE over 6 rotating folds x seeds",
+  "mean_smoothed_val_set_mae": 1.513756453453072,
+  "between_run_sd": 0.19256562988145678,
+  "se": 0.03515751309542158,
+  "n_runs": 30,
+  "note": "E* is the median across runs of the EARLIEST epoch within 1 SE of the smoothed minimum, not of the argmin: run_lodo_population applies it with NO validation set and NO early stopping, so an E* past the overfitting knee would go undetected in all 12 folds. Erring early costs mild under-training; erring late costs overfitting nothing catches. Compare epochs_argmin_median -- a large gap means a flat basin (E* barely matters) and a small one means a sharp optimum (check epochs_1se_iqr for stability). These hyperparameters have seen every driver (rotating folds) -- disclosed trade, identical for both arms.",
+  "constant_floor_set_mae": 1.1609540950323451,
+  "vs_constant_floor": 0.35280235842072694,
+  "beats_constant": false
+}

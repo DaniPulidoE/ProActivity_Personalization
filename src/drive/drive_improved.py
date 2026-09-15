@@ -4141,7 +4141,7 @@ def main():
              'participants so the jitter differs between blocks.')
     argparser.add_argument(
         '--k-condition', dest='k_condition', default='',
-        help='Which K condition this block serves (e.g. k000, k010, k030). '
+        help='Which K condition this block serves (k0, k1, k2, corresponding to 0, 4 and 8 labels, respectively). '
              'Recorded in every call_events.csv row -- it is the independent '
              'variable, and nothing else in the drive process knows it.')
     argparser.add_argument(

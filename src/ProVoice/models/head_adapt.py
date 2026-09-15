@@ -96,7 +96,7 @@ DEFAULT_ADAPT_LR = 5e-3
 # per-driver support set, and now holds that strength constant as K shrinks
 # instead of letting it collapse. Tune it on the development drivers; it is a
 # study-level constant, not a per-run knob.
-DEFAULT_TAU = 2.0
+DEFAULT_TAU = 1.0
 
 # ---------------------------------------------------------------------------
 # FCD-AUGMENTED HEAD INPUT  (--embed-fcd)
