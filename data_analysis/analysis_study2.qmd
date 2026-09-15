@@ -87,9 +87,7 @@ if (!file.exists(QUESTIONNAIRE_PATH)) {
     QUESTIONNAIRE_PATH))
 }
 
-# participantid as character: readr would otherwise infer "001".."012" as a
-# number and silently drop the leading zeros, which would then fail to match
-# call_events.csv's zero-padded ids on any later join.
+# participantid as character
 q <- read_csv(QUESTIONNAIRE_PATH,
               col_types = cols(participantid = col_character(),
                                k_condition = col_integer(),
