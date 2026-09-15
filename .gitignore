@@ -292,6 +292,8 @@ results/**
 !results/**/
 !results/**/*.csv
 !results/**/*.json
+# the per-run epoch curves the two sweep-analysis notebooks read, zipped (see README)
+!results/results_runs.zip
 results/**/runs/
 results/**/_smoke/
 results/**/ckpt/

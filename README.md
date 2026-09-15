@@ -440,6 +440,8 @@ are `uv run python -m …` from the repo root; a CUDA GPU is strongly recommende
 (`scripts/setup_cuda_torch.py` once, then launch with the venv's Python directly
 rather than `uv run` — see the script header).
 
+Download `danipulidoe/proactivity_preference_dataset`  into data/study1_data/.
+
 ```
 data/labeled_data.jsonl
         │
@@ -517,7 +519,36 @@ Single-driver tools behind these stages, usable on their own:
 `ProVoice.models.fine_tune_XLSTM` (adapt one head; `--laplace` adds the
 posterior over it), `scripts/sweep_train_frac.py` (one driver's quality-vs-K
 curve), `ProVoice.models.xlstm_maml` (meta-train one fold).
-`results/` is not tracked; the analysis notebooks in `data_analysis/` read from it.
+
+### What is in `results/`
+
+The **summary tables** every thesis table is built from are tracked: each
+sweep's `*_results.csv` / `l2sp_tau_sweep.csv` and its `selected_*.json`, the
+K-curve and paired-difference CSVs under `arm_comparison_v2/` and
+`phone_call_k_curve*/`, `lodo/lodo_population.csv` (the K=0 floor per driver)
+and `user_study_checkpoints.csv` (provenance of every served head). Per-run
+epoch curves, plots and draft runs are not tracked.
+
+The **per-epoch training curves** that two of the analysis notebooks read are
+shipped as one archive instead, `results/results_runs.zip` (4 MB, 660 CSVs):
+
+| archive path | read by |
+|---|---|
+| `anil_sweep_v2/runs/` | `src/ProVoice/training_analysis/anil_sweep_analysis.ipynb` |
+| `pop_adapt_full/{corn_w10,corn_w20,ce_w20}/runs/`, `pop_adapt_full_ext/corn_w20/runs/` | `src/ProVoice/training_analysis/pop_model_training_analysis.ipynb` |
+
+Unpack it in place before running either notebook — the paths inside the
+archive are relative to `results/`, so this restores exactly the layout the
+sweeps wrote:
+
+```bash
+# from the repo root
+uv run python -c "import zipfile; zipfile.ZipFile('results/results_runs.zip').extractall('results')"
+```
+
+The other notebooks (`l2sp_sweep_analysis`, `arm_comparison_analysis`,
+`phone_call_k_curve_analysis`) need only the tracked CSVs plus the study-1 data
+from Hugging Face.
 
 ## Driver Perception (EAR / MAR / Distraction)
 
