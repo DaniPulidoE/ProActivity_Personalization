@@ -2,8 +2,7 @@
 
 """Simulated incoming phone call, handled according to the predicted LoA.
 
-The interactive event of the live follow-up study. Design record and rationale:
-``docs/live_study_setup.md`` (§5 the ladder, §6 the UI spec). This module is the
+The interactive event of the live follow-up study. This module is the
 implementation of that spec and nothing else -- it owns no study logic, reads no
 files, and knows nothing about K conditions or checkpoints.
 
@@ -13,10 +12,7 @@ The call is a WORLD EVENT, not a system action: the phone rings in every
 condition, identically. What the LoA governs is how involved the assistant gets.
 
 This matters and is not decoration. If LoA 0 produced no on-screen event, the
-driver would perceive nothing and the satisfaction rating for that window would
-have no referent -- and since unpersonalized heads plausibly predict LoA 0 more
-often, the unratable windows would concentrate in one experimental condition.
-That is missing data correlated with the independent variable.
+driver would perceive nothing so they could not evaluate how the assistant handled the call.
 
     LoA  assistant                     affordance        no input ->
     ---  ---------------------------   ---------------   ------------
@@ -68,7 +64,7 @@ from pygame.locals import K_j, K_k
 # --- Geometry ---------------------------------------------------------------
 #
 # The panel sits in the HUD band to the RIGHT of the speed readout, sharing its
-# baseline (docs/live_study_setup.md §6.1). Bottom-aligned and growing UPWARD:
+# baseline. Bottom-aligned and growing UPWARD:
 # the speed is at 0.80 h because that is the base of the windshield, and a panel
 # centred on that line would reach ~0.87 h and overlap the rendered wheel.
 #
@@ -148,16 +144,11 @@ COL_PANEL_BG = (60, 120, 180)
 #     190      5.6 :1       4.50:1       3.8 :1       3.3 :1
 #     235      4.89:1       4.59:1       4.37:1       4.18:1
 #
-# 190 keeps every backdrop above the 3:1 large/bold threshold and mid road at
-# the 4.5:1 body threshold, while still letting a quarter of the scene through.
-# Going much lower puts pale backdrops under 3:1 and the text starts to swim.
 PLATE_ALPHA_BG = 150
 
 COL_WHITE = (255, 255, 255)
 # Borders no longer carry the driver/assistant distinction by HUE -- everything
-# is on one blue panel now, so a blue border would vanish into it. The
-# distinction is single vs DOUBLE border, plus the wording and input modality
-# that docs/live_study_setup.md 5.3 makes load-bearing.
+# is on one blue panel now, so a blue border would vanish into it. 
 COL_PHONE = (232, 240, 250)
 COL_ASSISTANT = (232, 240, 250)
 # Accent for headers and markers -- carries the hierarchy, since the drive UI's
@@ -559,9 +550,7 @@ class CallEvent(object):
         handle_event(pygame_event)       -> while `active`
         render(display)                  -> every frame; no-op when inactive
 
-    Deliberately does NOT freeze the simulation. The label pop-up dims the whole
-    screen and holds the clock; this does neither, because the driver is still
-    driving and the event is meant to be handled in traffic.
+    Deliberately does NOT freeze the simulation.
     """
 
     def __init__(self, dim, assets_dir=None, caller_name='Sam',
@@ -1070,7 +1059,7 @@ class CallEvent(object):
         return out
 
     def outcome(self, now_ms=None):
-        """The row for ``call_events.csv`` (docs/live_study_setup.md §9)."""
+        """The row for ``call_events.csv``."""
         latency = None
         if self._response_ms is not None:
             latency = int(self._response_ms - self._onset_ms)

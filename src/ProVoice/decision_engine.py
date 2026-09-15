@@ -16,8 +16,7 @@ from ProVoice.models.xlstm_model import (
 import torch
 
 
-# LoA -> (action, level). One fixed policy: at every level the system asks
-# before it acts, and only full autonomy at LoA 4.
+# LoA -> (action, level).
 #
 # There used to be a second, more aggressive mapping selected by a
 # `conservative` parameter that every caller passed as True and no CLI flag
@@ -72,7 +71,7 @@ def truncate_frames_by_seconds(seq: List[Dict[str, Any]], window_seconds: float)
     of the newest frame.
 
     The DataCollector's buffer is capped in FRAMES, so its time span depends on
-    the achieved sampling rate (measured ~4 Hz, not the nominal 20 Hz) — a
+    the achieved sampling rate — a
     frame-count cap alone would feed the model ~100 s of history when it was
     trained on 20 s label windows. Truncating by time keeps train and serve
     aligned regardless of the actual rate.
@@ -391,7 +390,7 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             )[-self.context_length:]
             if self._log_fh is not None:
                 # Log only the last frame (most recent driver state) to keep
-                # the file manageable at 20 Hz.
+                # the file manageable at 4 Hz.
                 log_encoded_frames(
                     self._log_fh, "infer",
                     state.get("timestamp", ""),

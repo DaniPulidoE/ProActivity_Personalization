@@ -5,7 +5,6 @@ Run:  uv run python -m scripts.verify_soft_corn
 Check [1] compares against ``coral_pytorch.losses.corn_loss``, which is no longer
 a project dependency; it is skipped automatically if the package is absent.
 Install it ad hoc (``uv pip install coral-pytorch``) to reproduce that check.
-See docs/soft_corn_and_oldl.md §1.4.
 """
 import torch
 import torch.nn.functional as F

@@ -1741,7 +1741,7 @@ def main():
     # vehicle undoes the whole finding.
     #
     # Whichever clock is used for the study, keep these fixed across every
-    # participant and both arms, for the same reason --decision-hz and --delta
+    # participant and all arms, for the same reason --decision-hz and --delta
     # are fixed.
     print("Enabling autopilot...")
 

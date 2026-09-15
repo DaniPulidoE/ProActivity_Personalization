@@ -11,9 +11,7 @@ WHAT THIS IS NOT
 It selects NOTHING. tau, the population configuration, the ANIL configuration
 and the LODO checkpoints are all frozen inputs, read from the artifacts the
 earlier stages already wrote. There is no grid, no ranking and no
-``selected_*.json`` output. Adding one would re-open the selection-validity
-question (``docs/selection_validity.md``) on a query tail far too small to
-support it -- see the warning below.
+``selected_*.json`` output.
 
 WHAT CHANGES RELATIVE TO ``compare_arms_k_curve``
 -------------------------------------------------

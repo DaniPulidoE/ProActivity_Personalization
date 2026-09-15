@@ -40,7 +40,7 @@ class OnlineRPPG(RemoteVitalSigns):
         #     they are optimistic and not comparable. The paper also validates
         #     SCAMPS -> BP4D+ transfer directly (SS6).
         #
-        # Caveat to validate in the pilot: SCAMPS is rendered, and RGB
+        # SCAMPS is rendered, and RGB
         # respiration comes from head motion / pulse-amplitude modulation, which
         # synthetic data models less faithfully than pulse. Trust HR first; check
         # RR against a reference before relying on rr_delta.

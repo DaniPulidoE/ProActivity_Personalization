@@ -57,7 +57,7 @@ adaptation over the true session PREFIX of held-out drivers. Not the
 meta-training query loss: that is computed on ``--episode-start any`` episodes
 and answers a different question. Both are recorded per epoch; only the
 prefix-based one selects. A gap between them is expected and is NOT evidence of
-meta-overfitting (docs/meta_optimization_options.md).
+meta-overfitting.
 
 M* uses the same 1-SE rule as E*, for the same reason: stage B meta-trains with
 no meta-validation, so an M* past the meta-overfitting knee goes undetected in

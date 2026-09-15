@@ -178,7 +178,6 @@ class DataCollector:
         decision_engine: Optional[Any] = None,
         actuator: Optional[Any] = None,
         function_name: str = "fatigue_alert",
-        fer_model_path: str = './src/ProVoice/trained_models/fer2013_mini_XCEPTION.102-0.66.hdf5',
         cam_index: int | str = 0,
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
@@ -217,8 +216,7 @@ class DataCollector:
         # consumer (main loop, YOLO26, face-box worker) reads the frame it
         # publishes here. cv2.VideoCapture cannot be read from two threads, and
         # rPPG needs UNIFORMLY sampled frames at ~30 fps while the main decision
-        # loop runs an order of magnitude slower and with heavy jitter — so the
-        # two cadences have to be decoupled.
+        # loop runs slower and with heavy jitter — so the two cadences have to be decoupled.
         self._cap_lock = threading.Lock()
         self._cap_frame = None            # latest raw BGR frame
         self._cap_frame_id: int = 0       # bumped per frame; consumers skip stale
@@ -435,10 +433,7 @@ class DataCollector:
         self._rppg_staleness_s: float = 15.0
         # rPPG face crop: MMRPhys is trained on a SQUARED face-detector box
         # enlarged by LARGE_BOX_COEF=1.5 (see _rppg_crop_box for the exact
-        # reproduction), then EMA-smoothed here to kill the per-frame crop jitter
-        # that corrupts the pulse signal (rPPG is spectral, jitter-sensitive).
-        # EMA rather than Kalman: the head moves slowly, so a velocity model buys
-        # nothing and EMA mirrors the toolbox's own near-static box. Both tunable.
+        # reproduction).
         self._rppg_box_coef: float = 1.5                        # = LARGE_BOX_COEF
         self._rppg_box_alpha: float = 1.0                       # 1.0 = no smoothing (reference)
         self._rppg_box_ema: Optional[np.ndarray] = None         # smoothed [cx, cy, w, h]
@@ -468,23 +463,13 @@ class DataCollector:
         # discontinuity and post-hoc analysis can filter on it. Set
         # _rppg_gap_suppress = True to refuse contaminated readings outright.
         self._rppg_gap_suppress: bool = False
-        # 30 frames (= 1 s at 30 fps), not 5. At 5 the counter fired on ordinary
-        # scheduler jitter: the main loop never sleeps (its per-tick decision +
-        # logging work exceeds sampling_interval, so `next_t < now` always), so
-        # the capture worker gets descheduled for a few hundred ms at a time and
-        # trips any threshold near one frame interval. Those stalls are real
-        # frame loss, but counting them tells you nothing you can act on --
-        # 1 s isolates actual look-aways, which is what the flag is for.
+        # 30 frames (= 1 s at 30 fps).
         self._rppg_gap_frames: float = 30.0   # gap > this many frame intervals = discontinuity
         self._rppg_last_fed_t: float = 0.0
         self._rppg_contig: int = 0            # gap-free frames fed since the last hole
         self._rppg_gap_count: int = 0         # discontinuities seen this session
         self._rppg_suppressed: int = 0        # readings discarded as contaminated
-        # Face-detector misses. Every failed detection is reported: a miss stops
-        # the crop box being refreshed, and once it goes stale the capture worker
-        # stops feeding rPPG altogether — so this is the upstream cause of most
-        # rPPG dropouts, and the check that tells you whether YOLO5Face actually
-        # works on your camera and lighting.
+        # Face-detector misses. Every failed detection is reported.
         self._face_box_misses: int = 0        # total failed detections
         self._face_box_consec_misses: int = 0 # current unbroken run
         self._face_box_last_ok_t: float = 0.0 # monotonic stamp of last success
@@ -538,12 +523,7 @@ class DataCollector:
         self._calibration_log_writer = None
 
         # Calibration: 180 s time-based, collects gaze/EAR/MAR/HR/RR.
-        # 3 minutes is set by the BLINK-RATE baseline, not by rPPG: a blink count
-        # is Poisson, so 60 s at ~15 blinks/min gives SE = sqrt(15)/15 ≈ 26% on
-        # the baseline rate, versus ~15% at 3 min. (rPPG is no longer the binding
-        # constraint — at 30 fps it emits a reading every ~1.5 s, i.e. ~120 per
-        # 3 min.) 3 min also averages over road/traffic variability, which matters
-        # now that the baseline is collected while driving.
+        # 3 minutes is set by the BLINK-RATE baseline.
         self._calibration_duration_s: float = 180.0
         self._calibration_start_t: float = 0.0
         # Persisted per-driver baselines: the loop tries the stored file ONCE
@@ -771,10 +751,7 @@ class DataCollector:
         ``_rppg_box_alpha`` = 1.0 reproduces the reference exactly: no temporal
         smoothing, so the box is piecewise constant between detections (the
         upstream loader uses the box from detection ``i // detection_freq``
-        verbatim, with USE_MEDIAN_FACE_BOX False). Lower it to re-enable EMA
-        smoothing of centre and size -- worthwhile only if the detection rate is
-        raised well above the reference 1 Hz, since the EMA time constant is
-        ~1/alpha detections.
+        verbatim, with USE_MEDIAN_FACE_BOX False). 
         """
         cx, cy = x + bw / 2.0, y + bh / 2.0
         side = max(bw, bh) * self._rppg_box_coef
@@ -1365,10 +1342,7 @@ class DataCollector:
         if std == 0.0:
             std = 1.0
         z = (value - baseline) / std
-        # Applies to rr_delta as well as hr_delta: both are STATE_NUM inputs, and
-        # every other numeric dim reaches the model inside [0,1] (`_as01` coerces
-        # but does not scale), so an unbounded z-score is the one column that can
-        # dominate in_proj at initialization. Measured on the population data,
+        # Applies to rr_delta as well as hr_delta. Measured on the population data,
         # hr_delta reached ±12 before this bound; ±5 leaves p95 near 3.4 and
         # engages on ~2% of frames.
         return round(max(-_HR_DELTA_CLIP, min(_HR_DELTA_CLIP, z)), 1)
@@ -1394,10 +1368,8 @@ class DataCollector:
             self.latest_frame = None
             return False
 
-        # MediaPipe Tasks FaceLandmarker — the SINGLE face detector for the whole
-        # pipeline: gaze, EAR/MAR, and the rPPG/emotion crop box all key off these
-        # landmarks. Replaces both the legacy solutions FaceMesh and the separate
-        # Haar cascade, so there is no longer a second detector to disagree with.
+        # MediaPipe Tasks FaceLandmarker — the face detector for the whole
+        # pipeline. rPPG uses YOLO5Face to match the pipeline used in the MMRPhys paper. 
         h_img, w_img = frame.shape[:2]
         with self._phase('visual.landmarks'):
             landmarks = self.compute_face_landmarks(frame)

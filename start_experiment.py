@@ -20,7 +20,7 @@ MAIN OPTIONS:
     there by hand, with the command line this launcher prints
 
 LoA POPUP INTERFACE (default = keyboard on every rig, wheel attached or not):
---keyboard-input: the default, stated explicitly -- number keys 0-4 tick a level
+--keyboard-input: the default, stated explicitly -- number keys 1-5 tick a level
     (same key again unticks), N ticks INVALID FRAME instead, ENTER commits
     whatever is ticked (an invalid frame writes no label)
 --wheel-input: override -- paddles move the cursor, front button ticks, CONFIRM
@@ -109,9 +109,29 @@ the line beside it, and any flag they do not mention (--webcam, --environment,
     on. Edit CARLA_MACHINE_IP if the rig is re-addressed; passing either flag
     explicitly still wins for a one-off.
 
-The two ProVoice-machine presets have no equivalent flag spelling, because
-that machine runs neither CARLA nor Drive and this launcher previously had no
-mode for "ProVoice alone". They start ProVoice and nothing else:
+    --study-satisfaction-carla-remote
+        = --study-satisfaction --remote --fixed --fullscreen
+          --functionname "Respond to a phone call"
+          --remote-host <CARLA_MACHINE_IP> --remote-bind <CARLA_MACHINE_IP>
+
+    ONE BLOCK of the satisfaction study (10 min of free driving, 5 incoming
+    calls served by one model), CARLA side. Needs --participantid,
+    --condition {0,1,2} and --block-idx {1,2,3}; the pair is checked against
+    src/drive/study_blocks.py's counterbalancing table and refused on a
+    mismatch. This machine names the served checkpoint
+    (trained_models/user_study/xlstm_p<pid>_k<condition>.pt) and publishes it
+    at /session -- it never loads it. --study-satisfaction itself then forces
+    what the block needs and refuses to vary: --modeltype state
+    --state-model xlstm (never 'combined', which would dilute the head with the
+    FCD XGBoost), --no-popup, no --random-function, --speed on, and the
+    STUDY_TRAFFIC_SEED scenario (--traffic-seed is rejected). --fixed pins the
+    ego spawn point too, so the three blocks start from one place. When Drive
+    reports the block over, the post-block questionnaire opens on this machine
+    with the three ids filled in (--no-questionnaire suppresses it).
+
+The ProVoice-machine presets have no equivalent flag spelling, because that
+machine runs neither CARLA nor Drive and this launcher previously had no mode
+for "ProVoice alone". They start ProVoice and nothing else:
 
     --experiment-calibration-provoice-remote [URL]
         = ProVoice with --calibration-only --webcam, reading vehicle state from
@@ -131,6 +151,18 @@ mode for "ProVoice alone". They start ProVoice and nothing else:
           screen it shows at the end of calibration -- deferred until any LoA
           prompt on screen at that moment has been answered (or skipped), so
           the cutoff never discards a label mid-window.
+    --study-satisfaction-provoice-remote [URL]
+        = ProVoice with --study-bridge --webcam --modeltype state
+          --state-model xlstm --functionname "Respond to a phone call",
+          reading vehicle state from <URL>/ and its participant id, session id,
+          served checkpoint path AND the status-bridge address from
+          <URL>/session. NOT --data-collection: this half must actually run
+          the model, and it publishes every decision back over the link so
+          Drive can read the served LoA the instant a call fires. It takes no
+          --participantid, --condition or model path on purpose -- all three
+          are chosen once on the CARLA machine, which is what stops the two
+          halves running different conditions. Stops itself when Drive reports
+          the block over.
 
     [URL] defaults to PV_BRIDGE_URL and then to CARLA_MACHINE_IP, so on the
     rig neither preset takes an argument at all. Give one to point at a
@@ -232,7 +264,7 @@ STUDY_TRAFFIC_SEED = 42
 #
 # One invocation is ONE BLOCK: 10 minutes of free driving with 5 incoming calls,
 # served by ONE model. Three blocks per participant means three runs, with
-# --condition changed between them. Design record: docs/live_study_setup.md.
+# --condition changed between them.
 #
 # The condition is the study's independent variable and it arrives as a
 # FILENAME -- nothing else about the two processes differs between blocks.
@@ -1139,7 +1171,7 @@ def build_provoice_cmd(session, args, vehicle_id, remote_url=None,
 # every conflict check, every warning -- sees exactly what a hand-typed command
 # line would have produced. Nothing here has behaviour of its own.
 #
-# The two CARLA-machine presets and the two ProVoice-machine ones are different
+# The CARLA-machine presets and the ProVoice-machine ones are different
 # in kind: the first pair configures the normal CARLA+Drive(+bridge) run, the
 # second pair runs ProVoice ALONE against a bridge on the other machine, which
 # is a mode this launcher did not have before.
@@ -1983,7 +2015,7 @@ def main():
                              "A single large readout, not the F1 debug panel, so it "
                              "is safe to have in front of a participant. ON by "
                              "default, and it must be either on or off identically "
-                             "for EVERY participant and BOTH study arms, since a "
+                             "for EVERY participant and all study arms, since a "
                              "precise speed instrument is something the driver can "
                              "regulate against and plausibly shifts how they judge "
                              "the assistant's autonomy. Pass --no-speed to turn it "
@@ -2000,7 +2032,7 @@ def main():
                              "Drive and are unaffected. It is an arousal "
                              "manipulation whether or not it is meant as one, "
                              "and hr_delta / rr_delta are model inputs, so keep "
-                             "it identical for EVERY participant and BOTH arms. "
+                             "it identical for EVERY participant and ALL arms. "
                              "Not a level -- set the amplifier once, measure "
                              "dB(A) at the driver's head, report that. Logged "
                              "per label row as ambient_gain.")
@@ -2067,7 +2099,7 @@ def main():
                              "evidence -- the [SYNC] lines from NPC_TRAFFIC print "
                              "the measured server frame time and the rate it can "
                              "actually sustain. KEEP THIS FIXED ACROSS ALL "
-                             "PARTICIPANTS AND BOTH STUDY ARMS, for the same reason "
+                             "PARTICIPANTS AND ALL STUDY ARMS, for the same reason "
                              "--decision-hz is fixed: it changes the simulation the "
                              "driver responds to. Ignored without --sync.")
     parser.add_argument("--test-popup", dest="test_popup", action="store_true",
@@ -2238,8 +2270,7 @@ def main():
         # every session unbalanced, and nothing downstream would ever notice:
         # each individual block still looks completely valid on its own.
         #
-        # src/drive/study_blocks.py is the ONE table this order is decided in
-        # (docs/live_study_setup.md section 2); this is that table's one
+        # src/drive/study_blocks.py is the ONE table, this is that table's one
         # consumer. A participant absent from it is refused for the same
         # reason an absent TRAFFIC_SEED_PLAN entry already is: silently
         # improvising here would run a real session outside the design the

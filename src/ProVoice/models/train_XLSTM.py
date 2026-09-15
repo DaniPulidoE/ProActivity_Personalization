@@ -1,4 +1,4 @@
-# Usage: python -m ProVoice.train_XLSTM --in data/with_segments.jsonl --label-map data/labels.csv --out trained_models/state_xlstm.pt
+# Usage: python -m ProVoice.models.train_XLSTM --in data/labeled_data.jsonl --out trained_models/state_xlstm.pt
 import argparse, csv, hashlib, json, pathlib, random
 from typing import List, Dict, Any, Optional, Sequence, Tuple
 
@@ -558,9 +558,7 @@ def make_collate(context_length: int):
 # --------------------------------------------------------------------------- #
 # Metrics.
 #
-# A window's label is the SET of LoAs the driver marked acceptable (~a third of
-# real windows mark more than one, and a third of THOSE are non-contiguous, e.g.
-# {L1, L5}). Every metric below therefore takes the multi-hot `levels` vector,
+# A window's label is the SET of LoAs the driver marked acceptable. Every metric below therefore takes the multi-hot `levels` vector,
 # never a collapsed integer.
 #
 # There used to be an `int(np.argmax(level_vec))` pseudo-label threaded through
@@ -938,7 +936,7 @@ def datasets_from_cache(args, resample_hz) -> Tuple[Any, Any]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train official xLSTM (single-label 5-class).")
+    ap = argparse.ArgumentParser(description="Train xLSTM (multi-label 5-class).")
     ap.add_argument("--in",        dest="in_jsonl", required=True)
     ap.add_argument("--out",       dest="out_pt",   default="trained_models/state_xlstm.pt")
     ap.add_argument("--log",       dest="log_path", default="",
@@ -1147,11 +1145,7 @@ def main():
                     help="Linear LR warmup from 0 to --lr over this many epochs, then "
                          "CONSTANT (no decay). 0 disables. lr=2e-3 at batch 16 is high "
                          "for a 2-block recurrent stack, and the warmup is the cheap half "
-                         "of the fix. Cosine decay is deliberately NOT applied: "
-                         "docs/meta_optimization_options.md rejected it for the outer "
-                         "meta-loop on the grounds that best-checkpoint selection plus "
-                         "early stopping already neutralize it, and the same argument "
-                         "holds here.")
+                         "of the fix.")
     ap.add_argument("--context-length", dest="context_length", type=int, default=None,
                     help="Max sequence length. Defaults to window_seconds * resample_hz "
                          "(the exact grid length, so the frame cap never binds), or "
@@ -1159,7 +1153,7 @@ def main():
     ap.add_argument("--embedding-dim", dest="embedding_dim", type=int, default=64)
     ap.add_argument("--num-blocks", dest="num_blocks", type=int, default=2)
     ap.add_argument("--num-heads", dest="num_heads", type=int, default=4)
-    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=10.0,
+    ap.add_argument("--window-seconds", dest="window_seconds", type=float, default=20.0,
                     help="Truncate each segment to its LAST k seconds before encoding "
                          "(by frame timestamps, so it is robust to the actual sampling "
                          "rate). Default 10 = the second HALF of the 20 s label window; "
@@ -1184,8 +1178,7 @@ def main():
                          "inference inherit it.")
     ap.add_argument("--loss", choices=["ce", "corn"], default="corn",
                     help="DEFAULT 'corn': rank-consistent ordinal head (K-1 conditional "
-                         "logits) trained with SOFT-CORN (Shi et al. 2023, generalized to a "
-                         "SET of marked LoAs; see docs/soft_corn_and_oldl.md). This is the "
+                         "logits) trained with SOFT-CORN. This is the "
                          "thesis path — LoA is ordinal, the design selects on set-MAE, and "
                          "the Laplace UQ layer REFUSES a non-CORN head — so it is the "
                          "default rather than something every caller has to remember. "
@@ -1619,15 +1612,7 @@ def main():
         print(f"[init] UNTRAINED model: set-MAE={init['mae']:.3f} set-acc={init['acc']:.3f} "
               f"(vs constant floor {base['const_set_mae']:.3f}) — training must beat THIS "
               f"line to have learned anything")
-        # ADAPTED init. The untrained backbone is a random-feature reservoir, and
-        # a reservoir plus an adapted head is a genuinely strong baseline — so
-        # "does training the backbone help ADAPTATION?" is a different question
-        # from "does training help unadapted accuracy?", and only this line
-        # answers it. If the trained model's adapted score does not beat this,
-        # the backbone contributes nothing that per-driver adaptation can use,
-        # whatever its unadapted curve does. This is the random-backbone control
-        # from docs/embedding_informativeness.md, obtained here for one extra
-        # evaluation instead of a separate experiment.
+        # ADAPTED init.
         if args.adapt_eval:
             init_ad = evaluate_adaptation_val()
             init["adapt_mae"] = init_ad["adapt_set_mae"]

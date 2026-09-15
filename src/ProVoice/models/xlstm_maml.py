@@ -35,7 +35,7 @@
 #     gradient at the ADAPTED head parameters. Cheaper, immune to
 #     inner-Jacobian amplification, but biased toward joint training.
 #   - 'imaml' (DEFAULT — implicit MAML, Rajeswaran et al. 2019): the inner problem is
-#     SOLVED to its argmin (full-batch LBFGS) and the meta-gradient comes from
+#     SOLVED to its argmin (LBFGS/Newton) and the meta-gradient comes from
 #     implicit differentiation of the stationarity condition — i.e.
 #     meta-learning the anchor of the CONVERGED L2-SP adaptation, independent
 #     of inner-lr/steps. Exact at this head size (dense Hessian solve, no
@@ -48,8 +48,7 @@
 # meta-trains the whole backbone for adaptability; that is what distinguishes
 # the result from the joint-trained warm start it begins from.
 #
-# Outer-loop optimization (decision record: docs/meta_optimization_options.md;
-# neither knob touches the deployed adaptation or the two-arm comparison):
+# Outer-loop optimization:
 #   - --outer-opt (default nadam): NAdam's Nesterov look-ahead (Dozat 2016;
 #     LaANIL, Tammisetti et al. 2024) damps oscillation from noisy
 #     meta-gradients — the realistic failure mode at ~15 tasks. Chosen over
@@ -953,8 +952,7 @@ def main():
     #   query_loss  — meta-TRAINING progress, on `--episode-start any` episodes.
     #   val_set_mae — meta-VALIDATION, on the deployed adaptation over the true
     #                 session PREFIX of held-out drivers.
-    # They are computed on DIFFERENT episode distributions by design (see
-    # docs/meta_optimization_options.md), so a gap between them is not evidence
+    # They are computed on DIFFERENT episode distributions by design, so a gap between them is not evidence
     # of meta-overfitting and must not be read as one. Selection and M* key off
     # val_set_mae alone; query_loss is here to show whether meta-training is
     # progressing at all, which val_set_mae cannot distinguish from a bad init.

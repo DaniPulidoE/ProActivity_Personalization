@@ -468,7 +468,7 @@ def summarize(rows: List[dict], adapt_params_list: List[str]) -> None:
         if abs(a - b) < 0.02:
             print("  Bias-only MATCHES the full head: on this representation, adaptation is")
             print("  learning a per-driver LEVEL OFFSET and nothing else. Both study arms")
-            print("  would then be tied by construction - see docs/embedding_informativeness.md")
+            print("  would then be tied by construction")
             print("  section 4. Worth knowing before the LODO runs, not after.")
         else:
             print("  The full head beats bias-only, so adaptation is using the embedding")

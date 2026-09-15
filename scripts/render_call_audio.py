@@ -19,8 +19,7 @@ ENGINES
            ``python -m piper.download_voices NAME --data-dir models/piper``.
 ``sapi``   pyttsx3 / Windows SAPI5. Kept as a fallback, but UNRELIABLE for batch
            work: on this machine it hangs after the second file, with or without
-           a fresh engine per line, exactly as pyttsx3's reputation and the
-           comment in src/drive/simcall_simulation.py suggest. It also has only
+           a fresh engine per line, exactly as pyttsx3's reputation. It also has only
            two voices installed, both female, so the caller ends up sounding
            like the assistant.
 

@@ -122,4 +122,4 @@ dev = [
 
 [project.scripts]
 provoice = "ProVoice.main:main"
-drive = "drive:main"
+drive = "drive.drive_improved:main"

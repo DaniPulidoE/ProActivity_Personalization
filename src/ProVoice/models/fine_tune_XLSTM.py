@@ -57,7 +57,7 @@ def embed_all(model, dl, device, embed_fcd: bool = False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fine-tune official xLSTM (single-label 5-class).")
+    ap = argparse.ArgumentParser(description="Fine-tune xLSTM (multi-label 5-class).")
     ap.add_argument("--in-data",        dest="in_jsonl", required=True)
     ap.add_argument("--in-model",        dest="in_model", required=True)
     ap.add_argument("--out",       dest="out_pt",   default="trained_models/state_xlstm_finetune.pt")

@@ -78,7 +78,7 @@ Columns marked **P** exist only in `frames_preprocessed`.
 | `face_present` | bool | 0 % | landmarker found a face |
 | `eye_ar` | float | 0 % | eye aspect ratio (model feature `ear`) |
 | `mar` | float | 0 % | mouth aspect ratio |
-| `gaze_score` | float | 0 % | z-scored against the 60 s calibration baseline |
+| `gaze_score` | float | 0 % | z-scored against the 180 s calibration baseline |
 | `gaze_score_raw` | float | 0 % | uncalibrated gaze score |
 | `gaze_distracted` | bool | 0 % | `gaze_score` above calibrated threshold (mean + 2.5·std) |
 | `blink_rate` | float | 0 % | normalized (Poisson) against calibration mean |

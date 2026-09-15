@@ -1,5 +1,5 @@
 # Sweep the amount of per-driver training data used to fine-tune the xLSTM head
-# and plot validation accuracy vs. number of training segments.
+# and plot validation set-mae & QWK vs. number of training segments.
 #
 # For every prefix size k (chronologically first k segments outside the held-out
 # validation tail) a fresh copy of the population head is fine-tuned with the
@@ -7,7 +7,7 @@
 # "personalization quality vs. data collection time" learning curve.
 #
 # The frozen backbone runs exactly once: all segments are embedded up front and
-# every sweep point trains a Linear(64->5) on the cached embeddings (full-batch,
+# every sweep point trains the head on the cached embeddings (full-batch,
 # deterministic — no seed variance).
 #
 # The adaptation itself lives in ProVoice.models.head_adapt, which fine_tune_XLSTM

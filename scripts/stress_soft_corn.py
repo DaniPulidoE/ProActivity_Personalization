@@ -1,7 +1,6 @@
 """Numerical-stability stress test for soft_corn_loss.
 
 Run:  uv run python -m scripts.stress_soft_corn
-Results and interpretation: docs/soft_corn_and_oldl.md §1.7.
 """
 import torch
 import torch.nn.functional as F

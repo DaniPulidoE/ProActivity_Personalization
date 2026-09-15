@@ -796,7 +796,7 @@ def main():
     # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
     # window the checkpoint was trained with (falling back to 20 s for legacy
     # checkpoints). Explicit value overrides; 0 disables the time cap, leaving
-    # the rate-dependent frame-count cap only (400 frames ≈ 100 s at ~4 Hz).
+    # the rate-dependent frame-count cap only.
     window_seconds = args.window_seconds
     camera_source = args.camera_source
     camera_url = args.camera_url
@@ -873,7 +873,7 @@ def main():
     # An explicit --study-checkpoint-id still wins outright. That is the escape
     # hatch for a checkpoint whose filename does not carry the information an
     # analyst needs (e.g. running an ad hoc file outside the
-    # trained_models/user_study/xlstm_p<pid>_k<n>.pt convention) --
+    # trained_models/user_study/xlstm_p<pid>_k<k_idx>.pt convention) --
     # participant/condition/K are exactly what that convention's filename
     # already encodes, so the derived form is the right default rather than a
     # placeholder pending something better.

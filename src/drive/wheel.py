@@ -374,8 +374,8 @@ def main():
                 reverse = False
                 
             else:
-                # === Full WASD fallback (consistent with drive.py) ===
-                # Use GetAsyncKeyState instead of pygame.key to keep behavior consistent with drive.py
+                # === Full WASD fallback (consistent with drive_improved.py) ===
+                # Use GetAsyncKeyState instead of pygame.key to keep behavior consistent with drive_improved.py
                 forward = key_down(ord('W'))
                 reverse = key_down(ord('S'))
                 left = key_down(ord('A'))

@@ -22,7 +22,7 @@ it exists to probe. See the SPAM CALL block below.
 THE DRIVE PROCESS DOES NOT LOAD A MODEL
 ---------------------------------------
 It never has and it must not start: the model lives on the ProVoice machine and
-its prediction arrives over the bridge (``docs/live_study_setup.md`` section 7).
+its prediction arrives over the bridge.
 Two sources are supported:
 
 ``bridge``  read ``latest_loa`` from the ProVoice status file, session-scoped.
@@ -118,13 +118,7 @@ SHORT_TRIAL = dict(duration_s=120.0, n_calls=5, interval_s=24.0, jitter_s=4.0)
 MAX_DEFER_S = 45.0
 DEFER_RETRY_S = 1.0
 
-# The block ends when every call is ACCOUNTED FOR, not when the nominal duration
-# elapses. Spacing is relative to the previous call, so any deferral -- a driver
-# stopped at a light, a call held for the rating pop-up -- pushes the rest back,
-# and a hard cut at `duration_s` silently drops the last call. Losing a fifth of
-# a condition's data to a red light is far worse than a block running long.
-# `duration_s` therefore sets the NOMINAL length (and the schedule that fills
-# it); this is the runaway guard on top.
+# legacy code - no longer used
 OVERRUN_FACTOR = 1.5
 
 
@@ -285,21 +279,14 @@ class StudySession(object):
 
     # -- arming --------------------------------------------------------------
 
-    def _gate(self, now_ms, speed_kmh, popup_active, call_active):
+    def _gate(self, popup_active, call_active):
         """None if clear to fire, else the reason it is being held.
 
         NOT a proxy for "is the driver actually driving": a call fires on
         schedule regardless of speed, including a driver stopped at a red
         light or in stop-start traffic -- that is a normal, expected part of
         driving and exactly the kind of moment the study wants a call to be
-        able to land in, not a condition to filter out. An earlier version of
-        this method also refused to fire below 5 km/h (unless sustained for
-        3s), on reasoning nobody asked for and that contradicted the
-        deferral-vs-cut tradeoff argued for two paragraphs up in this file:
-        "a driver stopped at a light" was given THERE as the textbook example
-        of a deferral worth accepting, and refused HERE. It cost three real
-        calls across three participants before being removed -- state that as
-        a limitation, not as the gate correctly excluding invalid trials.
+        able to land in, not a condition to filter out. 
 
         The two conditions still checked are the ones with no such judgement
         call attached: a call cannot fire on top of one still resolving, and
@@ -477,6 +464,5 @@ class StudySession(object):
                      % self.spam_call_idx)
         if self.overran:
             base += (' -- ENDED ON THE OVERRUN GUARD at %.0f x the nominal '
-                     'duration, so calls are MISSING; check how much of the '
-                     'block the driver spent stationary' % OVERRUN_FACTOR)
+                     'duration, so calls are MISSING' % OVERRUN_FACTOR)
         return base

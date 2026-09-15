@@ -1,153 +1,159 @@
-# ProVoice: Driver State–Aware Adaptive Automation Assistant
+# ProVoice — the decision engine of ProActivity Personalization
 
-## 1. Prerequisites
+`src/ProVoice` is the half of the study rig that watches the driver and decides
+how autonomously the in-vehicle assistant should act. It samples the driver's
+face and the CARLA vehicle state, predicts a **Level of Autonomy (LoA, 0–4)**
+for the active in-vehicle task, logs everything, and — in the live follow-up
+study — serves a **per-driver personalized head** to the Drive UI over a bridge.
+The other half (`src/drive/`) owns the simulator, the labelling pop-ups and the
+phone-call event; `start_experiment.py` at the repository root launches both.
 
-### Get the Source Code
-- **Option 1: Download ZIP**
-  - Go to the GitHub project page → Code → Download ZIP → unzip to a folder.
-- **Option 2: Clone with Git**
-  ```
-  git clone <repository-link>
-  ```
+This file is the module-level map. Installation, the session recipes and the
+offline reproduction pipeline are in the repository [README](../../README.md);
+design decisions and data contracts are in [CLAUDE.md](../../CLAUDE.md).
 
-### Install an IDE
-This project is written solely in Python. Recommended IDEs:
-- Visual Studio Code (lightweight)
-- PyCharm (full-featured Python IDE)
+## What it does, end to end
 
-### Setup Environment
-- Install Miniconda (or Miniforge, Anaconda, etc.): [Miniconda Quickstart](https://www.anaconda.com/docs/getting-started/miniconda/install#quickstart-install-instructions)
-- Create and activate the Conda environment:
-  ```
-  cd D:/ProVoice   # replace with your local path
-  conda env create -f environment.yml
-  conda activate ProVoice
-  pip install dash
-  pip install dash-bootstrap-components
-  ```
-
-## 2. Install CARLA Simulator
-- Download CARLA from the official site: [CARLA 0.10.0](https://carla.org/2024/12/19/release-0.10.0/)
-
-## 3. Running the System
-1. **Start Driving Simulation** (Open CARLA.exe first, then in a terminal):
-   ```
-   python drive.py
-   ```
-2. **Launch ProVoice**
-   In a new terminal:
-   ```
-   python main.py participantid=001 environment=city secondary_task=none functionname="Adjust seat positioning" modeltype=combined state_model=xlstm w_fcd=0.7
-   ```
-   **Arguments:**
-   - `participantid` – Participant ID
-   - `environment` – Driving environment (`city` / `highway`)
-   - `secondary_task` – Secondary task (`none` / `phone` / `drinking`)
-   - `functionname` – Experimental function (e.g., "Adjust seat positioning")
-   - `modeltype` – Decision model (`fcd` / `state` / `combined` )
-   - `state_model` – Model used for state→LoA (`xgboost` / `xlstm`)
-   - `w_fcd` – Weight for FCD in fusion (0–1)
-
-## 4. Data Collection
-We conducted a simulation-based user study to collect data for model training and initial evaluation. The experiment uses the CARLA simulator with a monitor, keyboard control, and a webcam to record the driver’s face. Participants (10–30 licensed drivers, balanced in age/gender) drive in various scenarios, with all monitoring systems running in real time. The refresh rate is ~20Hz for generated data (FCD, state features).
-
-**Experimental Design:**
-- Each scenario focuses on one driving function (14 total), with two factors varied: environment (`city`/`highway`) and secondary task (`none`/`phone`/`drinking`).
-- Scenarios are distributed using a Latin square so each participant experiences a balanced subset.
-- Each drive lasts ~50s: 10s Baseline (normal driving), 30s Task (main function + possible distraction), 10s Recovery (rest).
-- After each scenario, participants report their preferred LoA (0–4). These subjective ratings help build the datasets.
-
-**Data Annotation & Training:**
-- Each 30s task segment is labeled with the participant’s LoA preference.
-- Labels are assigned manually based on participant reports.
-- Data is split into training/test sets for model development and evaluation.
-
-**How to Run:**
-Start a scenario with:
+```text
+webcam ──► DataCollector (~20 Hz collection loop, worker threads for capture,
+           face box, YOLO, vehicle state and the decision engine)
+            ├─ MediaPipe Tasks FaceLandmarker → EAR, MAR, gaze_score,
+            │    blink_rate, yawn_rate, perclos, drowsiness_alert
+            ├─ EmotiEffLib (AffectNet) → emotion, emotion_prob
+            ├─ MMRPhys rPPG (SCAMPS LEF 72×72) → heart_rate, hr_delta
+            │    (respiratory_rate is still logged but no longer a model input)
+            ├─ YOLO distraction → lab (phone / drink / face)
+            └─ vehicle-state bridge → speed, brake, steer, throttle,
+                 is_junction, lead_distance_m, …   (raw CARLA units)
+                   │
+                   ▼
+           Decision engine (own thread, --decision-hz 4)
+            ├─ fcd:      XGBoost on the task's 12 FCD dimensions
+            ├─ state:    xLSTM over the last 10 s resampled to 10 Hz (33 dims)
+            └─ combined: w_fcd · P_fcd + (1 − w_fcd) · P_state
+                   │
+                   ▼
+           LoA → ProVoiceActuator → data/decisions.csv, data/raw_data.jsonl,
+                 dashboard (port 8001), optional study bridge to the CARLA machine
 ```
-python main.py participantid=001 environment=city secondary_task=none functionname="Adjust seat positioning" modeltype=collection
+
+A **180 s calibration** at session start establishes the per-driver baselines
+(gaze, EAR, MAR, heart rate, blink rate, PERCLOS) that every physiological
+feature is normalised against. The baseline is persisted per participant and
+reused by later sessions.
+
+## Running it
+
+ProVoice never holds a CARLA client of its own; vehicle state arrives through a bridge
+process. The launcher wires all of that up, so this is the normal entry point:
+
+```bash
+uv run python start_experiment.py --participantid 001 --environment city \
+    --secondary-task none --functionname "Adjust seat positioning" \
+    --modeltype combined --state-model xlstm --w-fcd 0.7
 ```
-Adjust arguments as needed for each participant and scenario.
 
-## 5. Data Preprocessing
-Data collected from the driving experiments is stored as raw JSONL logs. To prepare this data for model training and analysis, follow these four steps:
+ProVoice on its own (`python -m ProVoice.main`, or the `provoice` script) takes
+the same flags; `key=value` spellings are rewritten to `--key value`:
 
-1. **Split into Segments**
-   - The raw log contains continuous data from all sessions. Use the script below to split it into fixed-length segments (e.g., 600 samples per chunk (30 experiment seconds * 20 FPS)), each corresponding to a scenario or trial.
-   ```
-   python data/generate_id.py --in data/raw_data.jsonl --out data/with_segments.jsonl --chunk 600
-   ```
-   This creates `with_segments.jsonl`, where each entry is a segment with a unique ID.
+| Flag | Meaning |
+| --- | --- |
+| `--participantid` | Files the calibration baseline and tags every row |
+| `--functionname` | The active in-vehicle task; must match a name in `fcd_config.py` exactly (a paraphrase resolves to the neutral all-3s FCD vector and warns `[fcd][warn]`) |
+| `--modeltype` | `fcd` / `state` / `combined` (default) / `collection`. **There is no `xlstm` modeltype**: the xLSTM is a state model, so serving it alone is `--modeltype state --state-model xlstm` |
+| `--state-model` | `xlstm` (default) or `classic` (the MLP in `trained_models/state_levels.pkl`) |
+| `--w-fcd` | Fusion weight under `combined` (default 0.7) |
+| `--decision-hz` | Decision-thread rate (default 4). Keep it fixed across participants |
+| `--xlstm-model` | Checkpoint to serve (default `trained_models/state_xlstm.pt`) |
+| `--window-seconds` | Time span of the xLSTM input; unset inherits the checkpoint's contract |
+| `--calibration-only` | Run the 180 s calibration, store the baseline, exit |
+| `--data-collection` | Record `raw_data.jsonl` only: no calibration, no model, no decisions (`--data-collection-timeout` caps it) |
+| `--vehicle-state-file` / `--vehicle-state-url` | Local file bridge (default on one machine) or the HTTP bridge on a remote CARLA machine |
+| `--webcam` | Use camera index 1 (the external driver-facing camera) |
+| `--study-bridge`, `--status-url`, `--study-checkpoint-id` | Live study only: publish every decision to the CARLA machine and record which head served it |
 
-2. **Generate Label File**
-   - For each segment, generate a CSV file to annotate ground truth labels (LoA).
-   ```
-   python data/label_data.py --in data/with_segments.jsonl --out data/labels.csv
-   ```
-   The resulting `labels.csv` lists all Loa labels to be filled in.
+Decoding of the 5-class distribution to a single LoA is controlled by
+`PV_DECISION_METHOD` (`argmax` default, `expected`, `quantile`),
+`PV_QUANTILE_TAU` and `PV_TEMP`. A CORN head is decoded with its rank rule
+(the PMF's median), the same function the trainers and sweeps use.
 
-3. **Manually Label**
-   - Open `labels.csv` in Excel or another editor. For each segment, fill in the correct LoA label as reported by the participant after the scenario. This step ensures the model is trained on accurate, human-verified ground truth.
+## Module layout
 
-4. **Merge Labels into Dataset**
-   - Combine the segment data and the annotated labels into a single JSONL file for model training and evaluation.
-   ```
-   python data/merge_label.py --in data/with_segments.jsonl --labels data/labels.csv --out data/labeled_data.jsonl
-   ```
-   The output `labeled_data.jsonl` contains all sensor data, conditions, and ground truth labels for each segment.
+| Path | Role |
+| --- | --- |
+| `main.py` | Entry point: argument parsing, session/participant identity (adopted from the bridge under `--remote`), model loading, dashboard server |
+| `data_collector.py` | Multimodal sampling loop, calibration, and the capture / face-box / YOLO / vehicle-state / decision worker threads |
+| `decision_engine.py` | `XGBoostLoAStrategy`, `StateLevelsLoAStrategy`, `StateXLSTMLoAStrategy`, `CombinedFusionStrategy`; the fixed LoA→action policy; the loader that refuses a study checkpoint held out for a different participant |
+| `provoice_actuator.py` | LoA → action and the console/log trace of decisions |
+| `logger.py` | Dual-stream logging: `raw_data.jsonl` (every frame) + `decisions.csv` (fixed schema, one row per decision) |
+| `fcd_config.py` | The 12-dimensional FCD vector for each of the 14 known functions |
+| `perception.py` | EAR/MAR geometry from face landmarks, the YOLO `DistractionDetector`, dashboard overlays |
+| `hr_filter.py` | The ONE definition of the rPPG cleaning algorithm (octave/harmonic handling, baseline statistic), shared with `data_preprocessing/heart_rate_preprocessing.py` |
+| `study_bridge.py` | Fire-and-forget publisher of each decision to the CARLA machine during a live-study block |
+| `webui/` | FastAPI + Dash + Socket.IO dashboard at `http://127.0.0.1:8001` |
+| `models/xlstm_model.py` | Single source of truth for the xLSTM architecture and the 33-feature encoding (`FEATURE_NAMES`, sentinels, aliases, 10 Hz resampling grid), soft-CORN loss and decoding |
+| `models/train_XLSTM.py` | Population model training (`--loss corn` default, `--window-seconds 10`) |
+| `models/head_adapt.py` | The ONE per-driver head adaptation optimizer (full-batch, K-independent budget, L2-SP anchor specified as prior precision τ) |
+| `models/fine_tune_XLSTM.py` | Per-driver head fine-tuning on a frozen backbone; produces the head that gets served |
+| `models/laplace_head.py` | Laplace posterior over the adapted CORN head (offline uncertainty analysis) |
+| `models/xlstm_maml.py` | ANIL / iMAML meta-training — the comparison arm of the offline study |
+| `training_scripts/` | The offline pipeline: population hyperparameter sweeps, leave-one-driver-out models, τ selection, the L2-SP vs. ANIL comparison, and `build_study_checkpoints.py`, which mints the checkpoints the live study serves |
+| `training_analysis/` | Notebooks reading the sweep and comparison results |
+| `train_fcd_loa.py` | XGBoost FCD → LoA (`trained_models/fcd_levels.pkl`) |
+| `train_distraction.py` | Fine-tune YOLO26 on the in-cabin distraction dataset |
+| `eval.py` | Offline evaluation report for a labelled dataset |
+| `agents/`, `data/`, `demo.py`, `read.py`, `test.py` | Inherited from the original ProVoice codebase; not used by the current pipeline |
 
-**Resulting files:**
-- `with_segments.jsonl`: Segmented data with unique IDs
-- `labels.csv`: Annotation file for experimental conditions and LoA labels
-- `labeled_data.jsonl`: Final dataset for model training and evaluation
+`src/rPPG/rppg_infer_simple.py` (outside this package) wraps the MMRPhys
+estimator the collector feeds.
 
-This process ensures that each data segment is accurately labeled and ready for downstream machine learning tasks.
+## Data it writes
 
-## 6. Model Training
-- Train State→LoA (xLSTM)
-  - This uses the official [`nx-ai/xlstm`](https://github.com/NX-AI/xlstm)
-    package (`xlstm==2.0.5`), which is now a normal `uv` dependency — **no
-    manual repo checkout or separate conda env is needed**. It runs on the
-    CPU-compatible mLSTM `xLSTMBlockStack` path.
-  - The classifier is **single-label, 5-class** (LoA 0–4).
-  - **A real labeled dataset is required to retrain.** No trained checkpoint
-    is committed to this repo. Run the data pipeline first
-    (`data/generate_id.py` → `data/label_data.py` → `data/merge_label.py`,
-    see section 5); `label_data.py` produces a **blank label template** that
-    the researcher must fill in by hand before merging.
-  ```
-  python -m ProVoice.train_XLSTM --in data/labeled_data.jsonl --out trained_models/state_xlstm.pt --epochs 30 # hyperparameter tuning is needed based on your dataset
-  ```
+| File | Content |
+| --- | --- |
+| `data/raw_data.jsonl` | One dict per collection tick: every perception and vehicle field, plus the LoA/FCD *in force* at that frame |
+| `data/decisions.csv` | One row per decision, fixed schema, `timestamp` = the frame the decision was computed from (so it joins onto `raw_data.jsonl`) |
+| `data/calibration_data/calibration_<pid>.json` | The stored per-driver baseline (+ a per-tick log under `calibration_logs/`) |
 
-## 7. Run Decision Engines
-> **Note:** xLSTM inference runs on CPU. If `trained_models/state_xlstm.pt`
-> is absent, the engine falls back to FCD / LoA 0.
+Ground-truth LoA labels are written by the Drive UI (`data/user_loa_labels.csv`,
+one prompt per 20 s window, two under `--random-function`); the system's own
+prediction is never a training label. `scripts/build_loa_dataset.py` aligns the
+two into `data/labeled_data.jsonl`.
 
-- **FCD→LoA (XGBoost):**
-  ```
-  python main.py ... modeltype=fcd
-  ```
-- **State→LoA (xLSTM):**
-  ```
-  python main.py ... modeltype=state state_model=xlstm
-  ```
-- **Combined Fusion (FCD + xLSTM):**
-  ```
-  python main.py ... modeltype=combined state_model=xlstm w_fcd=0.7
-  ```
-- **Evaluation:**
-  ```
-  python eval.py --in data/labeled_data.jsonl --outdir reports/eval --title "ProVoice LoA Evaluation"
-  ```
+## Models
 
-## 8. Dashboard
-When running `main.py`, a browser window will open automatically. The dashboard displays:
-- Driver video (mocked/simulated)
-- Secondary task detection (phone, drinking, smoking)
-- Physiological signals (mocked HR, HRV)
-- LoA predictions in real time
-- Decision engine logs
+```text
+trained_models/
+├── fcd_levels.pkl                 XGBoost FCD → LoA
+├── state_levels.pkl               classic MLP state → LoA
+├── state_xlstm.pt                 population xLSTM (arch dict carries head_type,
+│                                  context_length, window_seconds, resample_hz)
+├── lodo/pop_heldout_<pid>.pt      leave-one-driver-out population models (offline)
+└── user_study/xlstm_p<pid>_k<c>.pt  the live study's served heads, condition c ∈ {0,1,2}
+```
 
-![ProVoice Driver State Dashboard](image/dashboard.png)
+Retrain the population model with
 
----
+```bash
+uv run python -m ProVoice.models.train_XLSTM --in data/labeled_data.jsonl \
+    --out trained_models/state_xlstm.pt --loss corn
+```
+
+and adapt a head to one driver with `python -m ProVoice.models.fine_tune_XLSTM`.
+The label is a **set** of acceptable LoAs per window (multi-hot), trained with
+soft-CORN; metrics are set-aware (set-MAE, set-accuracy, QWK) and reduce to the
+single-label forms when one level is marked. xLSTM inference runs on CPU (the
+pure-PyTorch `xLSTMBlockStack` path; no triton). If `state_xlstm.pt` is
+missing, the state strategy falls back and the row is marked `fallback=True`.
+
+The YOLO distraction weights, the EmotiEffLib emotion model and the MMRPhys
+checkpoint are downloaded on first use and cached; the MediaPipe landmarker
+task file lands in `src/ProVoice/trained_models/`.
+
+## Dashboard
+
+`main.py` serves the dashboard at `http://127.0.0.1:8001` while it runs. It
+shows the annotated camera frame, the current action, fatigue (blink rate, yawn
+rate, PERCLOS, drowsiness), gaze, emotion, distraction labels, EAR/MAR and the
+heart-rate / respiration trends, refreshed over a WebSocket from the collector's
+latest frame.

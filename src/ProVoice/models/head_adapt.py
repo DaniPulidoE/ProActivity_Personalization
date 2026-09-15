@@ -56,12 +56,7 @@ not depend on how much data is about to arrive. This module therefore takes
 forget to. Fix tau once on the development drivers and it is comparable across
 every K, every driver and both study arms.
 
-NOT COVERED HERE: ``xlstm_maml``'s inner loop. It runs a few DIFFERENTIABLE SGD
-steps (second derivatives flow through them), so it cannot call this function,
-and it uses the batch-mean convention with prior ``2*lam`` — see the note in
-``laplace_head``. Keeping the deployed adaptation identical across arms means
-the ANIL arm must adapt through THIS function at evaluation time even though it
-meta-trains through its own; only the initialization is allowed to differ.
+NOT COVERED HERE: ``xlstm_maml``'s inner loop.
 """
 from __future__ import annotations
 
@@ -289,8 +284,7 @@ def adapt_head_tensors(
     ``adapt_params`` restricts WHICH head parameters move. ``'all'`` (the
     default, and the only value any serving path uses) adapts the 256 weights
     and 4 biases. ``'bias'`` freezes the weight at the anchor and adapts the 4
-    biases alone -- the diagnostic of ``docs/embedding_informativeness.md`` §4:
-    a bias-only head can slide the CORN thresholds along the ordinal scale
+    biases alone: a bias-only head can slide the CORN thresholds along the ordinal scale
     ("this driver prefers more/less autonomy") but cannot reorder segments, so
     it is the per-driver constant expressed in the head. If it matches the full
     head, personalization on this representation reduces to learning a level
@@ -396,9 +390,7 @@ def adapt_head(
         steps:     full-batch gradient steps. Fixed, K-independent, no selection.
         lr:        AdamW learning rate; weight_decay is 0 because L2-SP IS the
                    decay, anchored at theta_pop rather than at the origin.
-        adapt_params: 'all' (every serving path) or 'bias' (the 4 biases only,
-                   for the expressiveness diagnostic of
-                   docs/embedding_informativeness.md §4).
+        adapt_params: 'all' (every serving path) or 'bias'
 
     Returns ``(head, info)``. ``info`` carries the realised ``l2sp`` (needed by
     the Laplace fit), the final objective value, and ``grad_norm`` — the norm of

@@ -671,7 +671,7 @@ class Ambience(object):
                 self.update(0.0)
                 print('[INFO] Ambience on (recorded): gain=%.2f %s, %d Hz, '
                       '%d ch, loaded in %d ms. Fix the gain AND the physical '
-                      'volume across all participants and both study arms, and '
+                      'volume across all participants and all study arms, and '
                       'report the measured dB(A), not this number.'
                       % (self.effective_gain, self.assets.describe(), rate,
                          channels, build_ms))

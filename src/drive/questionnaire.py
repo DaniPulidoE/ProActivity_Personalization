@@ -177,12 +177,6 @@ VDL_SCALE_POINTS = 5
 # not-happy/happy poles for agree/disagree, the more standard Likert
 # convention, keeping "happy" and "proactive" in the statement itself.
 #
-# Implements HALF of docs/live_study_setup.md section 4A.2's per-block pair --
-# item 1, "overall satisfaction", reworded to name the construct (proactivity)
-# rather than ask generically "how the calls were handled", which is what that
-# section itself warns a bare satisfaction question invites. Item 2, the
-# just-about-right "far too little...far too much" item, is NOT implemented
-# here -- do not read this as that section being complete.
 PROACTIVITY_STEM = ("I was happy with how proactive the assistant was during "
                     "this block.")
 PROACTIVITY_ITEM = (

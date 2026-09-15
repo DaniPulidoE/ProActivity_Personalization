@@ -1,6 +1,5 @@
 """Counterbalancing for the live follow-up study — the ONE place block order is
-decided. ``docs/live_study_setup.md`` section 2; CLAUDE.md's "Counterbalancing"
-paragraph is the corrected record this file implements.
+decided.
 
 THE DESIGN
 ==========
@@ -116,8 +115,7 @@ BLOCK_ORDER: Dict[str, Tuple[int, int, int]] = {
 # A participant who drops out mid-sequence and is re-consented under a NEW id
 # can be pinned to their predecessor's remaining order here, rather than
 # forcing a full regeneration (which would reshuffle everyone). Empty by
-# design -- see docs/live_study_setup.md section 2 before adding an entry: an
-# override changes the replicate count for whichever order it duplicates.
+# design.
 PINNED_OVERRIDES: Dict[str, Tuple[int, int, int]] = {}
 
 

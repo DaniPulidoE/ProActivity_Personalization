@@ -3,8 +3,7 @@
 """Publish each LoA decision to the CARLA machine, for the live study.
 
 Enabled by ``--study-bridge``. The drive process owns the call schedule and
-reads the latest published decision at the instant a call fires; see
-``docs/live_study_setup.md`` section 7 and ``src/drive/study_session.py``.
+reads the latest published decision at the instant a call fires.
 
 WHY A SLOT AND A THREAD, NOT A DIRECT POST
 ------------------------------------------

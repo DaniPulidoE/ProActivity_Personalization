@@ -1,40 +1,51 @@
-"""In-tree replacement for ``yolov5_deepsort_driverdistracted_driving_behavior_detection.myframe``.
+"""Visual driver-state perception: EAR/MAR from face landmarks, YOLO distraction, overlays.
 
-The upstream package pinned us to Python 3.10 and bundled dlib + an old
-YOLOv5 codebase. This module reimplements the only function the project
-actually used (``frametest(frame)``) on top of two modern,
-Python-version-agnostic dependencies:
+What ``DataCollector`` actually calls (the live API):
 
-* **MediaPipe FaceMesh** -- eye aspect ratio (EAR) and mouth aspect ratio
-  (MAR), replacing dlib's 68-point landmark predictor.
+* :func:`eye_mouth_aspect_ratios` -- eye aspect ratio (EAR) and mouth aspect
+  ratio (MAR) from a list of normalised face landmarks. The landmarks come from
+  the caller: ``DataCollector`` runs the maintained MediaPipe Tasks
+  ``FaceLandmarker`` (478 points) and hands the result in, so this module owns
+  the EAR/MAR geometry and NOT the detector. It also accepts the legacy
+  ``mediapipe.solutions`` landmark list, which shares the point indexing.
+* :class:`DistractionDetector` -- Ultralytics YOLO for in-cabin distraction,
+  run on the DataCollector's own YOLO worker thread. Two modes, chosen with
+  ``PROVOICE_DISTRACTION_MODE``:
 
-* **Ultralytics YOLO26** -- in-cabin driver-distraction classification.
+  - ``detect`` (default): a COCO object detector (``PROVOICE_DETECT_WEIGHTS``,
+    default ``yolo26n.pt``, auto-downloaded by ultralytics; falls back to
+    ``yolo11n.pt``) whose ``cell phone`` / ``cup`` / ``bottle`` classes are
+    mapped to ``phone`` / ``drink`` (``DEFAULT_COCO_CLASS_MAP``). Localises
+    objects, so it works at any distance and can report several at once.
+  - ``classify``: the fine-tuned single-label classifier from the Hugging Face
+    Hub (`maco018/in-car-distraction-yolo26
+    <https://huggingface.co/maco018/in-car-distraction-yolo26>`_), five size
+    variants ``n``/``s``/``m``/``l``/``x`` producing ``safe`` / ``phone`` /
+    ``drink`` / ``distracted``. Downloaded on first use and cached by
+    ``huggingface_hub``. Legacy: biased toward ``distracted``.
 
-Public API (drop-in replacement for ``myframe.frametest``)::
+  Weight resolution order for either mode: ``weights=`` argument >
+  ``PROVOICE_YOLO_WEIGHTS`` (local ``.pt``, skips any download) > the mode's
+  default. In ``classify`` mode ``PROVOICE_YOLO_REPO`` and
+  ``PROVOICE_YOLO_VARIANT`` (default ``l``) pick the Hub file. The mode is
+  auto-detected from the loaded weights, so a detection checkpoint passed to a
+  ``classify`` run still works.
 
-    ret, annotated = frametest(frame_bgr)
-    labels, eye_ar, mouth_ar = ret
+  Note that only ``face`` survives into the model input (``xlstm_model.LAB_VOCAB``);
+  ``phone`` / ``drink`` are still detected and logged for post-hoc analysis.
+* :func:`draw_overlays` -- dashboard-only annotated COPY of a frame: eye/mouth
+  boxes from the landmarks plus the YOLO detections.
 
-The distraction model is **not bundled in this repo**. It is downloaded
-on first use from the Hugging Face Hub
-(`maco018/in-car-distraction-yolo26 <https://huggingface.co/maco018/in-car-distraction-yolo26>`_)
-and cached locally by ``huggingface_hub`` (so it only downloads once).
-The five YOLO26 size variants (``n``/``s``/``m``/``l``/``x``) are
-classification models producing the labels ``safe``, ``phone``,
-``drink`` and ``distracted``.
+Legacy, kept for scripts but not on the live path: :class:`EARMARDetector`
+(owns its own deprecated ``mediapipe.solutions.face_mesh`` instance) and
+:func:`frametest`, the original drop-in for
+``yolov5_deepsort_driverdistracted_driving_behavior_detection.myframe.frametest``
+that this module started life as. ``DataCollector`` no longer calls either --
+its landmarker is shared with gaze estimation and the emotion crop, and a
+second per-frame detector here would only disagree with it.
 
-Override the source via environment variables:
-
-* ``PROVOICE_YOLO_WEIGHTS`` -- absolute path to a local ``.pt`` (highest
-  priority; skips the download entirely).
-* ``PROVOICE_YOLO_REPO``    -- Hugging Face repo id
-  (default ``maco018/in-car-distraction-yolo26``).
-* ``PROVOICE_YOLO_VARIANT`` -- which size to pull: ``n``/``s``/``m``/``l``/``x``
-  (default ``l`` -- highest accuracy).
-
-To retrain (e.g. when a newer YOLO release lands) see
-``src/ProVoice/train_distraction.py`` and
-``scripts/train_yolo26_series.py``.
+To retrain the classifier (e.g. when a newer YOLO release lands) see
+``src/ProVoice/train_distraction.py`` and ``scripts/train_yolo26_series.py``.
 """
 
 from __future__ import annotations

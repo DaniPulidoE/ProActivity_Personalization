@@ -167,8 +167,7 @@ async def emit_data_periodically():
 
             ts = latest_data.get("timestamp")
             if ts is not None and ts == last_emitted_ts:
-                # Collector runs ~4 Hz, this loop 20 Hz: same frame, don't
-                # re-encode/re-send it.
+                # same frame, don't re-encode/re-send it.
                 await asyncio.sleep(0.05)
                 continue
 

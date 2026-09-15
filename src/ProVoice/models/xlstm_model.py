@@ -141,8 +141,7 @@ STATE_CAT =  STATE_CAT_ONE_HOT
 EMOTION_VOCAB = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
 LAB_VOCAB = ['face'] # discard drinks due to lack of data
 
-# FCD values, then each NUM (1 value), then each CAT (2 values).
-#D_IN = len(FCD_NAMES) + len(STATE_NUM) + 2 * len(STATE_CAT)
+# FCD values, then each driver state numeric, then each CARLA state,
 # with one-hot encoding for emotion and lab categories
 D_IN = len(FCD_NAMES) + len(STATE_NUM) + len(STATE_CARLA) + len(EMOTION_VOCAB) + len(LAB_VOCAB)
 
@@ -152,10 +151,10 @@ DEFAULT_CONTEXT_LENGTH = 400
 # Used to label log entries so they can be read without the source code.
 FEATURE_NAMES: List[str] = (
     list(FCD_NAMES)                                       # 12  FCD dims (normalised [1,5]→[0,1])
-    + list(STATE_NUM)                                     #  8  driver state numerics
+    + list(STATE_NUM)                                     #  7  driver state numerics
     + list(STATE_CARLA)                                   #  6  CARLA vehicle/world
     + [f"emotion_{e}" for e in EMOTION_VOCAB]             #  7  one-hot emotion
-    + [f"lab_{l}"     for l in LAB_VOCAB]                 #  2  multi-hot distraction
+    + [f"lab_{l}"     for l in LAB_VOCAB]                 #  1  multi-hot distraction
 )
 assert len(FEATURE_NAMES) == D_IN, f"FEATURE_NAMES length {len(FEATURE_NAMES)} != D_IN {D_IN}"
 
@@ -205,9 +204,7 @@ DEFAULT_RESAMPLE_HZ = 10.0
 # What is held, and why:
 #   * emotion one-hot / lab multi-hot — a blend (emotion_happy=0.4 next to
 #     emotion_sad=0.6) is a state that never occurred.
-#   * is_night / is_junction — binary.
-#   * environment_len / secondary_task_len — a CATEGORY encoded as a string
-#     length; the midpoint of two lengths is not a category.
+#   * is_junction — binary.
 #   * the 12 FCD dims — ordinal 1-5 ratings looked up per FUNCTION, not measured
 #     over time. Constant while functionname is (the common case, and always so
 #     at serving, where one name applies to the whole window), but a segment
@@ -225,16 +222,9 @@ DEFAULT_RESAMPLE_HZ = 10.0
 #   * yawn_rate — same, and without even the ramp: the divisor is the fixed
 #     180 s window, so the served feature is Anscombe(N) on {0, 1.12, 1.86, ...}
 #     for integer N. Anything between those is a fractional yawn.
-#   * hr_delta / rr_delta — the rPPG worker emits an estimate only about every
+#   * hr_delta — the rPPG worker emits an estimate only about every
 #     6 s and the collection loop reads the held value on every tick, so these
-#     are staircases with ~6.7 s plateaus (measured: 25 and 21 distinct values
-#     across a 4867 s recording). Heart rate is a continuous latent signal, but
-#     the pipeline never observed it between readings; a plateau of 6.7 s is a
-#     third of a 20 s window, so interpolating would reshape a 3-step staircase
-#     into a smooth ramp built entirely from values the system never had.
-#     Holding also matches the carry-forward the collector already applies
-#     between readings.
-#
+#     are staircases with ~6.7 s plateaus 
 # What survives as linear is exactly the set measured at FULL loop rate and
 # moving in small per-frame increments: the two visual driver-state features and
 # the CARLA vehicle/world channels.

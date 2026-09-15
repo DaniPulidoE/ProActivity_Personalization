@@ -1,3 +1,4 @@
+# THIS IS THE UPDATED DRIVING SCRIPT USED IN THE LATEST USER STUDY
 """
 Welcome to CARLA manual control.
 
@@ -23,7 +24,7 @@ LoA Popup Function:
 LoA Popup Input (which interface answers the popup):
     (default)        : Keyboard, on every rig, wheel attached or not -- the driver
                        says the levels out loud and the experimenter types them
-    --keyboard-input : The default, stated explicitly. Number keys 0-4 tick a
+    --keyboard-input : The default, stated explicitly. Number keys 1-5 tick a
                        level, the same number again unticks it, ENTER confirms
     --wheel-input    : Override: paddles move the cursor, the front button ticks
                        the level under it, CONFIRM submits
@@ -236,13 +237,7 @@ USER_LOA_LABEL_COLUMNS = [
     'modeltype',
     'state_model',
     'w_fcd',
-    # What the participant HEARD during this window. ambient_gain is the gain
-    # actually applied, not the one requested: a rig whose mixer failed to open
-    # logs 0 and is therefore correctly grouped with the silent runs instead of
-    # looking like a noise condition that never happened. Background noise is an
-    # arousal manipulation whether or not it is intended as one, and hr_delta /
-    # rr_delta are model inputs -- without these columns a mid-study volume
-    # change is a confound that cannot even be detected after the fact.
+    # What the participant HEARD during this window.
     'ambient_gain',
     'ambient_seed',
     # Which sound: the clip set's short hash when recordings were used, 'synth'
@@ -1196,7 +1191,7 @@ class LoASelectionPopup(object):
                 # Unmapped buttons would make the whole wheel feel dead; say so
                 # rather than leaving the driver pressing an inert control.
                 hint = ('Wheel buttons not mapped - run scripts/map_wheel_buttons.py. '
-                        'Use number keys 0-4 and ENTER, or N for no input.')
+                        'Use number keys 1-5 and ENTER, or N for no input.')
 
         # Keyboard mode is the spoken-answer setup: the driver answers out loud
         # and the experimenter types it. 'Read out' rather than 'say' on purpose
@@ -1524,7 +1519,7 @@ FIXED_SPAWN_POINT_INDEX = 152
 # clock). Without --sync the force lands at whatever rate the loop happens to
 # run and braking becomes frame-rate dependent.
 #
-# Keep BRAKE_ASSIST_TARGET_DECEL fixed across every participant and both study
+# Keep BRAKE_ASSIST_TARGET_DECEL fixed across every participant and all study
 # arms. Braking strength changes driving behaviour, which feeds brake,
 # speed_ratio_* and indirectly the physiological features -- varying it would
 # confound the personalization comparison exactly as a varying --decision-hz
@@ -2654,8 +2649,7 @@ class HUD(object):
         sideways shift each time the driver crosses 10 or 100 km/h. Only the
         unit was stabilised against this (see the blit below); the block was
         not. Anything positioned RELATIVE to this readout inherits the drift, so
-        anchor to absolute coordinates instead — see the call-event panel in
-        ``docs/live_study_setup.md`` §6.1.
+        anchor to absolute coordinates instead.
         """
         if not self.show_speed:
             return
@@ -3177,7 +3171,7 @@ def _resolve_popup_input(args, has_wheel):
     mode = getattr(args, 'popup_input', None) or POPUP_INPUT_DEFAULT
     if mode == POPUP_INPUT_WHEEL and not has_wheel:
         print('[WARN] --wheel-input, but no steering wheel is bound — the LoA '
-              'popup falls back to the keyboard (0-4 tick, ENTER confirms).')
+              'popup falls back to the keyboard (1-5 tick, ENTER confirms).')
         return POPUP_INPUT_KEYBOARD
     return mode
 
@@ -3308,7 +3302,7 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height, show_speed=args.speed)
         # Started here, before the start overlay and therefore before ProVoice's
-        # 60 s calibration, and left running for the whole session. Noise onset
+        # 180 s calibration, and left running for the whole session. Noise onset
         # is an arousal event: starting it partway through would move the HR/RR
         # baseline that hr_delta and rr_delta are normalised against, for that
         # participant only.
@@ -3476,7 +3470,7 @@ def game_loop(args):
             print("[INFO] LoA popup input: %s" % (
                 'steering wheel (paddles move, front button ticks, CONFIRM submits)'
                 if popup_input == POPUP_INPUT_WHEEL
-                else 'keyboard (0-4 tick, same key again unticks, ENTER confirms)'))
+                else 'keyboard (1-5 tick, same key again unticks, ENTER confirms)'))
             if loa_popup.prompts_per_window > 1:
                 print("[INFO] %d prompts per window, each about a different function "
                       "drawn from: %s"
@@ -3974,7 +3968,7 @@ def main():
              '0.9g). CARLA 0.10 vehicles manage only ~0.6g and the physics API '
              'cannot raise it, so the shortfall is supplied by a force opposing '
              'travel. 0 disables the assist and leaves stock CARLA braking. '
-             'KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND BOTH STUDY ARMS.'
+             'KEEP THIS FIXED ACROSS ALL PARTICIPANTS AND ALL STUDY ARMS.'
              % BRAKE_ASSIST_TARGET_DECEL)
     argparser.add_argument(
         '--participantid', default='',
@@ -4179,7 +4173,7 @@ def main():
              'in front of a participant. Off by default because it changes the '
              'driving task -- it gives the driver a precise instrument to regulate '
              'against -- so if it is used at all it should be used for EVERY '
-             'participant and both study arms.')
+             'participant and all study arms.')
     argparser.add_argument(
         '--ambient-gain', dest='ambient_gain', type=float,
         default=DEFAULT_AMBIENT_GAIN,
@@ -4189,7 +4183,7 @@ def main():
              'vehicle speed and idles at a standstill. Pass 0 for silence. '
              'Sound is an arousal manipulation whether or not it is meant as '
              'one, and hr_delta / rr_delta are model inputs, so this must be '
-             'IDENTICAL for every participant and both study arms -- gain and '
+             'IDENTICAL for every participant and all study arms -- gain and '
              'physical volume alike. The number is not a level: set the '
              'amplifier once, measure dB(A) at the driver\'s head, and report '
              'that. Logged per label row as ambient_gain.')
@@ -4247,7 +4241,7 @@ def main():
     popup_input_group.add_argument(
         '--keyboard-input', dest='popup_input', action='store_const',
         const=POPUP_INPUT_KEYBOARD,
-        help='Answer the LoA popups from the keyboard: number keys 0-4 tick a level, '
+        help='Answer the LoA popups from the keyboard: number keys 1-5 tick a level, '
              'pressing the same number again unticks it, N ticks INVALID FRAME '
              'instead, and ENTER commits whatever is ticked (an invalid frame writes '
              'no label). The popup ignores the wheel in this mode (it still steers). '

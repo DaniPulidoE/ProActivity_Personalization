@@ -161,7 +161,7 @@ would accept (0 = do nothing … 4 = act autonomously).
 
 `data/labels.csv` is the same table as the `labels` config in the CSV form
 `scripts/build_loa_dataset.py` reads (the Hub loads one file format per repo).
-`calibration/` (not a config) holds each driver's 60 s calibration baseline and
+`calibration/` (not a config) holds each driver's 180 s calibration baseline and
 per-tick calibration log — inputs of the heart-rate repair, shipped so that
 `frames_preprocessed` can be regenerated from `frames_raw`.
 
